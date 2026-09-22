@@ -5,6 +5,7 @@ description = "Front-month minute history of the MOEX CNY/RUB quarterly future"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib>=3.8",
     "pandas>=2.2",
     "pyarrow>=15",
 ]
@@ -21,4 +22,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

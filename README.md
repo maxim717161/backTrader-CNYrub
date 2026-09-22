@@ -66,3 +66,11 @@ python -m cnyrub download
 Колонки parquet: `datetime`, `end`, `open`, `high`, `low`, `close`, `volume`, `value`, `secid`. Поле `value` биржа по этим фьючерсам часто отдаёт нулём; объём при этом заполнен.
 
 Проверки: `pytest`.
+
+## График
+
+```bash
+python plot.py
+```
+
+Скрипт читает `data/continuous/cny_front_1m.parquet` и пишет `cny_front.png`: дневное закрытие, дневной диапазон и объём. Вертикальные линии — стыки контрактов, цена на них не подгонялась. `--show` открывает окно, `--output` меняет путь к файлу.
