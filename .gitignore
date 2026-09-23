@@ -6,4 +6,3 @@ __pycache__/
 .mypy_cache/
 dist/
 build/
-cny_front.png
