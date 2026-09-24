@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from backtest import SKIP_SECIDS, buy_and_hold, run_contract
+from backtest import buy_and_hold, run_contract
 
 
 def _days(rows: list[tuple[float, float, float, float, float]]) -> pd.DataFrame:
@@ -11,10 +11,6 @@ def _days(rows: list[tuple[float, float, float, float, float]]) -> pd.DataFrame:
     index = pd.to_datetime([start + timedelta(days=i) for i in range(len(rows))])
     frame = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=index)
     frame.index.name = "datetime"
-    frame["flatten_on_close"] = 0.0
-    frame["is_last"] = 0.0
-    frame.iloc[-1, frame.columns.get_loc("is_last")] = 1.0
-    frame.iloc[-2, frame.columns.get_loc("flatten_on_close")] = 1.0
     return frame
 
 
@@ -22,8 +18,7 @@ def _quiet(close: float = 10.0, volume: float = 1000.0) -> tuple[float, float, f
     return (close, close + 0.05, close - 0.05, close, volume)
 
 
-def test_stop_is_measured_from_the_fill_and_crm2_is_not_a_traded_window():
-    assert "CRM2" in SKIP_SECIDS
+def test_stop_is_measured_from_the_fill():
     rows = [_quiet() for _ in range(20)]
     rows.append((10.0, 10.40, 10.20, 10.30, 1000))
     rows.append((10.30, 10.50, 10.20, 10.40, 1000))
@@ -52,3 +47,11 @@ def test_open_position_is_closed_on_the_last_day_and_not_reopened():
     exit_ = float(frame["open"].iloc[-1])
     assert trade["pnl"] == (exit_ - entry) * 1000
     assert buy_and_hold(frame) == trade["pnlcomm"]
+
+
+def test_breakout_below_the_median_volume_is_skipped():
+    rows = [_quiet() for _ in range(20)]
+    rows.append((10.0, 10.40, 10.20, 10.30, 100))
+    rows.extend(_quiet(10.40) for _ in range(8))
+    strategy = run_contract("CRU5", _days(rows))
+    assert strategy.trades == []

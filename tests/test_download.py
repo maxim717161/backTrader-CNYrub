@@ -2,7 +2,7 @@ from datetime import date
 
 import pandas as pd
 
-from cnyrub.bars import prepare_bars
+from cnyrub.bars import bars_path, prepare_bars, read_bars, write_bars
 from cnyrub.cli import build_parser, main
 from cnyrub.contracts import Contract
 from cnyrub.download import download_front
@@ -66,20 +66,56 @@ def test_download_caches_closed_contracts_and_refetches_the_open_one(tmp_path):
 
     frame, manifest = download_front(contracts, today, tmp_path, fetch, workers=1)
     assert calls == ["CRM2", "CRU2"]
-    assert frame["open"].tolist() == [10.0, 10.7]
-    assert frame["secid"].tolist() == ["CRM2", "CRU2"]
-    assert manifest["rows"] == 2
+    # Свеча CRU2 лежит за месяц до фронта и в склейку не попадает.
+    assert frame["open"].tolist() == [10.0]
+    assert frame["secid"].tolist() == ["CRM2"]
+    assert manifest["rows"] == 1
+    stored = read_bars(tmp_path / "bars" / "CRU2.parquet")
+    assert stored["datetime"].iloc[0] == pd.Timestamp("2022-05-16 10:00:00")
     assert (tmp_path / "bars" / "CRM2.parquet").exists()
     assert (tmp_path / "bars" / "CRZ2.parquet").exists() is False
     assert (tmp_path / "continuous" / "cny_front_1m.parquet").exists()
 
     calls.clear()
     download_front(contracts, today, tmp_path, fetch, workers=2)
+    assert calls == []
+
+    calls.clear()
+    download_front(contracts, date(2022, 7, 2), tmp_path, fetch, workers=1)
     assert calls == ["CRU2"]
 
     calls.clear()
     download_front(contracts, today, tmp_path, fetch, force=True, workers=2)
     assert sorted(calls) == ["CRM2", "CRU2"]
+
+
+def test_download_extends_a_shorter_cache_without_putting_the_prefix_into_the_stitch(tmp_path):
+    contracts = [
+        contract("CRM2", "CNY-6.22", "2022-04-21", "2022-06-16"),
+        contract("CRU2", "CNY-9.22", "2022-04-21", "2022-09-15"),
+    ]
+    today = date(2022, 7, 1)
+    front = prepare_bars(candle("CRU2", "2022-06-17 10:00:00", 10.7), "CRU2", date(2022, 6, 17), date(2022, 7, 1))
+    write_bars(bars_path(tmp_path, "CRU2"), front, date(2022, 6, 17), date(2022, 7, 1))
+    calls: list[tuple[str, date, date]] = []
+
+    def fetch(item: Contract, start: date, end: date) -> pd.DataFrame:
+        calls.append((item.secid, start, end))
+        return candle(item.secid, f"{start.isoformat()} 10:00:00", 9.0)
+
+    frame, _manifest = download_front(contracts, today, tmp_path, fetch, workers=1)
+    assert ("CRU2", date(2022, 5, 16), date(2022, 6, 16)) in calls
+    assert frame["secid"].tolist() == ["CRM2", "CRU2"]
+    assert frame["open"].tolist() == [9.0, 10.7]
+    stored = read_bars(tmp_path / "bars" / "CRU2.parquet")
+    assert stored["datetime"].dt.strftime("%Y-%m-%d %H:%M").tolist() == [
+        "2022-05-16 10:00",
+        "2022-06-17 10:00",
+    ]
+
+    calls.clear()
+    download_front(contracts, today, tmp_path, fetch, workers=1)
+    assert calls == []
 
 
 def test_download_parser_flags_and_rejects_zero_workers():

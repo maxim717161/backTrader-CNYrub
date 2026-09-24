@@ -6,6 +6,8 @@ from cnyrub.contracts import (
     contracts_document,
     discover_contracts,
     front_windows,
+    history_windows,
+    months_before,
     parse_contract,
 )
 
@@ -153,6 +155,35 @@ def test_expiration_day_still_belongs_to_the_expiring_contract():
     assert "CRZ6" not in {item.secid for item in windows}
 
 
+def test_months_before_clamps_to_the_last_day_of_a_shorter_month():
+    assert months_before(date(2023, 3, 31), 1) == date(2023, 2, 28)
+    assert months_before(date(2024, 3, 31), 1) == date(2024, 2, 29)
+    assert months_before(date(2022, 6, 16), 1) == date(2022, 5, 16)
+
+
+def test_history_starts_a_month_before_the_previous_expiry():
+    windows = history_windows(SCHEDULE, AS_OF)
+    by_id = {item.secid: item for item in windows}
+    assert by_id["CRM2"].start == date(2022, 4, 21)
+    assert by_id["CRU2"].start == date(2022, 5, 16)
+    assert by_id["CRZ2"].start == date(2022, 8, 15)
+    assert by_id["CRZ6"].start == date(2026, 8, 17)
+    assert by_id["CRZ6"].end == date(2026, 9, 21)
+    fronts = {item.secid: item for item in front_windows(SCHEDULE, AS_OF)}
+    assert set(by_id) == set(fronts)
+    for secid, window in by_id.items():
+        assert window.end == fronts[secid].end
+        assert window.start <= fronts[secid].start
+
+
+def test_history_does_not_start_before_the_listing_date():
+    first = contract("CRM2", "CNY-6.22", "2022-04-21", "2022-06-16")
+    late = contract("CRU2", "CNY-9.22", "2022-06-01", "2022-09-15")
+    windows = history_windows([first, late], date(2022, 8, 1))
+    assert windows[1].start == date(2022, 6, 1)
+    assert windows[1].end == date(2022, 8, 1)
+
+
 def test_document_marks_far_quarters():
     document = contracts_document(SCHEDULE, AS_OF)
     assert document["front"] == "CRZ6"
@@ -161,4 +192,8 @@ def test_document_marks_far_quarters():
     assert by_id["CRZ6"]["window_end"] == "2026-09-21"
     assert by_id["CRH7"]["in_series"] is False
     assert by_id["CRH7"]["window_start"] is None
+    assert by_id["CRH7"]["history_start"] is None
+    assert by_id["CRU2"]["window_start"] == "2022-06-17"
+    assert by_id["CRU2"]["history_start"] == "2022-05-16"
+    assert by_id["CRM2"]["history_start"] == "2022-04-21"
     assert "CNYRUBF" not in by_id

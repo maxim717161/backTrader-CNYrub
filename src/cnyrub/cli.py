@@ -57,11 +57,11 @@ def _print_contracts(document: dict[str, object]) -> None:
     rows = document["contracts"]
     assert isinstance(rows, list)
     print(f"Дата: {document['as_of']}. Фронт: {document['front'] or '—'}. Выпусков: {len(rows)}")
-    print(f"{'SECID':<8} {'КОД':<12} {'СТАРТ':<12} {'ЭКСПИР.':<12} ОКНО")
+    print(f"{'SECID':<8} {'КОД':<12} {'СТАРТ':<12} {'ЭКСПИР.':<12} ИСТОРИЯ")
     for row in rows:
         assert isinstance(row, dict)
         if row["in_series"]:
-            window = f"{row['window_start']}..{row['window_end']}"
+            window = f"{row['history_start']}..{row['window_end']}"
         else:
             window = "—"
         print(f"{row['secid']:<8} {row['shortname']:<12} {row['frsttrade']:<12} {row['lsttrade']:<12} {window}")

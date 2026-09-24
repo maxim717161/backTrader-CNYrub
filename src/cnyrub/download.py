@@ -1,17 +1,17 @@
-"""Загрузка фронтальных окон и запись склейки."""
+"""Загрузка истории контрактов и запись фронтальной склейки."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 
-from cnyrub.bars import bars_path, cache_covers, prepare_bars, read_bars, write_bars
-from cnyrub.contracts import Contract, Window, contracts_document, front_windows
+from cnyrub.bars import bars_path, cache_bounds, prepare_bars, read_bars, write_bars
+from cnyrub.contracts import Contract, Window, contracts_document, front_windows, history_windows
 from cnyrub.manifest import build_manifest, stitch
 
 FetchCandles = Callable[[Contract, date, date], pd.DataFrame]
@@ -43,6 +43,70 @@ def _atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
     temporary.replace(path)
 
 
+def _merge_bars(prefix: pd.DataFrame, existing: pd.DataFrame) -> pd.DataFrame:
+    if prefix.empty:
+        return existing.reset_index(drop=True)
+    if existing.empty:
+        return prefix.reset_index(drop=True)
+    frame = pd.concat([prefix, existing], ignore_index=True)
+    frame = frame.sort_values("datetime", kind="mergesort").drop_duplicates("datetime", keep="last")
+    return frame.reset_index(drop=True)
+
+
+def _clip(frame: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """Оставить в склейке только фронтальное окно, без добавленного месяца."""
+    if frame.empty:
+        return frame
+    day = frame["datetime"].dt.normalize()
+    mask = (day >= pd.Timestamp(start)) & (day <= pd.Timestamp(end))
+    return frame.loc[mask].reset_index(drop=True)
+
+
+def _load_window(
+    window: Window,
+    data_dir: Path,
+    fetch_candles: FetchCandles,
+    *,
+    force: bool,
+) -> pd.DataFrame:
+    """Скачать историю контракта. Уже лежащий хвост с тем же концом дописывается спереди."""
+    path = bars_path(data_dir, window.secid)
+    bounds = None if force else cache_bounds(path)
+    if bounds == (window.start, window.end):
+        print(f"{window.secid}: кэш {window.start.isoformat()}..{window.end.isoformat()}", flush=True)
+        return read_bars(path)
+
+    if bounds is not None and bounds[1] == window.end and bounds[0] > window.start:
+        prefix_end = bounds[0] - timedelta(days=1)
+        print(
+            f"{window.secid}: дополнение {window.start.isoformat()}..{prefix_end.isoformat()} "
+            f"к кэшу до {window.end.isoformat()}",
+            flush=True,
+        )
+        fetched = fetch_candles(window.contract, window.start, prefix_end)
+        prefix = prepare_bars(fetched, window.secid, window.start, prefix_end)
+        frame = _merge_bars(prefix, read_bars(path))
+        if frame.empty:
+            print(f"{window.secid}: в окне нет свечей", flush=True)
+            return frame
+        write_bars(path, frame, window.start, window.end)
+        print(f"{window.secid}: записано {len(frame)} свечей", flush=True)
+        return frame
+
+    print(
+        f"{window.secid}: загрузка {window.start.isoformat()}..{window.end.isoformat()}",
+        flush=True,
+    )
+    fetched = fetch_candles(window.contract, window.start, window.end)
+    frame = prepare_bars(fetched, window.secid, window.start, window.end)
+    if frame.empty:
+        print(f"{window.secid}: в окне нет свечей", flush=True)
+        return frame
+    write_bars(path, frame, window.start, window.end)
+    print(f"{window.secid}: записано {len(frame)} свечей", flush=True)
+    return frame
+
+
 def download_front(
     contracts: list[Contract],
     today: date,
@@ -52,34 +116,20 @@ def download_front(
     force: bool = False,
     workers: int = 4,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    """Скачать фронтальные окна, склеить ряд и записать manifest.
+    """Скачать историю с лишним месяцем, а в склейку положить только фронтальные окна.
 
     Закрытый контракт при повторном запуске берётся из `data/bars/{SECID}.parquet`.
-    Текущий контракт скачивается заново: его окно каждый день длиннее.
+    Если кэш короче спереди, а конец совпадает, дописывается только недостающий месяц.
+    Текущий контракт скачивается целиком, когда его конец стал длиннее кэша.
     """
     if workers < 1:
         raise ValueError("workers должен быть >= 1")
-    windows = front_windows(contracts, today)
+    windows = history_windows(contracts, today)
+    fronts = {window.secid: window for window in front_windows(contracts, today)}
     loaded: dict[int, pd.DataFrame] = {}
 
     def load(index: int, window: Window) -> tuple[int, pd.DataFrame]:
-        path = bars_path(data_dir, window.secid)
-        closed = window.contract.lsttrade < today
-        if not force and closed and cache_covers(path, window.start, window.end):
-            print(f"{window.secid}: кэш {window.start.isoformat()}..{window.end.isoformat()}", flush=True)
-            return index, read_bars(path)
-        print(
-            f"{window.secid}: загрузка {window.start.isoformat()}..{window.end.isoformat()}",
-            flush=True,
-        )
-        fetched = fetch_candles(window.contract, window.start, window.end)
-        frame = prepare_bars(fetched, window.secid, window.start, window.end)
-        if frame.empty:
-            print(f"{window.secid}: в окне нет свечей", flush=True)
-            return index, frame
-        write_bars(path, frame, window.start, window.end)
-        print(f"{window.secid}: записано {len(frame)} свечей", flush=True)
-        return index, frame
+        return index, _load_window(window, data_dir, fetch_candles, force=force)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(load, index, window) for index, window in enumerate(windows)]
@@ -94,8 +144,11 @@ def download_front(
         if errors:
             raise RuntimeError("Не удалось скачать часть контрактов:\n" + "\n".join(errors))
 
-    frames = [loaded[index] for index in range(len(windows))]
-    combined, dropped = stitch(frames)
+    clipped = [
+        _clip(loaded[index], fronts[window.secid].start, fronts[window.secid].end)
+        for index, window in enumerate(windows)
+    ]
+    combined, dropped = stitch(clipped)
     manifest = build_manifest(
         combined,
         as_of=today,

@@ -105,16 +105,25 @@ def write_bars(path: Path, frame: pd.DataFrame, start: date, end: date) -> None:
     temporary.replace(path)
 
 
-def cache_covers(path: Path, start: date, end: date) -> bool:
+def cache_bounds(path: Path) -> tuple[date, date] | None:
+    """Границы уже записанного окна или None, если кэш неполный."""
     if not path.exists():
-        return False
+        return None
     metadata = pq.read_schema(path).metadata or {}
-    return (
-        metadata.get(_META_COMPLETE) == b"1"
-        and metadata.get(_META_VERSION) == _CACHE_VERSION
-        and metadata.get(_META_START) == start.isoformat().encode()
-        and metadata.get(_META_END) == end.isoformat().encode()
-    )
+    if metadata.get(_META_COMPLETE) != b"1" or metadata.get(_META_VERSION) != _CACHE_VERSION:
+        return None
+    raw_start = metadata.get(_META_START)
+    raw_end = metadata.get(_META_END)
+    if not raw_start or not raw_end:
+        return None
+    try:
+        return date.fromisoformat(raw_start.decode()), date.fromisoformat(raw_end.decode())
+    except ValueError:
+        return None
+
+
+def cache_covers(path: Path, start: date, end: date) -> bool:
+    return cache_bounds(path) == (start, end)
 
 
 def read_bars(path: Path) -> pd.DataFrame:

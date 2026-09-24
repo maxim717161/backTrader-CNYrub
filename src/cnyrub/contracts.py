@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -123,6 +124,41 @@ def discover_contracts(
     return sorted(found.values(), key=lambda contract: (contract.lsttrade, contract.secid))
 
 
+def months_before(day: date, months: int) -> date:
+    """Сдвинуть дату на целое число календарных месяцев назад.
+
+    Если в целевом месяце нет такого числа, берётся последний день месяца.
+    """
+    month = day.month - months
+    year = day.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(day.day, last_day))
+
+
+def history_windows(contracts: list[Contract], today: date) -> list[Window]:
+    """Окно загрузки: фронтальный кусок плюс месяц до экспирации предыдущего.
+
+    У первого выпуска добавлять нечего, начало остаётся первым днём торгов.
+    У остальных начало — не раньше даты листинга и не раньше, чем за месяц
+    до последнего дня торгов предыдущего контракта. Конец совпадает с
+    фронтальным окном.
+    """
+    windows: list[Window] = []
+    previous_last: date | None = None
+    for window in front_windows(contracts, today):
+        if previous_last is None:
+            start = window.start
+        else:
+            start = max(window.contract.frsttrade, months_before(previous_last, 1))
+        if start <= window.end:
+            windows.append(Window(contract=window.contract, start=start, end=window.end))
+        previous_last = window.contract.lsttrade
+    return windows
+
+
 def front_windows(contracts: list[Contract], today: date) -> list[Window]:
     """Окна, на которых контракт был ближайшим к экспирации.
 
@@ -155,6 +191,7 @@ def front_windows(contracts: list[Contract], today: date) -> list[Window]:
 def contracts_document(contracts: list[Contract], today: date) -> dict[str, object]:
     """Описание всех найденных выпусков и фронтальных окон на дату."""
     windows = {window.secid: window for window in front_windows(contracts, today)}
+    histories = {window.secid: window for window in history_windows(contracts, today)}
     front_secid = next(
         (window.secid for window in windows.values() if window.contract.lsttrade >= today),
         None,
@@ -162,6 +199,7 @@ def contracts_document(contracts: list[Contract], today: date) -> dict[str, obje
     rows = []
     for contract in sorted(contracts, key=lambda item: (item.lsttrade, item.secid)):
         window = windows.get(contract.secid)
+        history = histories.get(contract.secid)
         rows.append(
             {
                 "secid": contract.secid,
@@ -174,6 +212,7 @@ def contracts_document(contracts: list[Contract], today: date) -> dict[str, obje
                 "in_series": window is not None,
                 "window_start": window.start.isoformat() if window else None,
                 "window_end": window.end.isoformat() if window else None,
+                "history_start": history.start.isoformat() if history else None,
             }
         )
     return {"as_of": today.isoformat(), "front": front_secid, "contracts": rows}
