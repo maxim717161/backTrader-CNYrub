@@ -284,6 +284,22 @@ def test_a_trade_still_negative_after_the_time_limit_is_closed():
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
 
 
+def test_the_time_limit_wins_when_the_channel_breaks_on_the_same_bar():
+    rows = [_quiet() for _ in range(5)]
+    rows.append((10.0, 10.40, 10.20, 10.30, 1000))
+    rows.append((10.30, 10.35, 10.22, 10.25, 1000))
+    rows.append((10.25, 10.26, 9.40, 9.50, 1000))
+    rows.append((9.50, 9.55, 9.45, 9.50, 1000))
+    rows.append(_quiet(9.50))
+    frame = _days(rows)
+    simulated = simulate("CRZ5", frame, 5, stop_mult=None, exit_channel=5, loss_bars=1)
+    strategy = run_contract("CRZ5", frame, 5, stop_mult=None, exit_channel=5, loss_bars=1)
+    assert len(simulated) == len(strategy.trades) == 1
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["reason"] == "time"
+        assert trade["pnl"] == pytest.approx(-800.0)
+
+
 def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("inverse", 1, 10.5, 10.0, 9.0, 1.0) == 3
     assert entry_lots("inverse", 1, 11.0, 10.0, 9.0, 1.0) == 2

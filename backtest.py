@@ -576,17 +576,17 @@ def simulate(
             if position != 0:
                 pending = "expiry"
             continue
-        if position == 1 and exit_low[i] == exit_low[i] and close[i] < exit_low[i]:
-            pending = "exit"
-        elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
-            pending = "exit"
-        elif (
+        if (
             position != 0
             and loss_bars is not None
             and i - entry_i >= loss_bars
             and (close[i] - entry_px) * position < 0
         ):
             pending = "time"
+        elif position == 1 and exit_low[i] == exit_low[i] and close[i] < exit_low[i]:
+            pending = "exit"
+        elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
+            pending = "exit"
         elif position == 0 and prior_high[i] == prior_high[i] and i >= cooldown_until:
             if trade_from is not None and days[i + 1] < trade_from:
                 continue
