@@ -3,14 +3,13 @@
 Склеенного ряда нет: у каждого контракта свой прогон. Сигнал — закрытие
 минуты за пределами предыдущих N максимумов или минимумов. Вход на открытии
 следующей минуты, если объём минуты сигнала не ниже медианы этих N минут.
-Выход — обратный пробой окна N/2 или стоп в 2,5 медианы минутного диапазона.
-В последний день новая сделка не открывается, открытая закрывается на первом
-открытии этого дня.
+Выход — обратный пробой более короткого окна или стоп в нескольких медианах
+минутного диапазона. В последний день новая сделка не открывается, открытая
+закрывается на первом открытии этого дня.
 
-`python backtest.py --grid` печатает грубую сетку, уточнение вокруг пиков
-и три фильтра по отдельности. Окно годится, если прибыльных частей больше половины. Часть считается
-прибыльной, когда её результат больше нуля и в ней не меньше 4 сделок на
-контракт. Среди таких окон берётся лучший результат худшей части.
+В работе два окна, выбранные по общему итогу: 680 минут и длинное окно из
+пары 12 480 / 12 960. Каждое считается отдельно. `python backtest.py --exits`
+сравнивает точные суммы длинной пары и перебирает длину выхода и стоп.
 """
 
 from __future__ import annotations
@@ -28,10 +27,14 @@ COARSE_TO = 14_400
 COARSE_STEP = 480
 REFINE_STEP = 120
 REFINE_RADIUS = 480
-# Вокруг 960 шаг 20 и вокруг 12480 шаг 120. Прибыльных частей больше половины.
-# Выбрано 12480: четыре части из пяти в плюсе, худшая часть −414 руб.
-CHANNEL = 12480
+# Два окна по общему итогу, каждое отдельно. Длинное уточняет --exits.
+SHORT_WINDOW = 680
+LONG_CANDIDATES = (12_480, 12_960)
+CHANNEL = 12_480
 STOP_MULT = 2.5
+# Длина выхода = N * scale / 4. Ноль выключает выход по каналу.
+EXIT_SCALES = (0, 1, 2, 4, 8)
+STOP_GRID = (1.5, 2.0, 2.5, 3.5, 5.0, 8.0)
 MIN_TRADES_PER_CONTRACT = 4
 CLEARANCE = 0.5
 CLOCK_DAYS = 5
@@ -225,9 +228,10 @@ def load_minutes(bars_dir: Path = BARS_DIR) -> dict[str, pd.DataFrame]:
     return {secid: frames[secid] for secid in ordered}
 
 
-def channel_view(frame: pd.DataFrame, channel: int) -> pd.DataFrame:
+def channel_view(frame: pd.DataFrame, channel: int, exit_channel: int | None = None) -> pd.DataFrame:
     """Уровни канала на закрытии минуты: окно не включает саму эту минуту."""
-    exit_channel = max(channel // 2, 1)
+    if exit_channel is None:
+        exit_channel = max(channel // 2, 1)
     high = frame["high"]
     low = frame["low"]
     view = pd.DataFrame(index=frame.index)
@@ -240,10 +244,15 @@ def channel_view(frame: pd.DataFrame, channel: int) -> pd.DataFrame:
     view["prior_low"] = low.rolling(channel, min_periods=channel).min().shift(1)
     view["prior_vol"] = frame["volume"].rolling(channel, min_periods=channel).median().shift(1)
     view["prior_range"] = (high - low).rolling(channel, min_periods=channel).median().shift(1)
-    view["exit_high"] = high.rolling(exit_channel, min_periods=exit_channel).max().shift(1)
-    view["exit_low"] = low.rolling(exit_channel, min_periods=exit_channel).min().shift(1)
+    if exit_channel > 0:
+        view["exit_high"] = high.rolling(exit_channel, min_periods=exit_channel).max().shift(1)
+        view["exit_low"] = low.rolling(exit_channel, min_periods=exit_channel).min().shift(1)
+        view["exit_ready"] = view["exit_low"].notna().astype(float)
+    else:
+        view["exit_high"] = np.nan
+        view["exit_low"] = np.nan
+        view["exit_ready"] = 0.0
     view["entry_ready"] = view["prior_high"].notna().astype(float)
-    view["exit_ready"] = view["exit_low"].notna().astype(float)
     return view
 
 
@@ -260,6 +269,13 @@ def _clock_volume(index: pd.DatetimeIndex, volume: np.ndarray, lookback: int) ->
     return typical
 
 
+def scaled_exit(channel: int, scale: int) -> int:
+    """Длина выхода: scale 2 — это половина окна, scale 0 — выход по каналу выключен."""
+    if scale <= 0:
+        return 0
+    return max(channel * scale // 4, 1)
+
+
 def simulate(
     secid: str,
     frame: pd.DataFrame,
@@ -268,6 +284,9 @@ def simulate(
     clearance: float = 0.0,
     cooldown: int = 0,
     clock_volume: bool = False,
+    stop_mult: float = STOP_MULT,
+    exit_channel: int | None = None,
+    view: pd.DataFrame | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
 
@@ -275,8 +294,10 @@ def simulate(
     cooldown — сколько минут после стопа нельзя открывать новую сделку.
     clock_volume заменяет сравнение с медианой последних N минут на медиану
     той же минуты суток за предыдущие дни.
+    view — уже посчитанные уровни; иначе они строятся из channel и exit_channel.
     """
-    view = channel_view(frame, channel)
+    if view is None:
+        view = channel_view(frame, channel, exit_channel)
     opened = view["open"].to_numpy(dtype=float)
     high = view["high"].to_numpy(dtype=float)
     low = view["low"].to_numpy(dtype=float)
@@ -359,7 +380,7 @@ def simulate(
             if typical > 0 and volume[i] < typical:
                 continue
             room = clearance * prior_range[i]
-            stop_dist = STOP_MULT * prior_range[i]
+            stop_dist = stop_mult * prior_range[i]
             if close[i] > prior_high[i] + room:
                 pending = "long"
             elif close[i] < prior_low[i] - room:
@@ -518,6 +539,45 @@ def _net(by_secid: dict[str, list[dict[str, object]]], secids: list[str]) -> flo
     return sum(float(trade["pnlcomm"]) for secid in secids for trade in by_secid[secid])
 
 
+def score_window(
+    frames: dict[str, pd.DataFrame],
+    channel: int,
+    *,
+    stop_mult: float = STOP_MULT,
+    exit_channel: int | None = None,
+    views: dict[str, pd.DataFrame] | None = None,
+) -> dict[str, object]:
+    """Сумма по контрактам и пять частей. Пересечение историй в сумму не склеивается."""
+    by_secid = {
+        secid: simulate(
+            secid,
+            frame,
+            channel,
+            stop_mult=stop_mult,
+            exit_channel=exit_channel,
+            view=None if views is None else views[secid],
+        )
+        for secid, frame in frames.items()
+    }
+    trades = [trade for secid in frames for trade in by_secid[secid]]
+    reasons: dict[str, int] = {}
+    for trade in trades:
+        reason = str(trade["reason"])
+        reasons[reason] = reasons.get(reason, 0) + 1
+    recorded_exit = max(channel // 2, 1) if exit_channel is None else exit_channel
+    return {
+        "channel": channel,
+        "exit": recorded_exit,
+        "stop_mult": stop_mult,
+        "trades": len(trades),
+        "wins": sum(float(trade["pnlcomm"]) > 0 for trade in trades),
+        "net": _net(by_secid, list(frames)),
+        "parts": tuple(_net(by_secid, list(part)) for part in PARTS),
+        "factor": _profit_factor(trades),
+        "reasons": reasons,
+    }
+
+
 def _profit_factor(trades: list[dict[str, object]]) -> float | None:
     wins = sum(float(trade["pnlcomm"]) for trade in trades if float(trade["pnlcomm"]) > 0)
     losses = sum(float(trade["pnlcomm"]) for trade in trades if float(trade["pnlcomm"]) < 0)
@@ -526,11 +586,18 @@ def _profit_factor(trades: list[dict[str, object]]) -> float | None:
     return wins / abs(losses)
 
 
-def run_contract(secid: str, frame: pd.DataFrame, channel: int = CHANNEL) -> MinuteDonchian:
-    view = channel_view(_as_feed(frame), channel)
+def run_contract(
+    secid: str,
+    frame: pd.DataFrame,
+    channel: int = CHANNEL,
+    *,
+    stop_mult: float = STOP_MULT,
+    exit_channel: int | None = None,
+) -> MinuteDonchian:
+    view = channel_view(_as_feed(frame), channel, exit_channel)
     last_day = pd.Timestamp(view.index[-1]).date().isoformat()
     cerebro = bt.Cerebro(stdstats=False, cheat_on_open=True)
-    cerebro.addstrategy(MinuteDonchian, secid=secid, last_day=last_day)
+    cerebro.addstrategy(MinuteDonchian, secid=secid, last_day=last_day, stop_mult=stop_mult)
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(START_CASH)
     cerebro.broker.setcommission(
@@ -680,12 +747,127 @@ def report(summary: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _reason_text(reasons: object) -> str:
+    assert isinstance(reasons, dict)
+    order = ("stop", "channel", "expiry")
+    parts = [f"{name} {int(reasons[name])}" for name in order if name in reasons]
+    extra = [f"{name} {int(count)}" for name, count in sorted(reasons.items()) if name not in order]
+    return ", ".join(parts + extra) if parts or extra else "—"
+
+
+def _score_line(row: dict[str, object]) -> str:
+    parts = tuple(float(part) for part in row["parts"])
+    factor = row["factor"]
+    factor_text = "—" if factor is None else f"{float(factor):.2f}"
+    part_text = " ".join(f"{_money(part):>9}" for part in parts)
+    return (
+        f"{int(row['channel']):>6} {int(row['exit']):>6} {float(row['stop_mult']):>4.1f} "
+        f"{int(row['trades']):>7} {int(row['wins']):>5} {_money(float(row['net'])):>10} "
+        f"{part_text} {factor_text:>7}  {_reason_text(row['reasons'])}"
+    )
+
+
+def exit_grid(frames: dict[str, pd.DataFrame]) -> str:
+    """Точная сумма длинной пары и сетка выхода на двух окнах по общему итогу."""
+    print("длинная пара, выход N/2, стоп 2.5", flush=True)
+    long_rows = [score_window(frames, channel) for channel in LONG_CANDIDATES]
+    long_row = max(long_rows, key=lambda row: float(row["net"]))
+    long_channel = int(long_row["channel"])
+    windows = (SHORT_WINDOW, long_channel)
+    header = (
+        f"{'ВХОД':>6} {'ВЫХОД':>6} {'СТОП':>4} {'СДЕЛОК':>7} {'ПЛЮС':>5} {'ИТОГ':>10} "
+        + " ".join(f"{'Ч' + str(index):>9}" for index in range(1, 6))
+        + f" {'ФАКТОР':>7}  ВЫХОДЫ"
+    )
+    lines = [
+        "Длинная пара при выходе N/2 и стопе 2,5. Берётся окно с большей точной суммой.",
+        header,
+    ]
+    for row in long_rows:
+        mark = "  ←" if int(row["channel"]) == long_channel else ""
+        lines.append(_score_line(row) + mark)
+    lines.append("")
+    lines.append(
+        f"В работе вход {SHORT_WINDOW} и {long_channel}. "
+        "Сумма двух окон — не один счёт. Объём и вход не меняются."
+    )
+    lines.append(header)
+    baselines: dict[int, dict[str, object]] = {}
+    by_key: dict[tuple[int, float], dict[int, dict[str, object]]] = {}
+    for channel in windows:
+        for scale in EXIT_SCALES:
+            exit_channel = scaled_exit(channel, scale)
+            print(f"вход {channel}, выход {exit_channel}", flush=True)
+            views = {
+                secid: channel_view(frame, channel, exit_channel) for secid, frame in frames.items()
+            }
+            for stop_mult in STOP_GRID:
+                row = score_window(
+                    frames,
+                    channel,
+                    stop_mult=stop_mult,
+                    exit_channel=exit_channel,
+                    views=views,
+                )
+                row["scale"] = scale
+                lines.append(_score_line(row))
+                by_key.setdefault((scale, stop_mult), {})[channel] = row
+                if scale == 2 and stop_mult == STOP_MULT:
+                    baselines[channel] = row
+        lines.append("")
+    adopted = _adopted_exit(by_key, baselines, windows)
+    lines.append(_exit_decision(adopted, baselines, windows))
+    return "\n".join(lines)
+
+
+def _adopted_exit(
+    by_key: dict[tuple[int, float], dict[int, dict[str, object]]],
+    baselines: dict[int, dict[str, object]],
+    windows: tuple[int, ...],
+) -> tuple[int, float] | None:
+    """Вариант, который поднимает итог каждого окна. При нескольких — больший из меньших приростов."""
+    best_key: tuple[int, float] | None = None
+    best_rank: tuple[float, float] | None = None
+    for key, pair in by_key.items():
+        if key == (2, STOP_MULT):
+            continue
+        gains = [float(pair[channel]["net"]) - float(baselines[channel]["net"]) for channel in windows]
+        if min(gains) <= 0:
+            continue
+        rank = (min(gains), sum(gains))
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_key = key
+    return best_key
+
+
+def _exit_decision(
+    adopted: tuple[int, float] | None,
+    baselines: dict[int, dict[str, object]],
+    windows: tuple[int, ...],
+) -> str:
+    base = ", ".join(
+        f"{channel}: {_money(float(baselines[channel]['net']))} руб." for channel in windows
+    )
+    if adopted is None:
+        return f"Ни одна пара выход/стоп не подняла оба итога. База остаётся выход N/2, стоп {STOP_MULT}. База: {base}"
+    scale, stop_mult = adopted
+    return (
+        f"Оба итога выше при выходе {scale}/4 окна и стопе {stop_mult:.1f}. "
+        f"База (N/2, стоп {STOP_MULT}): {base}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Канал по закрытиям минуток CNY/RUB")
     parser.add_argument("--grid", action="store_true", help="Прогнать сетку окон и выбрать N")
+    parser.add_argument("--exits", action="store_true", help="Сравнить выходы на двух окнах по общему итогу")
     parser.add_argument("--bars", type=Path, default=BARS_DIR, help="Каталог parquet по контрактам")
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
+    if args.exits:
+        print(exit_grid(frames))
+        return 0
     if args.grid:
         around_short = tuple(range(480, 1440 + 1, 20))
         around_long = tuple(range(11_520, 13_440 + 1, 120))

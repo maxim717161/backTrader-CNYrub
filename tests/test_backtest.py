@@ -41,6 +41,19 @@ def test_stop_is_measured_from_the_fill_in_backtrader_and_the_simulator():
         assert trade["pnlcomm"] == pytest.approx(-252.0)
 
 
+def test_tighter_stop_without_a_channel_exit_matches_backtrader():
+    frame = _stop_frame()
+    simulated = simulate("CRZ5", frame, 20, stop_mult=2.0, exit_channel=0)
+    strategy = run_contract("CRZ5", frame, 20, stop_mult=2.0, exit_channel=0)
+    assert len(simulated) == 1
+    assert len(strategy.trades) == 1
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["direction"] == "long"
+        assert trade["reason"] == "stop"
+        assert trade["pnl"] == pytest.approx(-200.0)
+        assert trade["pnlcomm"] == pytest.approx(-202.0)
+
+
 def test_open_position_is_closed_on_the_last_day_and_not_reopened():
     rows = [_quiet() for _ in range(20)]
     rows.append((10.0, 10.40, 10.20, 10.30, 1000))
