@@ -6,6 +6,8 @@ import pytest
 from backtest import (
     WINDOWS,
     _part_nets,
+    breakout_fraction,
+    breakout_lots,
     buy_and_hold,
     choose_window,
     entry_lots,
@@ -300,6 +302,32 @@ def test_the_time_limit_wins_when_the_channel_breaks_on_the_same_bar():
         assert trade["pnl"] == pytest.approx(-800.0)
 
 
+def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
+    assert breakout_fraction(0, 12) == 1
+    assert breakout_fraction(6, 12) == 0.5
+    assert breakout_fraction(12, 12) == 0
+    assert breakout_fraction(float("inf"), 12) == 0
+    assert breakout_lots(100_000, 1_000, 0, 12) == 99
+    assert breakout_lots(100_000, 1_000, 6, 12) == 49
+    assert breakout_lots(100_000, 1_000, 12, 12) is None
+    rows = [(10.0, 10.5, 9.5, 10.0, 1000.0) for _ in range(5)]
+    rows.append((10.0, 16.5, 10.0, 16.5, 1000.0))
+    rows.append((16.5, 16.6, 16.4, 16.5, 1000.0))
+    rows.append((16.5, 16.6, 16.4, 16.5, 1000.0))
+    frame = _days(rows)
+    kwargs = dict(stop_mult=22.0, exit_channel=0, breakout_span=12.0, cash=10_000.0, margin=1_000.0)
+    simulated = simulate("CRZ5", frame, 5, **kwargs)
+    strategy = run_contract("CRZ5", frame, 5, **kwargs)
+    assert len(simulated) == len(strategy.trades) == 1
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["lots"] == 4
+        assert trade["pnlcomm"] == pytest.approx(-8)
+    far = rows.copy()
+    far[5] = (10.0, 22.5, 10.0, 22.5, 1000.0)
+    assert simulate("CRZ5", _days(far), 5, **kwargs) == []
+    assert run_contract("CRZ5", _days(far), 5, **kwargs).trades == []
+
+
 def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("inverse", 1, 10.5, 10.0, 9.0, 1.0) == 3
     assert entry_lots("inverse", 1, 11.0, 10.0, 9.0, 1.0) == 2
@@ -309,7 +337,9 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert WINDOWS[0].size_mode == "flat" and WINDOWS[0].clock_cap == 5
     assert WINDOWS[0].loss_bars == 1450 and WINDOWS[0].risk_fraction == 0.10
     assert WINDOWS[0].stop_rub == 285
-    assert WINDOWS[1].size_mode == "inverse" and WINDOWS[1].clock_cap is None
+    assert WINDOWS[1].size_mode == "span" and WINDOWS[1].clock_cap is None
+    assert WINDOWS[1].breakout_span == 12 and WINDOWS[1].cash == 100_000
+    assert WINDOWS[1].margin == 1_000
 
 
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():
