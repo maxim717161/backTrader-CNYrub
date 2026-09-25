@@ -64,17 +64,14 @@ def test_download_caches_closed_contracts_and_refetches_the_open_one(tmp_path):
         price = 10.0 if item.secid == "CRM2" else 10.7
         return candle(item.secid, f"{start.isoformat()} 10:00:00", price)
 
-    frame, manifest = download_front(contracts, today, tmp_path, fetch, workers=1)
+    summary = download_front(contracts, today, tmp_path, fetch, workers=1)
     assert calls == ["CRM2", "CRU2"]
-    # Свеча CRU2 лежит за месяц до фронта и в склейку не попадает.
-    assert frame["open"].tolist() == [10.0]
-    assert frame["secid"].tolist() == ["CRM2"]
-    assert manifest["rows"] == 1
+    assert summary["rows"] == 2
     stored = read_bars(tmp_path / "bars" / "CRU2.parquet")
     assert stored["datetime"].iloc[0] == pd.Timestamp("2022-05-16 10:00:00")
     assert (tmp_path / "bars" / "CRM2.parquet").exists()
     assert (tmp_path / "bars" / "CRZ2.parquet").exists() is False
-    assert (tmp_path / "continuous" / "cny_front_1m.parquet").exists()
+    assert (tmp_path / "continuous" / "cny_front_1m.parquet").exists() is False
 
     calls.clear()
     download_front(contracts, today, tmp_path, fetch, workers=2)
@@ -89,7 +86,7 @@ def test_download_caches_closed_contracts_and_refetches_the_open_one(tmp_path):
     assert sorted(calls) == ["CRM2", "CRU2"]
 
 
-def test_download_extends_a_shorter_cache_without_putting_the_prefix_into_the_stitch(tmp_path):
+def test_download_extends_a_shorter_cache_in_front_of_the_existing_bars(tmp_path):
     contracts = [
         contract("CRM2", "CNY-6.22", "2022-04-21", "2022-06-16"),
         contract("CRU2", "CNY-9.22", "2022-04-21", "2022-09-15"),
@@ -103,10 +100,10 @@ def test_download_extends_a_shorter_cache_without_putting_the_prefix_into_the_st
         calls.append((item.secid, start, end))
         return candle(item.secid, f"{start.isoformat()} 10:00:00", 9.0)
 
-    frame, _manifest = download_front(contracts, today, tmp_path, fetch, workers=1)
+    summary = download_front(contracts, today, tmp_path, fetch, workers=1)
     assert ("CRU2", date(2022, 5, 16), date(2022, 6, 16)) in calls
-    assert frame["secid"].tolist() == ["CRM2", "CRU2"]
-    assert frame["open"].tolist() == [9.0, 10.7]
+    assert summary["rows"] == 3
+    assert (tmp_path / "continuous").exists() is False
     stored = read_bars(tmp_path / "bars" / "CRU2.parquet")
     assert stored["datetime"].dt.strftime("%Y-%m-%d %H:%M").tolist() == [
         "2022-05-16 10:00",

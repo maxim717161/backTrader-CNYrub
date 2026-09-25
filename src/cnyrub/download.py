@@ -1,4 +1,4 @@
-"""Загрузка истории контрактов и запись фронтальной склейки."""
+"""Загрузка минутной истории каждого контракта отдельно."""
 
 from __future__ import annotations
 
@@ -11,35 +11,19 @@ from pathlib import Path
 import pandas as pd
 
 from cnyrub.bars import bars_path, cache_bounds, prepare_bars, read_bars, write_bars
-from cnyrub.contracts import Contract, Window, contracts_document, front_windows, history_windows
-from cnyrub.manifest import build_manifest, stitch
+from cnyrub.contracts import Contract, Window, contracts_document, history_windows
 
 FetchCandles = Callable[[Contract, date, date], pd.DataFrame]
-
-
-def continuous_path(data_dir: Path) -> Path:
-    return data_dir / "continuous" / "cny_front_1m.parquet"
 
 
 def contracts_path(data_dir: Path) -> Path:
     return data_dir / "contracts.json"
 
 
-def manifest_path(data_dir: Path) -> Path:
-    return data_dir / "manifest.json"
-
-
 def write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
-def _atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".parquet.tmp")
-    frame.to_parquet(temporary, index=False)
     temporary.replace(path)
 
 
@@ -51,15 +35,6 @@ def _merge_bars(prefix: pd.DataFrame, existing: pd.DataFrame) -> pd.DataFrame:
     frame = pd.concat([prefix, existing], ignore_index=True)
     frame = frame.sort_values("datetime", kind="mergesort").drop_duplicates("datetime", keep="last")
     return frame.reset_index(drop=True)
-
-
-def _clip(frame: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    """Оставить в склейке только фронтальное окно, без добавленного месяца."""
-    if frame.empty:
-        return frame
-    day = frame["datetime"].dt.normalize()
-    mask = (day >= pd.Timestamp(start)) & (day <= pd.Timestamp(end))
-    return frame.loc[mask].reset_index(drop=True)
 
 
 def _load_window(
@@ -115,8 +90,8 @@ def download_front(
     *,
     force: bool = False,
     workers: int = 4,
-) -> tuple[pd.DataFrame, dict[str, object]]:
-    """Скачать историю с лишним месяцем, а в склейку положить только фронтальные окна.
+) -> dict[str, object]:
+    """Скачать историю каждого контракта в свой файл, без склейки.
 
     Закрытый контракт при повторном запуске берётся из `data/bars/{SECID}.parquet`.
     Если кэш короче спереди, а конец совпадает, дописывается только недостающий месяц.
@@ -125,7 +100,6 @@ def download_front(
     if workers < 1:
         raise ValueError("workers должен быть >= 1")
     windows = history_windows(contracts, today)
-    fronts = {window.secid: window for window in front_windows(contracts, today)}
     loaded: dict[int, pd.DataFrame] = {}
 
     def load(index: int, window: Window) -> tuple[int, pd.DataFrame]:
@@ -144,21 +118,20 @@ def download_front(
         if errors:
             raise RuntimeError("Не удалось скачать часть контрактов:\n" + "\n".join(errors))
 
-    clipped = [
-        _clip(loaded[index], fronts[window.secid].start, fronts[window.secid].end)
-        for index, window in enumerate(windows)
-    ]
-    combined, dropped = stitch(clipped)
-    manifest = build_manifest(
-        combined,
-        as_of=today,
-        expected_secids=[window.secid for window in windows],
-        dropped_duplicates=dropped,
-    )
-    if not combined.empty:
-        _atomic_parquet(continuous_path(data_dir), combined)
-    write_json(manifest_path(data_dir), manifest)
-    return combined, manifest
+    rows = []
+    total = 0
+    for index, window in enumerate(windows):
+        count = len(loaded[index])
+        total += count
+        rows.append(
+            {
+                "secid": window.secid,
+                "rows": count,
+                "start": window.start.isoformat(),
+                "end": window.end.isoformat(),
+            }
+        )
+    return {"as_of": today.isoformat(), "rows": total, "contracts": rows}
 
 
 def publish_contracts(contracts: list[Contract], today: date, data_dir: Path) -> dict[str, object]:

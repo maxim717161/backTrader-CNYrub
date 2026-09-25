@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Дата, на которую считается фронт, YYYY-MM-DD",
     )
 
-    download = sub.add_parser("download", help="Скачать фронтальные окна и склеить минутный ряд")
+    download = sub.add_parser("download", help="Скачать минутную историю каждого контракта")
     download.add_argument("--force", action="store_true", help="Скачать все окна заново")
     download.add_argument("--workers", type=int, default=4, help="Число параллельных контрактов")
     download.add_argument(
@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "contracts":
             print(f"Записано {DATA_DIR / 'contracts.json'}")
             return 0
-        _frame, manifest = download_front(
+        summary = download_front(
             contracts,
             today,
             DATA_DIR,
@@ -92,10 +92,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 1
-    print(
-        f"Склейка: {manifest['rows']} свечей, объём {manifest['volume']}, "
-        f"{manifest['first']} — {manifest['last']}"
-    )
-    print(f"Предупреждений: {len(manifest['warnings'])}")
-    print(f"Записано {DATA_DIR / 'continuous' / 'cny_front_1m.parquet'}")
+    print(f"Контрактов: {len(summary['contracts'])}, свечей: {summary['rows']}")
+    print(f"Записано {DATA_DIR / 'bars'}")
     return 0
