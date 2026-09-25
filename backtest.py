@@ -7,9 +7,10 @@
 минутного диапазона. В последний день новая сделка не открывается, открытая
 закрывается на первом открытии этого дня.
 
-В работе два окна, выбранные по общему итогу: 680 минут и длинное окно из
-пары 12 480 / 12 960. Каждое считается отдельно. `python backtest.py --exits`
-сравнивает точные суммы длинной пары и перебирает длину выхода и стоп.
+В работе два окна по общему итогу, каждое со своим выходом. Короткое окно
+680 минут закрывается каналом той же длины, без защитного стопа. Длинное
+окно 12 960 минут держит стоп в 22 медианы минутного диапазона и не выходит
+по каналу. `python backtest.py --exits` показывает грубую сетку выходов.
 """
 
 from __future__ import annotations
@@ -27,10 +28,17 @@ COARSE_TO = 14_400
 COARSE_STEP = 480
 REFINE_STEP = 120
 REFINE_RADIUS = 480
-# Два окна по общему итогу, каждое отдельно. Длинное уточняет --exits.
+# Два окна по общему итогу, каждое со своим выходом.
+# Короткое: выход той же длины, защитного стопа нет.
+# Длинное: выход по каналу выключен, стоп 22 медианы минутного диапазона.
 SHORT_WINDOW = 680
+LONG_WINDOW = 12_960
 LONG_CANDIDATES = (12_480, 12_960)
-CHANNEL = 12_480
+WINDOWS = (
+    (SHORT_WINDOW, SHORT_WINDOW, None),
+    (LONG_WINDOW, 0, 22.0),
+)
+CHANNEL = SHORT_WINDOW
 STOP_MULT = 2.5
 # Длина выхода = N * scale / 4. Ноль выключает выход по каналу.
 EXIT_SCALES = (0, 1, 2, 4, 8)
@@ -67,7 +75,7 @@ class SignalData(bt.feeds.PandasData):
 
 
 class MinuteDonchian(bt.Strategy):
-    params = dict(secid="", last_day="", stop_mult=STOP_MULT)
+    params = dict(secid="", last_day="", stop_mult=STOP_MULT, use_stop=True)
 
     def __init__(self) -> None:
         self.entry_order = None
@@ -161,7 +169,8 @@ class MinuteDonchian(bt.Strategy):
         if typical > 0 and float(self.data.volume[0]) < typical:
             return
         close = float(self.data.close[0])
-        self.stop_dist = self.p.stop_mult * float(self.data.prior_range[0])
+        if self.p.use_stop:
+            self.stop_dist = self.p.stop_mult * float(self.data.prior_range[0])
         if close > float(self.data.prior_high[0]):
             self.pending = "long"
         elif close < float(self.data.prior_low[0]):
@@ -182,6 +191,8 @@ class MinuteDonchian(bt.Strategy):
             self.protective = None
 
     def _arm_stop(self, entry: bt.Order) -> None:
+        if not self.p.use_stop:
+            return
         fill = float(entry.executed.price)
         dist = float(self.stop_dist)
         if entry.isbuy():
@@ -284,8 +295,9 @@ def simulate(
     clearance: float = 0.0,
     cooldown: int = 0,
     clock_volume: bool = False,
-    stop_mult: float = STOP_MULT,
+    stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
+    trail: bool = False,
     view: pd.DataFrame | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
@@ -294,6 +306,8 @@ def simulate(
     cooldown — сколько минут после стопа нельзя открывать новую сделку.
     clock_volume заменяет сравнение с медианой последних N минут на медиану
     той же минуты суток за предыдущие дни.
+    stop_mult None выключает стоп. trail подтягивает стоп за закрытием
+    на исходную дистанцию, уже после проверки стопа на этой минуте.
     view — уже посчитанные уровни; иначе они строятся из channel и exit_channel.
     """
     if view is None:
@@ -326,12 +340,12 @@ def simulate(
             position = 1
             entry_px = opened[i]
             entry_i = i
-            stop_px = entry_px - stop_dist
+            stop_px = float("-inf") if stop_dist is None else entry_px - stop_dist
         elif pending == "short" and position == 0:
             position = -1
             entry_px = opened[i]
             entry_i = i
-            stop_px = entry_px + stop_dist
+            stop_px = float("inf") if stop_dist is None else entry_px + stop_dist
         elif pending == "exit" and position != 0:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "channel")
             position = 0
@@ -359,6 +373,11 @@ def simulate(
             stopped = True
         if stopped and cooldown:
             cooldown_until = i + cooldown
+        elif trail and position != 0 and stop_dist is not None:
+            if position == 1:
+                stop_px = max(stop_px, close[i] - stop_dist)
+            else:
+                stop_px = min(stop_px, close[i] + stop_dist)
 
         if i + 1 >= len(view) or days[i] == last_day:
             continue
@@ -380,7 +399,7 @@ def simulate(
             if typical > 0 and volume[i] < typical:
                 continue
             room = clearance * prior_range[i]
-            stop_dist = stop_mult * prior_range[i]
+            stop_dist = None if stop_mult is None else stop_mult * prior_range[i]
             if close[i] > prior_high[i] + room:
                 pending = "long"
             elif close[i] < prior_low[i] - room:
@@ -543,8 +562,9 @@ def score_window(
     frames: dict[str, pd.DataFrame],
     channel: int,
     *,
-    stop_mult: float = STOP_MULT,
+    stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
+    trail: bool = False,
     views: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, object]:
     """Сумма по контрактам и пять частей. Пересечение историй в сумму не склеивается."""
@@ -555,6 +575,7 @@ def score_window(
             channel,
             stop_mult=stop_mult,
             exit_channel=exit_channel,
+            trail=trail,
             view=None if views is None else views[secid],
         )
         for secid, frame in frames.items()
@@ -565,10 +586,13 @@ def score_window(
         reason = str(trade["reason"])
         reasons[reason] = reasons.get(reason, 0) + 1
     recorded_exit = max(channel // 2, 1) if exit_channel is None else exit_channel
+    pnls = [float(trade["pnlcomm"]) for trade in trades]
     return {
         "channel": channel,
         "exit": recorded_exit,
         "stop_mult": stop_mult,
+        "worst": min(pnls) if pnls else 0.0,
+        "best": max(pnls) if pnls else 0.0,
         "trades": len(trades),
         "wins": sum(float(trade["pnlcomm"]) > 0 for trade in trades),
         "net": _net(by_secid, list(frames)),
@@ -591,13 +615,19 @@ def run_contract(
     frame: pd.DataFrame,
     channel: int = CHANNEL,
     *,
-    stop_mult: float = STOP_MULT,
+    stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     last_day = pd.Timestamp(view.index[-1]).date().isoformat()
     cerebro = bt.Cerebro(stdstats=False, cheat_on_open=True)
-    cerebro.addstrategy(MinuteDonchian, secid=secid, last_day=last_day, stop_mult=stop_mult)
+    cerebro.addstrategy(
+        MinuteDonchian,
+        secid=secid,
+        last_day=last_day,
+        stop_mult=STOP_MULT if stop_mult is None else stop_mult,
+        use_stop=stop_mult is not None,
+    )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(START_CASH)
     cerebro.broker.setcommission(
@@ -610,11 +640,23 @@ def run_contract(
     return cerebro.run()[0]
 
 
-def run_all(frames: dict[str, pd.DataFrame], channel: int = CHANNEL) -> dict[str, object]:
+def run_all(
+    frames: dict[str, pd.DataFrame],
+    channel: int = CHANNEL,
+    *,
+    stop_mult: float | None = STOP_MULT,
+    exit_channel: int | None = None,
+) -> dict[str, object]:
     results = []
     for secid, frame in frames.items():
         print(secid, flush=True)
-        strategy = run_contract(secid, frame, channel)
+        strategy = run_contract(
+            secid,
+            frame,
+            channel,
+            stop_mult=stop_mult,
+            exit_channel=exit_channel,
+        )
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
         net = sum(float(trade["pnlcomm"]) for trade in strategy.trades)
         results.append(
@@ -628,7 +670,14 @@ def run_all(frames: dict[str, pd.DataFrame], channel: int = CHANNEL) -> dict[str
             }
         )
     trades = [trade for item in results for trade in item["trades"]]
-    return {"contracts": results, "trades": trades, "channel": channel}
+    recorded_exit = max(channel // 2, 1) if exit_channel is None else exit_channel
+    return {
+        "contracts": results,
+        "trades": trades,
+        "channel": channel,
+        "exit": recorded_exit,
+        "stop_mult": stop_mult,
+    }
 
 
 def _max_drawdown(values: list[tuple[object, float]]) -> float:
@@ -710,6 +759,8 @@ def report(summary: dict[str, object]) -> str:
     contracts = summary["contracts"]
     assert isinstance(contracts, list)
     channel = int(summary["channel"])
+    exit_channel = int(summary.get("exit", channel // 2))
+    stop_mult = summary.get("stop_mult", STOP_MULT)
     net = sum(float(trade["pnlcomm"]) for trade in trades)
     gross = sum(float(trade["pnl"]) for trade in trades)
     hold = sum(float(item["hold"]) for item in contracts)
@@ -719,11 +770,21 @@ def report(summary: dict[str, object]) -> str:
     factor = _profit_factor(trades)
     factor_text = "—" if factor is None else f"{factor:.2f}"
     worst = min((_max_drawdown(item["values"]) for item in contracts), default=0.0)
+    if stop_mult is None:
+        stop_text = "защитного стопа нет"
+    else:
+        stop_text = f"стоп {float(stop_mult):.0f} медиан минутного диапазона"
+    if exit_channel <= 0:
+        exit_text = "выход по каналу выключен"
+    else:
+        exit_text = f"выход по каналу {exit_channel} минут"
+    part_nets = _part_nets(trades)
     lines = [
-        f"Минутный канал {channel}/{channel // 2}, 1 контракт, лот 1000 юаней.",
+        f"Минутный канал {channel}, {exit_text}, {stop_text}. 1 контракт, лот 1000 юаней.",
         "Вход на следующем открытии, если объём минуты сигнала не ниже медианы окна.",
         f"Комиссия {COMMISSION:.0f} руб. за сторону. В последний день позиция закрывается.",
         "Окна пересекаются на месяц: сумма результатов — не один счёт.",
+        "Части: " + ", ".join(f"Ч{index} {_money(part)}" for index, part in enumerate(part_nets, start=1)),
         f"Сделок: {len(trades)}. Прибыльных: {len(wins)}.",
         f"Лонгов: {len(longs)}, результат {sum(float(trade['pnlcomm']) for trade in longs):,.0f} руб.",
         f"Шортов: {len(shorts)}, результат {sum(float(trade['pnlcomm']) for trade in shorts):,.0f} руб.",
@@ -745,6 +806,13 @@ def report(summary: dict[str, object]) -> str:
         lines.append("")
         lines.append("Выходы: " + ", ".join(f"{name} {count}" for name, count in sorted(reasons.items())))
     return "\n".join(lines)
+
+
+def _part_nets(trades: list[dict[str, object]]) -> tuple[float, ...]:
+    by_secid: dict[str, list[dict[str, object]]] = {}
+    for trade in trades:
+        by_secid.setdefault(str(trade["secid"]), []).append(trade)
+    return tuple(_net(by_secid, list(part)) for part in PARTS)
 
 
 def _reason_text(reasons: object) -> str:
@@ -850,12 +918,22 @@ def _exit_decision(
         f"{channel}: {_money(float(baselines[channel]['net']))} руб." for channel in windows
     )
     if adopted is None:
-        return f"Ни одна пара выход/стоп не подняла оба итога. База остаётся выход N/2, стоп {STOP_MULT}. База: {base}"
-    scale, stop_mult = adopted
-    return (
-        f"Оба итога выше при выходе {scale}/4 окна и стопе {stop_mult:.1f}. "
-        f"База (N/2, стоп {STOP_MULT}): {base}"
+        coarse = f"Внутри стопов 1,5–8 ни одна пара не подняла оба итога. База: {base}"
+    else:
+        scale, stop_mult = adopted
+        coarse = (
+            f"Внутри этой грубой сетки оба итога выше при выходе {scale}/4 окна и стопе {stop_mult:.1f}. "
+            f"База (N/2, стоп {STOP_MULT}): {base}"
+        )
+    locked = ", ".join(
+        "вход {channel}, выход {exit_channel}, стоп {stop}".format(
+            channel=channel,
+            exit_channel=exit_channel,
+            stop="нет" if stop is None else f"{float(stop):g}",
+        )
+        for channel, exit_channel, stop in WINDOWS
     )
+    return coarse + " Рабочие выходы после более широкой проверки: " + locked + "."
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -886,7 +964,9 @@ def main(argv: list[str] | None = None) -> int:
             f"худшая часть {_money(min(float(part) for part in chosen['parts']))} руб."
         )
         return 0
-    print(report(run_all(frames, CHANNEL)))
+    for channel, exit_channel, stop_mult in WINDOWS:
+        print(report(run_all(frames, channel, stop_mult=stop_mult, exit_channel=exit_channel)))
+        print()
     return 0
 
 
