@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from backtest import buy_and_hold, choose_window, run_contract, simulate
+from backtest import buy_and_hold, choose_window, refine_windows, run_contract, simulate
 
 
 def _days(rows: list[tuple[float, float, float, float, float]]) -> pd.DataFrame:
@@ -66,14 +66,68 @@ def test_breakout_below_the_median_volume_is_skipped():
     assert run_contract("CRU5", frame, 20).trades == []
 
 
-def test_choose_window_prefers_the_stronger_weaker_half():
+def _scored(channel: int, parts: tuple[float, ...], per: tuple[float, ...] | None = None) -> dict[str, object]:
+    return {
+        "channel": channel,
+        "parts": parts,
+        "per_contract": (4.0, 4.0, 4.0, 4.0, 4.0) if per is None else per,
+    }
+
+
+def test_choose_window_prefers_the_stronger_weakest_part():
     rows = [
-        {"channel": 15, "half1": 100.0, "half2": 10.0, "per_contract_2": 4.0},
-        {"channel": 60, "half1": 50.0, "half2": 40.0, "per_contract_2": 5.0},
-        {"channel": 30, "half1": 80.0, "half2": -1.0, "per_contract_2": 9.0},
-        {"channel": 120, "half1": 40.0, "half2": 40.0, "per_contract_2": 4.0},
+        _scored(480, (100.0, 80.0, 70.0, 60.0, 10.0)),
+        _scored(960, (50.0, 40.0, 45.0, 40.0, 40.0)),
+        _scored(1440, (80.0, -1.0, 90.0, 90.0, 90.0)),
+        _scored(1920, (40.0, 40.0, 40.0, 40.0, 40.0)),
+        _scored(2400, (5.0, 5.0, 5.0, 5.0, 5.0), (4.0, 4.0, 1.0, 4.0, 4.0)),
     ]
     chosen = choose_window(rows)
     assert chosen is not None
-    assert chosen["channel"] == 60
-    assert choose_window([{"channel": 15, "half1": -1.0, "half2": 10.0, "per_contract_2": 8.0}]) is None
+    assert chosen["channel"] == 960
+    assert choose_window([_scored(480, (-1.0, 10.0, 10.0, 10.0, 10.0))]) is None
+
+
+def test_clearance_blocks_a_close_that_only_touches_the_channel():
+    rows = [_quiet() for _ in range(5)]
+    rows.append((10.0, 10.08, 9.98, 10.07, 1000))
+    rows.extend(_quiet(10.07) for _ in range(3))
+    frame = _days(rows)
+    assert len(simulate("CRZ5", frame, 5)) == 1
+    assert simulate("CRZ5", frame, 5, clearance=0.5) == []
+
+
+def test_clock_volume_compares_with_the_same_minute_of_prior_days():
+    start = datetime(2024, 1, 2, 10, 0)
+    stamps = []
+    values = []
+    for day in range(5):
+        stamps.append(start + timedelta(days=day))
+        values.append((10.0, 10.05, 9.95, 10.0, 1000))
+        stamps.append(start + timedelta(days=day, minutes=1))
+        values.append((10.0, 10.05, 9.95, 10.0, 1))
+    signal = start + timedelta(days=5)
+    stamps.extend((signal, signal + timedelta(minutes=1), signal + timedelta(days=1)))
+    values.extend(
+        (
+            (10.0, 10.40, 10.20, 10.30, 10),
+            (10.30, 10.40, 10.20, 10.30, 1),
+            (10.30, 10.40, 10.20, 10.30, 1),
+        )
+    )
+    frame = pd.DataFrame(values, columns=["open", "high", "low", "close", "volume"], index=pd.to_datetime(stamps))
+    assert len(simulate("CRU5", frame, 1)) == 1
+    assert simulate("CRU5", frame, 1, clock_volume=True) == []
+
+
+def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():
+    rows = [
+        _scored(480, (1.0, 1.0, 1.0, 1.0, 1.0)),
+        _scored(960, (-1.0, 1.0, 1.0, 1.0, 1.0)),
+        _scored(14400, (2.0, 2.0, 2.0, 2.0, 2.0)),
+    ]
+    extra = refine_windows(rows)
+    assert 360 not in extra
+    assert 600 in extra
+    assert 14880 in extra
+    assert 14400 not in extra

@@ -7,10 +7,10 @@
 В последний день новая сделка не открывается, открытая закрывается на первом
 открытии этого дня.
 
-`python backtest.py --grid` печатает сетку окон. Обычный запуск гоняет в
-backtrader окно, выбранное по правилу: обе половины контрактов в плюсе, во
-второй половине не меньше 4 сделок на контракт, среди таких — лучший
-результат худшей половины.
+`python backtest.py --grid` печатает грубую сетку, уточнение вокруг пиков
+и три фильтра по отдельности. Окно годится, если все пять частей контрактов
+в плюсе и в каждой не меньше 4 сделок на контракт. Среди таких берётся лучший
+результат худшей части.
 """
 
 from __future__ import annotations
@@ -23,13 +23,25 @@ import backtrader as bt
 import numpy as np
 import pandas as pd
 
-WINDOWS = (15, 30, 60, 120, 240, 480, 960, 2400, 4800)
-# Сетка 2026-09-21: единственные окна с плюсом в обеих половинах — 960 и 4800.
-# У 960 худшая половина 1 819 руб. против 22 руб. у 4800.
+COARSE_FROM = 480
+COARSE_TO = 14_400
+COARSE_STEP = 480
+REFINE_STEP = 120
+REFINE_RADIUS = 480
+# Сетка 480..14400 по пяти частям не дала окна, где все части в плюсе.
+# Обычный запуск оставлен на 960: его выбрало прежнее правило двух половин.
 CHANNEL = 960
 STOP_MULT = 2.5
 MIN_TRADES_PER_CONTRACT = 4
-SPLIT_SECID = "CRZ4"
+CLEARANCE = 0.5
+CLOCK_DAYS = 5
+PARTS = (
+    ("CRM2", "CRU2", "CRZ2", "CRH3"),
+    ("CRM3", "CRU3", "CRZ3", "CRH4"),
+    ("CRM4", "CRU4", "CRZ4", "CRH5"),
+    ("CRM5", "CRU5", "CRZ5", "CRH6"),
+    ("CRM6", "CRU6", "CRZ6"),
+)
 MULTIPLIER = 1000.0
 COMMISSION = 1.0
 MARGIN = 20_000.0
@@ -235,8 +247,35 @@ def channel_view(frame: pd.DataFrame, channel: int) -> pd.DataFrame:
     return view
 
 
-def simulate(secid: str, frame: pd.DataFrame, channel: int) -> list[dict[str, object]]:
-    """Те же правила, что у стратегии в backtrader, без самого движка."""
+def _clock_volume(index: pd.DatetimeIndex, volume: np.ndarray, lookback: int) -> np.ndarray:
+    """Медиана объёма той же минуты суток по предыдущим lookback наблюдениям."""
+    minutes = index.hour * 60 + index.minute
+    typical = np.full(len(volume), np.nan)
+    history: dict[int, list[float]] = {}
+    for i, minute in enumerate(minutes):
+        seen = history.get(int(minute))
+        if seen is not None and len(seen) >= lookback:
+            typical[i] = float(np.median(seen[-lookback:]))
+        history.setdefault(int(minute), []).append(float(volume[i]))
+    return typical
+
+
+def simulate(
+    secid: str,
+    frame: pd.DataFrame,
+    channel: int,
+    *,
+    clearance: float = 0.0,
+    cooldown: int = 0,
+    clock_volume: bool = False,
+) -> list[dict[str, object]]:
+    """Те же правила, что у стратегии в backtrader, без самого движка.
+
+    clearance — на сколько медиан диапазона закрытие должно пробить канал.
+    cooldown — сколько минут после стопа нельзя открывать новую сделку.
+    clock_volume заменяет сравнение с медианой последних N минут на медиану
+    той же минуты суток за предыдущие дни.
+    """
     view = channel_view(frame, channel)
     opened = view["open"].to_numpy(dtype=float)
     high = view["high"].to_numpy(dtype=float)
@@ -249,6 +288,7 @@ def simulate(secid: str, frame: pd.DataFrame, channel: int) -> list[dict[str, ob
     prior_range = view["prior_range"].to_numpy(dtype=float)
     exit_high = view["exit_high"].to_numpy(dtype=float)
     exit_low = view["exit_low"].to_numpy(dtype=float)
+    clock_typical = _clock_volume(view.index, volume, CLOCK_DAYS) if clock_volume else None
     days = view.index.date
     last_day = days[-1]
     trades: list[dict[str, object]] = []
@@ -258,6 +298,7 @@ def simulate(secid: str, frame: pd.DataFrame, channel: int) -> list[dict[str, ob
     stop_px = 0.0
     stop_dist = 0.0
     pending = ""
+    cooldown_until = 0
 
     for i in range(len(view)):
         if pending == "long" and position == 0:
@@ -278,18 +319,25 @@ def simulate(secid: str, frame: pd.DataFrame, channel: int) -> list[dict[str, ob
             position = 0
         pending = ""
 
+        stopped = False
         if position == 1 and opened[i] <= stop_px:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop")
             position = 0
+            stopped = True
         elif position == 1 and low[i] <= stop_px:
             _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop")
             position = 0
+            stopped = True
         elif position == -1 and opened[i] >= stop_px:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop")
             position = 0
+            stopped = True
         elif position == -1 and high[i] >= stop_px:
             _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop")
             position = 0
+            stopped = True
+        if stopped and cooldown:
+            cooldown_until = i + cooldown
 
         if i + 1 >= len(view) or days[i] == last_day:
             continue
@@ -301,14 +349,20 @@ def simulate(secid: str, frame: pd.DataFrame, channel: int) -> list[dict[str, ob
             pending = "exit"
         elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
             pending = "exit"
-        elif position == 0 and prior_high[i] == prior_high[i]:
-            typical = prior_vol[i]
+        elif position == 0 and prior_high[i] == prior_high[i] and i >= cooldown_until:
+            if clock_typical is None:
+                typical = prior_vol[i]
+            else:
+                typical = clock_typical[i]
+                if typical != typical:
+                    continue
             if typical > 0 and volume[i] < typical:
                 continue
+            room = clearance * prior_range[i]
             stop_dist = STOP_MULT * prior_range[i]
-            if close[i] > prior_high[i]:
+            if close[i] > prior_high[i] + room:
                 pending = "long"
-            elif close[i] < prior_low[i]:
+            elif close[i] < prior_low[i] - room:
                 pending = "short"
     return trades
 
@@ -351,51 +405,103 @@ def buy_and_hold(frame: pd.DataFrame, channel: int) -> float:
     return (float(frame["open"].iloc[exit_i]) - float(frame["open"].iloc[entry_i])) * MULTIPLIER - 2 * COMMISSION
 
 
-def halves(secids: list[str]) -> tuple[list[str], list[str]]:
-    if SPLIT_SECID not in secids:
-        raise ValueError(f"В ряде нет {SPLIT_SECID}, нечем делить историю пополам")
-    cut = secids.index(SPLIT_SECID) + 1
-    return secids[:cut], secids[cut:]
+def coarse_windows() -> tuple[int, ...]:
+    return tuple(range(COARSE_FROM, COARSE_TO + 1, COARSE_STEP))
+
+
+def _eligible(row: dict[str, object]) -> bool:
+    parts = row["parts"]
+    assert isinstance(parts, tuple)
+    per_contract = row["per_contract"]
+    assert isinstance(per_contract, tuple)
+    return all(float(part) > 0 for part in parts) and all(
+        float(count) >= MIN_TRADES_PER_CONTRACT for count in per_contract
+    )
 
 
 def choose_window(rows: list[dict[str, object]]) -> dict[str, object] | None:
-    """Обе половины в плюсе, во второй достаточно сделок, затем лучшая худшая половина."""
-    eligible = [
-        row
-        for row in rows
-        if float(row["half1"]) > 0
-        and float(row["half2"]) > 0
-        and float(row["per_contract_2"]) >= MIN_TRADES_PER_CONTRACT
-    ]
+    """Все пять частей в плюсе и с достаточным числом сделок, затем лучшая худшая часть."""
+    eligible = [row for row in rows if _eligible(row)]
     if not eligible:
         return None
-    return max(eligible, key=lambda row: (min(float(row["half1"]), float(row["half2"])), -int(row["channel"])))
+    return max(eligible, key=lambda row: (min(float(part) for part in row["parts"]), -int(row["channel"])))
 
 
-def run_grid(frames: dict[str, pd.DataFrame], windows: tuple[int, ...] = WINDOWS) -> list[dict[str, object]]:
-    first, second = halves(list(frames))
+def local_peaks(rows: list[dict[str, object]]) -> list[int]:
+    """Окна, которые прошли правило и не хуже прошедших соседей по худшей части."""
+    ordered = sorted(rows, key=lambda row: int(row["channel"]))
+    peaks: list[int] = []
+    for index, row in enumerate(ordered):
+        if not _eligible(row):
+            continue
+        worst = min(float(part) for part in row["parts"])
+        neighbors = []
+        if index > 0:
+            neighbors.append(ordered[index - 1])
+        if index + 1 < len(ordered):
+            neighbors.append(ordered[index + 1])
+        neighbor_worst = [
+            min(float(part) for part in item["parts"]) if _eligible(item) else float("-inf") for item in neighbors
+        ]
+        if all(worst >= other for other in neighbor_worst):
+            peaks.append(int(row["channel"]))
+    return peaks
+
+
+def refine_windows(rows: list[dict[str, object]]) -> tuple[int, ...]:
+    """Шаг 120 вокруг прошедших пиков и вокруг краёв грубой сетки."""
+    centers = set(local_peaks(rows))
+    centers.update((COARSE_FROM, COARSE_TO))
+    known = {int(row["channel"]) for row in rows}
+    points: set[int] = set()
+    for center in centers:
+        low = COARSE_FROM if center == COARSE_FROM else max(COARSE_FROM, center - REFINE_RADIUS)
+        high = center + REFINE_RADIUS if center == COARSE_TO else min(COARSE_TO, center + REFINE_RADIUS)
+        for channel in range(low, high + 1, REFINE_STEP):
+            if channel not in known:
+                points.add(channel)
+    return tuple(sorted(points))
+
+
+def run_grid(
+    frames: dict[str, pd.DataFrame],
+    windows: tuple[int, ...],
+    *,
+    clearance: float = 0.0,
+    cooldown: int = 0,
+    clock_volume: bool = False,
+) -> list[dict[str, object]]:
+    missing = [secid for part in PARTS for secid in part if secid not in frames]
+    if missing:
+        raise ValueError("В данных нет контрактов: " + ", ".join(missing))
     rows = []
     for channel in windows:
         print(f"окно {channel}", flush=True)
-        by_secid: dict[str, list[dict[str, object]]] = {}
-        for secid, frame in frames.items():
-            by_secid[secid] = simulate(secid, frame, channel)
+        by_secid = {
+            secid: simulate(
+                secid,
+                frame,
+                channel,
+                clearance=clearance,
+                cooldown=cooldown,
+                clock_volume=clock_volume,
+            )
+            for secid, frame in frames.items()
+        }
         trades = [trade for secid in frames for trade in by_secid[secid]]
-        half1 = _net(by_secid, first)
-        half2 = _net(by_secid, second)
-        trades2 = sum(len(by_secid[secid]) for secid in second)
+        parts = tuple(_net(by_secid, list(part)) for part in PARTS)
+        per_contract = tuple(
+            sum(len(by_secid[secid]) for secid in part) / len(part) for part in PARTS
+        )
         rows.append(
             {
                 "channel": channel,
                 "exit": channel // 2,
                 "trades": len(trades),
                 "net": _net(by_secid, list(frames)),
-                "half1": half1,
-                "half2": half2,
-                "trades2": trades2,
-                "per_contract_2": trades2 / len(second),
+                "parts": parts,
+                "per_contract": per_contract,
                 "factor": _profit_factor(trades),
-                "by_secid": by_secid,
             }
         )
     return rows
@@ -464,33 +570,62 @@ def _money(value: float) -> str:
     return f"{value:,.0f}"
 
 
-def grid_report(rows: list[dict[str, object]]) -> str:
+def _part_labels() -> str:
+    return "  ".join(f"{secids[0]}–{secids[-1]}" for secids in PARTS)
+
+
+def grid_report(rows: list[dict[str, object]], title: str) -> str:
     chosen = choose_window(rows)
     lines = [
-        "Сетка окон по закрытиям минуток. Выход — половина окна.",
-        f"Годится окно, если обе половины в плюсе и во второй не меньше {MIN_TRADES_PER_CONTRACT:.0f} сделок на контракт.",
-        f"Половина 1: до {SPLIT_SECID} включительно. Половина 2: следующие контракты.",
+        title,
+        "Выход — половина окна. Объём минуты сигнала не ниже медианы окна.",
+        f"Годится окно, если все пять частей в плюсе и в каждой не меньше {MIN_TRADES_PER_CONTRACT:.0f} сделок на контракт.",
+        _part_labels(),
         "Сумма — не один счёт: истории пересекаются на месяц.",
         "",
-        f"{'N':>6} {'ВЫХОД':>6} {'СДЕЛОК':>7} {'ИТОГ':>10} {'ДО CRZ4':>10} {'ПОСЛЕ':>10} {'СД/КНТ':>7} {'ФАКТОР':>7}",
+        f"{'N':>6} {'СДЕЛОК':>7} {'ИТОГ':>10} "
+        + " ".join(f"{'Ч' + str(index):>9}" for index in range(1, 6))
+        + f" {'ХУДШАЯ':>9} {'ФАКТОР':>7}",
     ]
-    for row in rows:
+    for row in sorted(rows, key=lambda item: int(item["channel"])):
+        parts = tuple(float(part) for part in row["parts"])
         factor = row["factor"]
         factor_text = "—" if factor is None else f"{float(factor):.2f}"
-        mark = ""
-        if chosen is not None and int(row["channel"]) == int(chosen["channel"]):
-            mark = "  ←"
+        mark = "  ←" if chosen is not None and int(row["channel"]) == int(chosen["channel"]) else ""
+        part_text = " ".join(f"{_money(part):>9}" for part in parts)
         lines.append(
-            f"{int(row['channel']):>6} {int(row['exit']):>6} {int(row['trades']):>7} "
-            f"{_money(float(row['net'])):>10} {_money(float(row['half1'])):>10} "
-            f"{_money(float(row['half2'])):>10} {float(row['per_contract_2']):>7.1f} {factor_text:>7}{mark}"
+            f"{int(row['channel']):>6} {int(row['trades']):>7} {_money(float(row['net'])):>10} "
+            f"{part_text} {_money(min(parts)):>9} {factor_text:>7}{mark}"
         )
     lines.append("")
     if chosen is None:
-        lines.append("Ни одно окно не прошло правило. Параметр в backtest.py не менялся бы этим прогоном.")
+        lines.append("В этой сетке ни одно окно не прошло правило.")
     else:
+        worst = min(float(part) for part in chosen["parts"])
+        lines.append(f"Лучшее в этой сетке: N={int(chosen['channel'])}, худшая часть {_money(worst)} руб.")
+    return "\n".join(lines)
+
+
+def filter_report(frames: dict[str, pd.DataFrame], channel: int) -> str:
+    """Три фильтра по отдельности на уже выбранном окне."""
+    variants = (
+        ("как есть", {}),
+        ("пауза после стопа", {"cooldown": channel}),
+        ("запас пробоя 0,5 диапазона", {"clearance": CLEARANCE}),
+        ("объём той же минуты за 5 дней", {"clock_volume": True}),
+    )
+    lines = [
+        f"Фильтры по одному на окне {channel}. Объём последних {channel} минут остаётся, кроме последней строки: там он заменён.",
+        f"{'ФИЛЬТР':<32} {'СДЕЛОК':>7} {'ИТОГ':>10} {'ХУДШАЯ':>9} {'ПЛЮС':>5}",
+    ]
+    for name, options in variants:
+        print(f"фильтр: {name}", flush=True)
+        rows = run_grid(frames, (channel,), **options)
+        row = rows[0]
+        parts = tuple(float(part) for part in row["parts"])
+        plus = sum(part > 0 for part in parts)
         lines.append(
-            f"Выбрано N={int(chosen['channel'])}: худшая половина {_money(min(float(chosen['half1']), float(chosen['half2'])))} руб."
+            f"{name:<32} {int(row['trades']):>7} {_money(float(row['net'])):>10} {_money(min(parts)):>9} {plus:>5}/5"
         )
     return "\n".join(lines)
 
@@ -545,7 +680,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
     if args.grid:
-        print(grid_report(run_grid(frames)))
+        coarse = run_grid(frames, coarse_windows())
+        print(grid_report(coarse, "Грубая сетка, шаг 480 минут."))
+        extra = refine_windows(coarse)
+        refined = run_grid(frames, extra) if extra else []
+        if refined:
+            print()
+            print(grid_report(refined, "Уточнение, шаг 120 минут."))
+        chosen = choose_window(coarse + refined)
+        print()
+        if chosen is None:
+            closest = max(coarse + refined, key=lambda row: min(float(part) for part in row["parts"]))
+            print(
+                f"Ни одно окно не прошло правило пяти частей. Ближайшее по худшей части: "
+                f"N={int(closest['channel'])}, худшая часть "
+                f"{_money(min(float(part) for part in closest['parts']))} руб."
+            )
+            print()
+            print(filter_report(frames, int(closest["channel"])))
+            return 0
+        print(
+            f"Выбрано N={int(chosen['channel'])}: худшая часть "
+            f"{_money(min(float(part) for part in chosen['parts']))} руб."
+        )
+        print()
+        print(filter_report(frames, int(chosen["channel"])))
         return 0
     print(report(run_all(frames, CHANNEL)))
     return 0
