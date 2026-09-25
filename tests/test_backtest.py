@@ -1,9 +1,19 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
 
-from backtest import WINDOWS, _part_nets, buy_and_hold, choose_window, entry_lots, refine_windows, run_contract, simulate
+from backtest import (
+    WINDOWS,
+    _part_nets,
+    buy_and_hold,
+    choose_window,
+    entry_lots,
+    load_trade_starts,
+    refine_windows,
+    run_contract,
+    simulate,
+)
 
 
 def _days(rows: list[tuple[float, float, float, float, float]]) -> pd.DataFrame:
@@ -194,6 +204,42 @@ def test_inverse_size_uses_three_lots_on_a_fresh_breakout():
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 3 * 1000)
         assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6)
+
+
+def _front_frame() -> pd.DataFrame:
+    rows = [_quiet() for _ in range(5)]
+    rows.append((10.0, 10.40, 10.20, 10.30, 1000))
+    rows.extend(_quiet(10.40) for _ in range(3))
+    rows.append((10.80, 10.90, 10.70, 10.80, 1000))
+    return _days(rows)
+
+
+def test_warmup_bars_form_the_channel_and_the_fill_opens_the_front_contract():
+    frame = _front_frame()
+    front = frame.index[6].date()
+    simulated = simulate("CRU2", frame, 5, stop_mult=None, exit_channel=0, trade_from=front)
+    strategy = run_contract("CRU2", frame, 5, stop_mult=None, exit_channel=0, trade_from=front)
+    assert len(simulated) == len(strategy.trades) == 1
+    entry = float(frame["open"].iloc[6])
+    exit_ = float(frame["open"].iloc[-1])
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["reason"] == "expiry"
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
+
+
+def test_a_fill_during_the_warmup_month_is_not_a_trade():
+    frame = _front_frame()
+    front = frame.index[7].date()
+    assert simulate("CRU2", frame, 5, stop_mult=None, exit_channel=0, trade_from=front) == []
+    assert run_contract("CRU2", frame, 5, stop_mult=None, exit_channel=0, trade_from=front).trades == []
+
+
+def test_trade_starts_follow_the_expiring_contract_not_the_warmup_month():
+    starts = load_trade_starts()
+    assert starts["CRM2"] == date(2022, 4, 21)
+    assert starts["CRU2"] == date(2022, 6, 17)
+    assert starts["CRZ6"] == date(2026, 9, 18)
 
 
 def test_entry_lots_step_down_as_the_breakout_grows():

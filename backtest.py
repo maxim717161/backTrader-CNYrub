@@ -7,6 +7,11 @@
 минутного диапазона. В последний день новая сделка не открывается, открытая
 закрывается на первом открытии этого дня.
 
+Сделки идут только в истекающем контракте, со следующего дня после экспирации
+предыдущего. Месяц до этого дня уже лежит в файле и прогревает окно, но
+позиция в нём не открывается. После экспирации следующий контракт торгуется
+сразу: окно к этому дню уже собрано.
+
 В работе два окна, и правила у них разные. Короткое окно 525 минут
 закрывается каналом той же длины, без защитного стопа, одним лотом.
 Минута сигнала ещё и не громче пяти медиан той же минуты суток за пять дней.
@@ -18,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -110,6 +116,7 @@ class MinuteDonchian(bt.Strategy):
         use_stop=True,
         clock_cap=None,
         size_mode="flat",
+        trade_from="",
     )
 
     def __init__(self) -> None:
@@ -203,7 +210,13 @@ class MinuteDonchian(bt.Strategy):
         elif float(self.position.size) < 0 and float(self.data.close[0]) > float(self.data.exit_high[0]):
             self.pending = "exit"
 
+    def _front_day(self) -> date | None:
+        return _as_date(self.p.trade_from)
+
     def _schedule_entry(self) -> None:
+        front = self._front_day()
+        if front is not None and self.data.datetime.date(1) < front:
+            return
         if float(self.data.entry_ready[0]) < 1:
             return
         typical = float(self.data.prior_vol[0])
@@ -280,6 +293,28 @@ def _as_feed(frame: pd.DataFrame) -> pd.DataFrame:
     return feed.loc[:, columns]
 
 
+def _as_date(value: date | datetime | str | None) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def load_trade_starts(bars_dir: Path = BARS_DIR) -> dict[str, date]:
+    """День, с которого контракт истекающий и в нём можно открывать сделки."""
+    path = bars_dir.parent / "contracts.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    starts: dict[str, date] = {}
+    for row in document["contracts"]:
+        front = _as_date(row.get("window_start"))
+        if front is not None:
+            starts[str(row["secid"])] = front
+    return starts
+
+
 def load_minutes(bars_dir: Path = BARS_DIR) -> dict[str, pd.DataFrame]:
     """Минутки каждого контракта отдельно, в порядке последнего бара."""
     frames: dict[str, pd.DataFrame] = {}
@@ -352,6 +387,7 @@ def simulate(
     stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
     trail: bool = False,
+    trade_from: date | None = None,
     view: pd.DataFrame | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
@@ -366,6 +402,8 @@ def simulate(
     двух или больше медиан минутного диапазона.
     stop_mult None выключает стоп. trail подтягивает стоп за закрытием
     на исходную дистанцию, уже после проверки стопа на этой минуте.
+    trade_from — первый день истекающего контракта. Более ранние минуты
+    только собирают окно: сделка открывается не раньше открытия этого дня.
     view — уже посчитанные уровни; иначе они строятся из channel и exit_channel.
     """
     if view is None:
@@ -388,6 +426,7 @@ def simulate(
         clock_typical = view["clock_vol"].to_numpy(dtype=float)
     else:
         clock_typical = _clock_volume(view.index, volume, CLOCK_DAYS)
+    trade_from = _as_date(trade_from)
     days = view.index.date
     last_day = days[-1]
     trades: list[dict[str, object]] = []
@@ -458,6 +497,8 @@ def simulate(
         elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
             pending = "exit"
         elif position == 0 and prior_high[i] == prior_high[i] and i >= cooldown_until:
+            if trade_from is not None and days[i + 1] < trade_from:
+                continue
             if clock_volume:
                 typical = clock_typical[i]
                 if typical != typical:
@@ -527,14 +568,18 @@ def _close_trade(
     )
 
 
-def buy_and_hold(frame: pd.DataFrame, channel: int) -> float:
+def buy_and_hold(frame: pd.DataFrame, channel: int, trade_from: date | None = None) -> float:
     """Лонг с первой возможной минуты входа до открытия последнего дня."""
     if len(frame) < channel + 2:
         return 0.0
     days = frame.index.date
     last_day = days[-1]
     entry_i = channel + 1
-    if days[entry_i] == last_day:
+    trade_from = _as_date(trade_from)
+    if trade_from is not None:
+        while entry_i < len(frame) and days[entry_i] < trade_from:
+            entry_i += 1
+    if entry_i >= len(frame) or days[entry_i] == last_day:
         return 0.0
     exit_i = int(np.argmax(days == last_day))
     if exit_i <= entry_i:
@@ -614,6 +659,7 @@ def run_grid(
     clearance: float = 0.0,
     cooldown: int = 0,
     clock_volume: bool = False,
+    trade_from: dict[str, date] | None = None,
 ) -> list[dict[str, object]]:
     missing = [secid for part in PARTS for secid in part if secid not in frames]
     if missing:
@@ -629,6 +675,7 @@ def run_grid(
                 clearance=clearance,
                 cooldown=cooldown,
                 clock_volume=clock_volume,
+                trade_from=None if trade_from is None else trade_from.get(secid),
             )
             for secid, frame in frames.items()
         }
@@ -664,9 +711,10 @@ def score_window(
     trail: bool = False,
     clock_cap: float | None = None,
     size_mode: str = "flat",
+    trade_from: dict[str, date] | None = None,
     views: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, object]:
-    """Сумма по контрактам и пять частей. Пересечение историй в сумму не склеивается."""
+    """Сумма по контрактам и пять частей. Сделки идут только в истекающем контракте."""
     by_secid = {
         secid: simulate(
             secid,
@@ -677,6 +725,7 @@ def score_window(
             trail=trail,
             clock_cap=clock_cap,
             size_mode=size_mode,
+            trade_from=None if trade_from is None else trade_from.get(secid),
             view=None if views is None else views[secid],
         )
         for secid, frame in frames.items()
@@ -721,6 +770,7 @@ def run_contract(
     exit_channel: int | None = None,
     clock_cap: float | None = None,
     size_mode: str = "flat",
+    trade_from: date | None = None,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
@@ -734,6 +784,7 @@ def run_contract(
         use_stop=stop_mult is not None,
         clock_cap=clock_cap,
         size_mode=size_mode,
+        trade_from="" if trade_from is None else trade_from.isoformat(),
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(START_CASH)
@@ -755,6 +806,7 @@ def run_all(
     exit_channel: int | None = None,
     clock_cap: float | None = None,
     size_mode: str = "flat",
+    trade_from: dict[str, date] | None = None,
 ) -> dict[str, object]:
     results = []
     for secid, frame in frames.items():
@@ -767,16 +819,18 @@ def run_all(
             exit_channel=exit_channel,
             clock_cap=clock_cap,
             size_mode=size_mode,
+            trade_from=None if trade_from is None else trade_from.get(secid),
         )
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
         net = sum(float(trade["pnlcomm"]) for trade in strategy.trades)
+        front = None if trade_from is None else trade_from.get(secid)
         results.append(
             {
                 "secid": secid,
                 "trades": strategy.trades,
                 "gross": gross,
                 "net": net,
-                "hold": buy_and_hold(frame, channel),
+                "hold": buy_and_hold(frame, channel, front),
                 "values": strategy.values,
             }
         )
@@ -817,7 +871,7 @@ def grid_report(rows: list[dict[str, object]], title: str) -> str:
         "Выход — половина окна. Объём минуты сигнала не ниже медианы окна.",
         f"Годится окно, если прибыльных частей больше половины. Часть прибыльна при результате больше нуля и не меньше {MIN_TRADES_PER_CONTRACT:.0f} сделок на контракт.",
         _part_labels(),
-        "Сумма — не один счёт: истории пересекаются на месяц.",
+        "Сделки только в истекающем контракте. Месяц до него прогревает окно и не торгуется.",
         "",
         f"{'N':>6} {'СДЕЛОК':>7} {'ИТОГ':>10} "
         + " ".join(f"{'Ч' + str(index):>9}" for index in range(1, 6))
@@ -909,7 +963,7 @@ def report(summary: dict[str, object]) -> str:
         f"Минутный канал {channel}, {exit_text}, {stop_text}. {size_text}.",
         volume_text,
         f"Комиссия {COMMISSION:.0f} руб. за контракт за сторону. В последний день позиция закрывается.",
-        "Окна пересекаются на месяц: сумма результатов — не один счёт.",
+        "Сделки только в истекающем контракте. Месяц до него прогревает окно и не торгуется.",
         "Части: " + ", ".join(f"Ч{index} {_money(part)}" for index, part in enumerate(part_nets, start=1)),
         f"Сделок: {len(trades)}. Прибыльных: {len(wins)}.",
         _lots_line(trades),
@@ -978,10 +1032,10 @@ def _score_line(row: dict[str, object]) -> str:
     )
 
 
-def exit_grid(frames: dict[str, pd.DataFrame]) -> str:
+def exit_grid(frames: dict[str, pd.DataFrame], trade_from: dict[str, date] | None = None) -> str:
     """Точная сумма длинной пары и сетка выхода на двух окнах по общему итогу."""
     print("длинная пара, выход N/2, стоп 2.5", flush=True)
-    long_rows = [score_window(frames, channel) for channel in LONG_CANDIDATES]
+    long_rows = [score_window(frames, channel, trade_from=trade_from) for channel in LONG_CANDIDATES]
     long_row = max(long_rows, key=lambda row: float(row["net"]))
     long_channel = int(long_row["channel"])
     windows = (SHORT_WINDOW, long_channel)
@@ -1018,6 +1072,7 @@ def exit_grid(frames: dict[str, pd.DataFrame]) -> str:
                     channel,
                     stop_mult=stop_mult,
                     exit_channel=exit_channel,
+                    trade_from=trade_from,
                     views=views,
                 )
                 row["scale"] = scale
@@ -1086,16 +1141,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bars", type=Path, default=BARS_DIR, help="Каталог parquet по контрактам")
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
+    starts = load_trade_starts(args.bars)
     if args.exits:
-        print(exit_grid(frames))
+        print(exit_grid(frames, starts))
         return 0
     if args.grid:
         around_short = tuple(range(480, 1440 + 1, 20))
         around_long = tuple(range(11_520, 13_440 + 1, 120))
-        short = run_grid(frames, around_short)
+        short = run_grid(frames, around_short, trade_from=starts)
         print(grid_report(short, "Вокруг 960: 480–1440, шаг 20."))
         print()
-        long = run_grid(frames, around_long)
+        long = run_grid(frames, around_long, trade_from=starts)
         print(grid_report(long, "Вокруг 12480: 11520–13440, шаг 120."))
         chosen = choose_window(short + long)
         print()
@@ -1117,6 +1173,7 @@ def main(argv: list[str] | None = None) -> int:
                     exit_channel=window.exit_channel,
                     clock_cap=window.clock_cap,
                     size_mode=window.size_mode,
+                    trade_from=starts,
                 )
             )
         )
