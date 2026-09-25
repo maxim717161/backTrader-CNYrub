@@ -251,18 +251,18 @@ def test_a_fixed_ruble_stop_stays_inside_ten_percent_of_the_account():
     cash = 10_000.0
     simulated = simulate(
         "CRZ5", frame, 5, stop_mult=None, exit_channel=0,
-        risk_fraction=0.10, margin=1_000.0, stop_rub=450.0, cash=cash,
+        risk_fraction=0.10, margin=1_000.0, stop_rub=285.0, cash=cash,
     )
     strategy = run_contract(
         "CRZ5", frame, 5, stop_mult=None, exit_channel=0,
-        risk_fraction=0.10, margin=1_000.0, stop_rub=450.0, cash=cash,
+        risk_fraction=0.10, margin=1_000.0, stop_rub=285.0, cash=cash,
     )
     assert len(simulated) == len(strategy.trades) == 1
     for trade in (simulated[0], strategy.trades[0]):
-        assert trade["lots"] == 2
+        assert trade["lots"] == 3
         assert trade["reason"] == "stop"
-        assert trade["pnl"] == pytest.approx(-450.0 * 2)
-        assert trade["pnlcomm"] == pytest.approx(-450.0 * 2 - 4)
+        assert trade["pnl"] == pytest.approx(-285.0 * 3)
+        assert trade["pnlcomm"] == pytest.approx(-285.0 * 3 - 6)
         assert trade["pnlcomm"] >= -0.10 * cash
 
 
@@ -308,7 +308,7 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("flat", 1, 10.10, 10.05, 9.95, 0.10) == 1
     assert WINDOWS[0].size_mode == "flat" and WINDOWS[0].clock_cap == 5
     assert WINDOWS[0].loss_bars == 1500 and WINDOWS[0].risk_fraction == 0.10
-    assert WINDOWS[0].stop_rub == 450
+    assert WINDOWS[0].stop_rub == 285
     assert WINDOWS[1].size_mode == "inverse" and WINDOWS[1].clock_cap is None
 
 
