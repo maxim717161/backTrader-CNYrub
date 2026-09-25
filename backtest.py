@@ -1125,7 +1125,7 @@ def report(summary: dict[str, object]) -> str:
     if risk_fraction:
         size_text = (
             f"контрактов столько, сколько пускает залог {float(summary.get('margin', 0)):.0f} руб., "
-            f"счёт с {float(summary.get('cash', 0)):,.0f} руб."
+            f"счёт с {float(summary.get('cash', 0)):,.0f} руб"
         )
     elif size_mode == "inverse":
         size_text = "лоты 3, 2 или 1: чем ближе пробой к границе канала, тем больше"
