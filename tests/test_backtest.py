@@ -304,9 +304,11 @@ def test_the_time_limit_wins_when_the_channel_breaks_on_the_same_bar():
 
 def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
     assert breakout_fraction(0, 12) == 1
+    assert breakout_fraction(0.5, 12) == pytest.approx(0.75)
+    assert breakout_fraction(1, 12) == pytest.approx(0.5)
     assert breakout_fraction(1.5, 12) == pytest.approx(0.5)
-    assert breakout_fraction(1, 12) > 0.5
-    assert breakout_fraction(2, 12) < 0.5
+    assert breakout_fraction(2, 12) == pytest.approx(0.5)
+    assert breakout_fraction(6, 12) == pytest.approx(0.3)
     assert breakout_fraction(12, 12) == 0
     assert breakout_fraction(float("inf"), 12) == 0
     assert breakout_lots(100_000, 1_000, 0, 12) == 99

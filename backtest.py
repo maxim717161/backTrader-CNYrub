@@ -20,7 +20,7 @@
 сделка всё ещё в минусе, она закрывается.
 Длинное окно 12 420 минут не выходит по каналу и держит стоп в 22 медианы
 минутного диапазона. Ноль медиан пробоя — это 100% контрактов, которые
-пускает залог, полторы медианы — 50%, двенадцать медиан — 0%. Счёт 100 000 руб.,
+пускает залог, от одной до двух медиан — 50%, двенадцать медиан — 0%. Счёт 100 000 руб.,
 залог 1 000 руб.
 """
 
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -51,9 +50,10 @@ LONG_STOP = 22.0
 LONG_CASH = 100_000.0
 LONG_MARGIN = 1_000.0
 # Ноль медиан пробоя — 100% контрактов по залогу, столько медиан — 0%.
-# Кривая нелинейная: на LONG_BREAKOUT_MID медианах остаётся 50%.
+# От LOW до HIGH медиан доля держится на 50%, как раньше два контракта.
 LONG_BREAKOUT_SPAN = 12.0
-LONG_BREAKOUT_MID = 1.5
+LONG_BREAKOUT_LOW = 1.0
+LONG_BREAKOUT_HIGH = 2.0
 SHORT_CLOCK_CAP = 5.0
 LONG_CANDIDATES = (12_480, 12_960)
 
@@ -713,19 +713,28 @@ def _apply_cash(equity: float | None, trades: list[dict[str, object]]) -> float 
     return equity + float(trades[-1]["pnlcomm"])
 
 
-def breakout_fraction(beyond: float, span: float, mid: float = LONG_BREAKOUT_MID) -> float:
-    """0 медиан пробоя — 1, на mid медианах 0.5, на span и дальше — 0.
+def breakout_fraction(
+    beyond: float,
+    span: float,
+    low: float = LONG_BREAKOUT_LOW,
+    high: float = LONG_BREAKOUT_HIGH,
+) -> float:
+    """0 медиан пробоя — 1, от low до high — 0.5, на span и дальше — 0.
 
-    Доля = (1 - пробой / span) в степени, которая ставит 0.5 ровно на mid.
+    До одной медианы доля падает со 100% до 50%. Между одной и двумя держится
+    на 50%. Дальше линейно сходит к нулю на span.
     """
-    if span <= 0 or mid <= 0 or mid >= span or beyond != beyond or beyond == float("inf"):
+    if span <= 0 or low <= 0 or high <= low or high >= span or beyond != beyond or beyond == float("inf"):
         return 0.0
     if beyond <= 0:
         return 1.0
     if beyond >= span:
         return 0.0
-    power = math.log(0.5) / math.log(1.0 - mid / span)
-    return (1.0 - beyond / span) ** power
+    if beyond < low:
+        return 1.0 - 0.5 * (beyond / low)
+    if beyond <= high:
+        return 0.5
+    return 0.5 * (span - beyond) / (span - high)
 
 
 def breakout_lots(equity: float, margin: float, beyond: float, span: float) -> int | None:
@@ -1249,7 +1258,7 @@ def report(summary: dict[str, object]) -> str:
     if breakout_span:
         size_text = (
             f"0 медиан пробоя — 100% контрактов по залогу {float(summary.get('margin', 0)):,.0f} руб., "
-            f"{LONG_BREAKOUT_MID:g} медианы — 50%, {float(breakout_span):.0f} медиан — 0%, "
+            f"{LONG_BREAKOUT_LOW:g}–{LONG_BREAKOUT_HIGH:g} медианы — 50%, {float(breakout_span):.0f} медиан — 0%, "
             f"старт {float(summary.get('cash', 0)):,.0f} руб"
         )
     elif risk_fraction:
