@@ -304,16 +304,18 @@ def test_the_time_limit_wins_when_the_channel_breaks_on_the_same_bar():
 
 def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
     assert breakout_fraction(0, 12) == 1
-    assert breakout_fraction(6, 12) == 0.5
+    assert breakout_fraction(1.5, 12) == pytest.approx(0.5)
+    assert breakout_fraction(1, 12) > 0.5
+    assert breakout_fraction(2, 12) < 0.5
     assert breakout_fraction(12, 12) == 0
     assert breakout_fraction(float("inf"), 12) == 0
     assert breakout_lots(100_000, 1_000, 0, 12) == 99
-    assert breakout_lots(100_000, 1_000, 6, 12) == 49
+    assert breakout_lots(100_000, 1_000, 1.5, 12) == 49
     assert breakout_lots(100_000, 1_000, 12, 12) is None
     rows = [(10.0, 10.5, 9.5, 10.0, 1000.0) for _ in range(5)]
-    rows.append((10.0, 16.5, 10.0, 16.5, 1000.0))
-    rows.append((16.5, 16.6, 16.4, 16.5, 1000.0))
-    rows.append((16.5, 16.6, 16.4, 16.5, 1000.0))
+    rows.append((10.0, 12.0, 10.0, 12.0, 1000.0))
+    rows.append((12.0, 12.1, 11.9, 12.0, 1000.0))
+    rows.append((12.0, 12.1, 11.9, 12.0, 1000.0))
     frame = _days(rows)
     kwargs = dict(stop_mult=22.0, exit_channel=0, breakout_span=12.0, cash=10_000.0, margin=1_000.0)
     simulated = simulate("CRZ5", frame, 5, **kwargs)
