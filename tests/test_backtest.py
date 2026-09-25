@@ -85,7 +85,8 @@ def test_choose_window_prefers_the_stronger_weakest_part():
     chosen = choose_window(rows)
     assert chosen is not None
     assert chosen["channel"] == 960
-    assert choose_window([_scored(480, (-1.0, 10.0, 10.0, 10.0, 10.0))]) is None
+    assert choose_window([_scored(480, (10.0, 10.0, -1.0, -1.0, -1.0))]) is None
+    assert choose_window([_scored(720, (10.0, 10.0, 10.0, -5.0, -5.0))]) is not None
 
 
 def test_clearance_blocks_a_close_that_only_touches_the_channel():
@@ -123,7 +124,7 @@ def test_clock_volume_compares_with_the_same_minute_of_prior_days():
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():
     rows = [
         _scored(480, (1.0, 1.0, 1.0, 1.0, 1.0)),
-        _scored(960, (-1.0, 1.0, 1.0, 1.0, 1.0)),
+        _scored(960, (-1.0, -1.0, -1.0, 1.0, 1.0)),
         _scored(14400, (2.0, 2.0, 2.0, 2.0, 2.0)),
     ]
     extra = refine_windows(rows)

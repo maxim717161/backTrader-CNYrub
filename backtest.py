@@ -8,9 +8,9 @@
 открытии этого дня.
 
 `python backtest.py --grid` печатает грубую сетку, уточнение вокруг пиков
-и три фильтра по отдельности. Окно годится, если все пять частей контрактов
-в плюсе и в каждой не меньше 4 сделок на контракт. Среди таких берётся лучший
-результат худшей части.
+и три фильтра по отдельности. Окно годится, если прибыльных частей больше половины. Часть считается
+прибыльной, когда её результат больше нуля и в ней не меньше 4 сделок на
+контракт. Среди таких окон берётся лучший результат худшей части.
 """
 
 from __future__ import annotations
@@ -28,9 +28,9 @@ COARSE_TO = 14_400
 COARSE_STEP = 480
 REFINE_STEP = 120
 REFINE_RADIUS = 480
-# Сетка 480..14400 по пяти частям не дала окна, где все части в плюсе.
-# Обычный запуск оставлен на 960: его выбрало прежнее правило двух половин.
-CHANNEL = 960
+# Вокруг 960 шаг 20 и вокруг 12480 шаг 120. Прибыльных частей больше половины.
+# Выбрано 12480: четыре части из пяти в плюсе, худшая часть −414 руб.
+CHANNEL = 12480
 STOP_MULT = 2.5
 MIN_TRADES_PER_CONTRACT = 4
 CLEARANCE = 0.5
@@ -409,18 +409,25 @@ def coarse_windows() -> tuple[int, ...]:
     return tuple(range(COARSE_FROM, COARSE_TO + 1, COARSE_STEP))
 
 
-def _eligible(row: dict[str, object]) -> bool:
+def _profitable_parts(row: dict[str, object]) -> int:
     parts = row["parts"]
-    assert isinstance(parts, tuple)
     per_contract = row["per_contract"]
+    assert isinstance(parts, tuple)
     assert isinstance(per_contract, tuple)
-    return all(float(part) > 0 for part in parts) and all(
-        float(count) >= MIN_TRADES_PER_CONTRACT for count in per_contract
+    return sum(
+        float(part) > 0 and float(count) >= MIN_TRADES_PER_CONTRACT
+        for part, count in zip(parts, per_contract, strict=True)
     )
 
 
+def _eligible(row: dict[str, object]) -> bool:
+    parts = row["parts"]
+    assert isinstance(parts, tuple)
+    return _profitable_parts(row) * 2 > len(parts)
+
+
 def choose_window(rows: list[dict[str, object]]) -> dict[str, object] | None:
-    """Все пять частей в плюсе и с достаточным числом сделок, затем лучшая худшая часть."""
+    """Прибыльных частей больше половины, затем лучший результат худшей части."""
     eligible = [row for row in rows if _eligible(row)]
     if not eligible:
         return None
@@ -579,7 +586,7 @@ def grid_report(rows: list[dict[str, object]], title: str) -> str:
     lines = [
         title,
         "Выход — половина окна. Объём минуты сигнала не ниже медианы окна.",
-        f"Годится окно, если все пять частей в плюсе и в каждой не меньше {MIN_TRADES_PER_CONTRACT:.0f} сделок на контракт.",
+        f"Годится окно, если прибыльных частей больше половины. Часть прибыльна при результате больше нуля и не меньше {MIN_TRADES_PER_CONTRACT:.0f} сделок на контракт.",
         _part_labels(),
         "Сумма — не один счёт: истории пересекаются на месяц.",
         "",
@@ -680,31 +687,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
     if args.grid:
-        coarse = run_grid(frames, coarse_windows())
-        print(grid_report(coarse, "Грубая сетка, шаг 480 минут."))
-        extra = refine_windows(coarse)
-        refined = run_grid(frames, extra) if extra else []
-        if refined:
-            print()
-            print(grid_report(refined, "Уточнение, шаг 120 минут."))
-        chosen = choose_window(coarse + refined)
+        around_short = tuple(range(480, 1440 + 1, 20))
+        around_long = tuple(range(11_520, 13_440 + 1, 120))
+        short = run_grid(frames, around_short)
+        print(grid_report(short, "Вокруг 960: 480–1440, шаг 20."))
+        print()
+        long = run_grid(frames, around_long)
+        print(grid_report(long, "Вокруг 12480: 11520–13440, шаг 120."))
+        chosen = choose_window(short + long)
         print()
         if chosen is None:
-            closest = max(coarse + refined, key=lambda row: min(float(part) for part in row["parts"]))
-            print(
-                f"Ни одно окно не прошло правило пяти частей. Ближайшее по худшей части: "
-                f"N={int(closest['channel'])}, худшая часть "
-                f"{_money(min(float(part) for part in closest['parts']))} руб."
-            )
-            print()
-            print(filter_report(frames, int(closest["channel"])))
+            print("Ни одно окно не прошло правило: прибыльных частей должно быть больше половины.")
             return 0
         print(
-            f"Выбрано N={int(chosen['channel'])}: худшая часть "
-            f"{_money(min(float(part) for part in chosen['parts']))} руб."
+            f"Выбрано N={int(chosen['channel'])}: прибыльных частей {_profitable_parts(chosen)} из 5, "
+            f"худшая часть {_money(min(float(part) for part in chosen['parts']))} руб."
         )
-        print()
-        print(filter_report(frames, int(chosen["channel"])))
         return 0
     print(report(run_all(frames, CHANNEL)))
     return 0
