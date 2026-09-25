@@ -1,0 +1,26 @@
+[project]
+name = "cnyrub"
+version = "0.1.0"
+description = "Front-month minute history of the MOEX CNY/RUB quarterly future"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "backtrader>=1.9.78",
+    "matplotlib>=3.8",
+    "pandas>=2.2",
+    "pyarrow>=15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
