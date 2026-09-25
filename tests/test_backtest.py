@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from backtest import _part_nets, buy_and_hold, choose_window, refine_windows, run_contract, simulate
+from backtest import WINDOWS, _part_nets, buy_and_hold, choose_window, entry_lots, refine_windows, run_contract, simulate
 
 
 def _days(rows: list[tuple[float, float, float, float, float]]) -> pd.DataFrame:
@@ -152,6 +152,58 @@ def test_clock_volume_compares_with_the_same_minute_of_prior_days():
     frame = pd.DataFrame(values, columns=["open", "high", "low", "close", "volume"], index=pd.to_datetime(stamps))
     assert len(simulate("CRU5", frame, 1)) == 1
     assert simulate("CRU5", frame, 1, clock_volume=True) == []
+
+
+def test_clock_cap_rejects_a_loud_same_minute_and_keeps_the_window_floor():
+    start = datetime(2024, 1, 2, 10, 0)
+    stamps = []
+    values = []
+    for day in range(5):
+        for minute, volume in ((0, 10.0), (1, 100.0), (2, 100.0)):
+            stamps.append(start + timedelta(days=day, minutes=minute))
+            values.append((10.0, 10.05, 9.95, 10.0, volume))
+    signal = start + timedelta(days=5)
+    stamps.extend((signal, signal + timedelta(minutes=1), signal + timedelta(days=1)))
+    values.extend(
+        (
+            (10.0, 10.40, 10.10, 10.30, 100.0),
+            (10.30, 10.40, 10.20, 10.35, 100.0),
+            (10.35, 10.40, 10.20, 10.35, 100.0),
+        )
+    )
+    frame = pd.DataFrame(values, columns=["open", "high", "low", "close", "volume"], index=pd.to_datetime(stamps))
+    opened = simulate("CRU5", frame, 2, stop_mult=None, exit_channel=2)
+    capped = simulate("CRU5", frame, 2, stop_mult=None, exit_channel=2, clock_cap=5)
+    assert len(opened) == 1
+    assert capped == []
+    assert run_contract("CRU5", frame, 2, stop_mult=None, exit_channel=2, clock_cap=5).trades == []
+
+
+def test_inverse_size_uses_three_lots_on_a_fresh_breakout():
+    rows = [_quiet() for _ in range(5)]
+    rows.append((10.0, 10.12, 10.06, 10.10, 1000))
+    rows.extend(_quiet(10.20) for _ in range(3))
+    frame = _days(rows)
+    simulated = simulate("CRZ5", frame, 5, stop_mult=None, exit_channel=0, size_mode="inverse")
+    strategy = run_contract("CRZ5", frame, 5, stop_mult=None, exit_channel=0, size_mode="inverse")
+    assert len(simulated) == len(strategy.trades) == 1
+    entry = float(frame["open"].iloc[6])
+    exit_ = float(frame["open"].iloc[-1])
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["lots"] == 3
+        assert trade["reason"] == "expiry"
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 3 * 1000)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6)
+
+
+def test_entry_lots_step_down_as_the_breakout_grows():
+    assert entry_lots("inverse", 1, 10.5, 10.0, 9.0, 1.0) == 3
+    assert entry_lots("inverse", 1, 11.0, 10.0, 9.0, 1.0) == 2
+    assert entry_lots("inverse", 1, 11.9, 10.0, 9.0, 1.0) == 2
+    assert entry_lots("inverse", 1, 12.0, 10.0, 9.0, 1.0) == 1
+    assert entry_lots("flat", 1, 10.10, 10.05, 9.95, 0.10) == 1
+    assert WINDOWS[0].size_mode == "flat" and WINDOWS[0].clock_cap == 5
+    assert WINDOWS[1].size_mode == "inverse" and WINDOWS[1].clock_cap is None
 
 
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():

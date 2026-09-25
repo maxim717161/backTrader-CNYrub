@@ -7,10 +7,12 @@
 минутного диапазона. В последний день новая сделка не открывается, открытая
 закрывается на первом открытии этого дня.
 
-В работе два окна: середина двух соседних лучших. Короткое окно 525 минут
-закрывается каналом той же длины, без защитного стопа. Длинное окно
-12 420 минут держит стоп в 22 медианы минутного диапазона и не выходит
-по каналу.
+В работе два окна, и правила у них разные. Короткое окно 525 минут
+закрывается каналом той же длины, без защитного стопа, одним лотом.
+Минута сигнала ещё и не громче пяти медиан той же минуты суток за пять дней.
+Длинное окно 12 420 минут не выходит по каналу и держит стоп в 22 медианы
+минутного диапазона. Лотов тем больше, чем ближе пробой к границе канала:
+три, два или один.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import backtrader as bt
 import numpy as np
@@ -34,10 +37,23 @@ REFINE_RADIUS = 480
 SHORT_WINDOW = 525
 LONG_WINDOW = 12_420
 LONG_STOP = 22.0
+SHORT_CLOCK_CAP = 5.0
 LONG_CANDIDATES = (12_480, 12_960)
+
+
+class Window(NamedTuple):
+    """Свои вход, выход, стоп, потолок объёма и размер позиции."""
+
+    channel: int
+    exit_channel: int
+    stop_mult: float | None
+    clock_cap: float | None = None
+    size_mode: str = "flat"
+
+
 WINDOWS = (
-    (SHORT_WINDOW, SHORT_WINDOW, None),
-    (LONG_WINDOW, 0, LONG_STOP),
+    Window(SHORT_WINDOW, SHORT_WINDOW, None, SHORT_CLOCK_CAP, "flat"),
+    Window(LONG_WINDOW, 0, LONG_STOP, None, "inverse"),
 )
 CHANNEL = SHORT_WINDOW
 STOP_MULT = 2.5
@@ -62,7 +78,17 @@ BARS_DIR = Path("data/bars")
 
 
 class SignalData(bt.feeds.PandasData):
-    lines = ("prior_high", "prior_low", "prior_vol", "prior_range", "exit_high", "exit_low", "entry_ready", "exit_ready")
+    lines = (
+        "prior_high",
+        "prior_low",
+        "prior_vol",
+        "prior_range",
+        "exit_high",
+        "exit_low",
+        "entry_ready",
+        "exit_ready",
+        "clock_vol",
+    )
     params = (
         ("prior_high", -1),
         ("prior_low", -1),
@@ -72,17 +98,27 @@ class SignalData(bt.feeds.PandasData):
         ("exit_low", -1),
         ("entry_ready", -1),
         ("exit_ready", -1),
+        ("clock_vol", -1),
     )
 
 
 class MinuteDonchian(bt.Strategy):
-    params = dict(secid="", last_day="", stop_mult=STOP_MULT, use_stop=True)
+    params = dict(
+        secid="",
+        last_day="",
+        stop_mult=STOP_MULT,
+        use_stop=True,
+        clock_cap=None,
+        size_mode="flat",
+    )
 
     def __init__(self) -> None:
         self.entry_order = None
         self.protective = None
         self.stop_dist = None
         self.pending = ""
+        self.pending_size = 1
+        self.entry_sizes: list[int] = []
         self.reasons: list[str] = []
         self.seen_day: date | None = None
         self.trades: list[dict[str, object]] = []
@@ -97,11 +133,12 @@ class MinuteDonchian(bt.Strategy):
             return
         self.seen_day = today
         pending = self.pending
+        size = self.pending_size
         self.pending = ""
         if pending == "long":
-            self.entry_order = self.buy()
+            self.entry_order = self.buy(size=size)
         elif pending == "short":
-            self.entry_order = self.sell()
+            self.entry_order = self.sell(size=size)
         elif pending == "exit":
             self._exit("channel")
 
@@ -130,16 +167,19 @@ class MinuteDonchian(bt.Strategy):
             return
         if self.entry_order is None or order.ref != self.entry_order.ref:
             return
+        self.entry_sizes.append(abs(int(order.executed.size)))
         self._arm_stop(order)
         self.entry_order = None
 
     def notify_trade(self, trade: bt.Trade) -> None:
         if not trade.isclosed:
             return
+        lots = self.entry_sizes.pop(0) if self.entry_sizes else 1
         self.trades.append(
             {
                 "secid": self.p.secid,
                 "direction": "long" if trade.long else "short",
+                "lots": lots,
                 "pnl": float(trade.pnl),
                 "pnlcomm": float(trade.pnlcomm),
                 "bars": int(trade.barlen),
@@ -167,15 +207,25 @@ class MinuteDonchian(bt.Strategy):
         if float(self.data.entry_ready[0]) < 1:
             return
         typical = float(self.data.prior_vol[0])
-        if typical > 0 and float(self.data.volume[0]) < typical:
+        volume = float(self.data.volume[0])
+        if typical > 0 and volume < typical:
             return
+        if self.p.clock_cap is not None:
+            clock = float(self.data.clock_vol[0])
+            if clock > 0 and volume > self.p.clock_cap * clock:
+                return
         close = float(self.data.close[0])
+        prior_high = float(self.data.prior_high[0])
+        prior_low = float(self.data.prior_low[0])
+        prior_range = float(self.data.prior_range[0])
         if self.p.use_stop:
-            self.stop_dist = self.p.stop_mult * float(self.data.prior_range[0])
-        if close > float(self.data.prior_high[0]):
+            self.stop_dist = self.p.stop_mult * prior_range
+        if close > prior_high:
             self.pending = "long"
-        elif close < float(self.data.prior_low[0]):
+            self.pending_size = entry_lots(self.p.size_mode, 1, close, prior_high, prior_low, prior_range)
+        elif close < prior_low:
             self.pending = "short"
+            self.pending_size = entry_lots(self.p.size_mode, -1, close, prior_high, prior_low, prior_range)
 
     def _exit(self, reason: str) -> None:
         if not self.position:
@@ -265,6 +315,7 @@ def channel_view(frame: pd.DataFrame, channel: int, exit_channel: int | None = N
         view["exit_low"] = np.nan
         view["exit_ready"] = 0.0
     view["entry_ready"] = view["prior_high"].notna().astype(float)
+    view["clock_vol"] = _clock_volume(pd.DatetimeIndex(view.index), frame["volume"].to_numpy(dtype=float), CLOCK_DAYS)
     return view
 
 
@@ -296,6 +347,8 @@ def simulate(
     clearance: float = 0.0,
     cooldown: int = 0,
     clock_volume: bool = False,
+    clock_cap: float | None = None,
+    size_mode: str = "flat",
     stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
     trail: bool = False,
@@ -307,6 +360,10 @@ def simulate(
     cooldown — сколько минут после стопа нельзя открывать новую сделку.
     clock_volume заменяет сравнение с медианой последних N минут на медиану
     той же минуты суток за предыдущие дни.
+    clock_cap — потолок: минута сигнала не громче, чем clock_cap медиан
+    той же минуты суток за предыдущие дни. Пол по медиане окна остаётся.
+    size_mode inverse ставит 3, 2 или 1 лот, если пробой короче одной,
+    двух или больше медиан минутного диапазона.
     stop_mult None выключает стоп. trail подтягивает стоп за закрытием
     на исходную дистанцию, уже после проверки стопа на этой минуте.
     view — уже посчитанные уровни; иначе они строятся из channel и exit_channel.
@@ -324,52 +381,62 @@ def simulate(
     prior_range = view["prior_range"].to_numpy(dtype=float)
     exit_high = view["exit_high"].to_numpy(dtype=float)
     exit_low = view["exit_low"].to_numpy(dtype=float)
-    clock_typical = _clock_volume(view.index, volume, CLOCK_DAYS) if clock_volume else None
+    need_clock = clock_volume or clock_cap is not None
+    if not need_clock:
+        clock_typical = None
+    elif "clock_vol" in view.columns:
+        clock_typical = view["clock_vol"].to_numpy(dtype=float)
+    else:
+        clock_typical = _clock_volume(view.index, volume, CLOCK_DAYS)
     days = view.index.date
     last_day = days[-1]
     trades: list[dict[str, object]] = []
     position = 0
+    lots = 1
     entry_px = 0.0
     entry_i = 0
     stop_px = 0.0
     stop_dist = 0.0
     pending = ""
+    pending_lots = 1
     cooldown_until = 0
 
     for i in range(len(view)):
         if pending == "long" and position == 0:
             position = 1
+            lots = pending_lots
             entry_px = opened[i]
             entry_i = i
             stop_px = float("-inf") if stop_dist is None else entry_px - stop_dist
         elif pending == "short" and position == 0:
             position = -1
+            lots = pending_lots
             entry_px = opened[i]
             entry_i = i
             stop_px = float("inf") if stop_dist is None else entry_px + stop_dist
         elif pending == "exit" and position != 0:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "channel")
+            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "channel", lots)
             position = 0
         elif pending == "expiry" and position != 0:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "expiry")
+            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "expiry", lots)
             position = 0
         pending = ""
 
         stopped = False
         if position == 1 and opened[i] <= stop_px:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop")
+            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop", lots)
             position = 0
             stopped = True
         elif position == 1 and low[i] <= stop_px:
-            _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop")
+            _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop", lots)
             position = 0
             stopped = True
         elif position == -1 and opened[i] >= stop_px:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop")
+            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop", lots)
             position = 0
             stopped = True
         elif position == -1 and high[i] >= stop_px:
-            _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop")
+            _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop", lots)
             position = 0
             stopped = True
         if stopped and cooldown:
@@ -391,21 +458,48 @@ def simulate(
         elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
             pending = "exit"
         elif position == 0 and prior_high[i] == prior_high[i] and i >= cooldown_until:
-            if clock_typical is None:
-                typical = prior_vol[i]
-            else:
+            if clock_volume:
                 typical = clock_typical[i]
                 if typical != typical:
                     continue
+            else:
+                typical = prior_vol[i]
             if typical > 0 and volume[i] < typical:
                 continue
+            if clock_cap is not None and clock_typical is not None:
+                clock = clock_typical[i]
+                if clock == clock and clock > 0 and volume[i] > clock_cap * clock:
+                    continue
             room = clearance * prior_range[i]
             stop_dist = None if stop_mult is None else stop_mult * prior_range[i]
             if close[i] > prior_high[i] + room:
                 pending = "long"
+                pending_lots = entry_lots(size_mode, 1, close[i], prior_high[i], prior_low[i], prior_range[i])
             elif close[i] < prior_low[i] - room:
                 pending = "short"
+                pending_lots = entry_lots(size_mode, -1, close[i], prior_high[i], prior_low[i], prior_range[i])
     return trades
+
+
+def entry_lots(
+    size_mode: str,
+    side: int,
+    close: float,
+    prior_high: float,
+    prior_low: float,
+    prior_range: float,
+) -> int:
+    """1 лот, либо 3/2/1 по тому, насколько закрытие ушло за канал."""
+    if size_mode != "inverse":
+        return 1
+    if not prior_range > 0:
+        return 1
+    beyond = (close - prior_high) / prior_range if side > 0 else (prior_low - close) / prior_range
+    if beyond < 1.0:
+        return 3
+    if beyond < 2.0:
+        return 2
+    return 1
 
 
 def _close_trade(
@@ -417,14 +511,16 @@ def _close_trade(
     entry_i: int,
     exit_i: int,
     reason: str,
+    lots: int = 1,
 ) -> None:
-    gross = (exit_px - entry_px) * position * MULTIPLIER
+    gross = (exit_px - entry_px) * position * lots * MULTIPLIER
     trades.append(
         {
             "secid": secid,
             "direction": "long" if position > 0 else "short",
+            "lots": lots,
             "pnl": gross,
-            "pnlcomm": gross - 2 * COMMISSION,
+            "pnlcomm": gross - 2 * COMMISSION * lots,
             "bars": exit_i - entry_i,
             "reason": reason,
         }
@@ -566,6 +662,8 @@ def score_window(
     stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
     trail: bool = False,
+    clock_cap: float | None = None,
+    size_mode: str = "flat",
     views: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, object]:
     """Сумма по контрактам и пять частей. Пересечение историй в сумму не склеивается."""
@@ -577,6 +675,8 @@ def score_window(
             stop_mult=stop_mult,
             exit_channel=exit_channel,
             trail=trail,
+            clock_cap=clock_cap,
+            size_mode=size_mode,
             view=None if views is None else views[secid],
         )
         for secid, frame in frames.items()
@@ -600,6 +700,7 @@ def score_window(
         "parts": tuple(_net(by_secid, list(part)) for part in PARTS),
         "factor": _profit_factor(trades),
         "reasons": reasons,
+        "lots": sum(int(trade.get("lots", 1)) for trade in trades),
     }
 
 
@@ -618,8 +719,11 @@ def run_contract(
     *,
     stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
+    clock_cap: float | None = None,
+    size_mode: str = "flat",
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
+    view["clock_vol"] = view["clock_vol"].fillna(0.0)
     last_day = pd.Timestamp(view.index[-1]).date().isoformat()
     cerebro = bt.Cerebro(stdstats=False, cheat_on_open=True)
     cerebro.addstrategy(
@@ -628,6 +732,8 @@ def run_contract(
         last_day=last_day,
         stop_mult=STOP_MULT if stop_mult is None else stop_mult,
         use_stop=stop_mult is not None,
+        clock_cap=clock_cap,
+        size_mode=size_mode,
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(START_CASH)
@@ -647,6 +753,8 @@ def run_all(
     *,
     stop_mult: float | None = STOP_MULT,
     exit_channel: int | None = None,
+    clock_cap: float | None = None,
+    size_mode: str = "flat",
 ) -> dict[str, object]:
     results = []
     for secid, frame in frames.items():
@@ -657,6 +765,8 @@ def run_all(
             channel,
             stop_mult=stop_mult,
             exit_channel=exit_channel,
+            clock_cap=clock_cap,
+            size_mode=size_mode,
         )
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
         net = sum(float(trade["pnlcomm"]) for trade in strategy.trades)
@@ -678,6 +788,8 @@ def run_all(
         "channel": channel,
         "exit": recorded_exit,
         "stop_mult": stop_mult,
+        "clock_cap": clock_cap,
+        "size_mode": size_mode,
     }
 
 
@@ -771,6 +883,8 @@ def report(summary: dict[str, object]) -> str:
     factor = _profit_factor(trades)
     factor_text = "—" if factor is None else f"{factor:.2f}"
     worst = min((_max_drawdown(item["values"]) for item in contracts), default=0.0)
+    clock_cap = summary.get("clock_cap")
+    size_mode = str(summary.get("size_mode", "flat"))
     if stop_mult is None:
         stop_text = "защитного стопа нет"
     else:
@@ -779,14 +893,26 @@ def report(summary: dict[str, object]) -> str:
         exit_text = "выход по каналу выключен"
     else:
         exit_text = f"выход по каналу {exit_channel} минут"
+    if size_mode == "inverse":
+        size_text = "лоты 3, 2 или 1: чем ближе пробой к границе канала, тем больше"
+    else:
+        size_text = "1 лот"
+    if clock_cap is None:
+        volume_text = "Объём минуты сигнала не ниже медианы окна."
+    else:
+        volume_text = (
+            f"Объём минуты сигнала не ниже медианы окна и не выше {float(clock_cap):g} "
+            f"медиан той же минуты за {CLOCK_DAYS} дней."
+        )
     part_nets = _part_nets(trades)
     lines = [
-        f"Минутный канал {channel}, {exit_text}, {stop_text}. 1 контракт, лот 1000 юаней.",
-        "Вход на следующем открытии, если объём минуты сигнала не ниже медианы окна.",
-        f"Комиссия {COMMISSION:.0f} руб. за сторону. В последний день позиция закрывается.",
+        f"Минутный канал {channel}, {exit_text}, {stop_text}. {size_text}.",
+        volume_text,
+        f"Комиссия {COMMISSION:.0f} руб. за контракт за сторону. В последний день позиция закрывается.",
         "Окна пересекаются на месяц: сумма результатов — не один счёт.",
         "Части: " + ", ".join(f"Ч{index} {_money(part)}" for index, part in enumerate(part_nets, start=1)),
         f"Сделок: {len(trades)}. Прибыльных: {len(wins)}.",
+        _lots_line(trades),
         f"Лонгов: {len(longs)}, результат {sum(float(trade['pnlcomm']) for trade in longs):,.0f} руб.",
         f"Шортов: {len(shorts)}, результат {sum(float(trade['pnlcomm']) for trade in shorts):,.0f} руб.",
         f"Без комиссии: {gross:,.0f} руб. После комиссии: {net:,.0f} руб.",
@@ -807,6 +933,22 @@ def report(summary: dict[str, object]) -> str:
         lines.append("")
         lines.append("Выходы: " + ", ".join(f"{name} {count}" for name, count in sorted(reasons.items())))
     return "\n".join(lines)
+
+
+def _lots_line(trades: list[dict[str, object]]) -> str:
+    if not trades:
+        return "Лотов в сделке: —."
+    def _avg(rows: list[dict[str, object]]) -> float:
+        if not rows:
+            return 0.0
+        return sum(int(trade.get("lots", 1)) for trade in rows) / len(rows)
+
+    losses = [trade for trade in trades if float(trade["pnlcomm"]) < 0]
+    wins = [trade for trade in trades if float(trade["pnlcomm"]) > 0]
+    return (
+        f"Средний размер: {_avg(trades):.2f} лота. "
+        f"У прибыльных {_avg(wins):.2f}, у убыточных {_avg(losses):.2f}."
+    )
 
 
 def _part_nets(trades: list[dict[str, object]]) -> tuple[float, ...]:
@@ -928,11 +1070,11 @@ def _exit_decision(
         )
     locked = ", ".join(
         "вход {channel}, выход {exit_channel}, стоп {stop}".format(
-            channel=channel,
-            exit_channel=exit_channel,
-            stop="нет" if stop is None else f"{float(stop):g}",
+            channel=window.channel,
+            exit_channel=window.exit_channel,
+            stop="нет" if window.stop_mult is None else f"{float(window.stop_mult):g}",
         )
-        for channel, exit_channel, stop in WINDOWS
+        for window in WINDOWS
     )
     return coarse + " Рабочие выходы после более широкой проверки: " + locked + "."
 
@@ -965,8 +1107,19 @@ def main(argv: list[str] | None = None) -> int:
             f"худшая часть {_money(min(float(part) for part in chosen['parts']))} руб."
         )
         return 0
-    for channel, exit_channel, stop_mult in WINDOWS:
-        print(report(run_all(frames, channel, stop_mult=stop_mult, exit_channel=exit_channel)))
+    for window in WINDOWS:
+        print(
+            report(
+                run_all(
+                    frames,
+                    window.channel,
+                    stop_mult=window.stop_mult,
+                    exit_channel=window.exit_channel,
+                    clock_cap=window.clock_cap,
+                    size_mode=window.size_mode,
+                )
+            )
+        )
         print()
     return 0
 
