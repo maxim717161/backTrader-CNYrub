@@ -15,8 +15,9 @@
 В работе два окна, и правила у них разные. Короткое окно 525 минут
 закрывается каналом той же длины. Минута сигнала не громче пяти медиан
 той же минуты суток за пять дней. Счёт 100 000 руб., залог 1 000 руб.
-Позиция закрывается, когда убыток достигает 7% счёта, и ещё если через
-1 500 минут она всё ещё в минусе. Число контрактов растёт вместе со счётом.
+Стоп — 450 руб. на контракт. Контрактов столько, чтобы этот стоп забирал
+не больше 10% счёта, и число растёт вместе со счётом. Если через 1 500 минут
+сделка всё ещё в минусе, она закрывается.
 Длинное окно 12 420 минут не выходит по каналу и держит стоп в 22 медианы
 минутного диапазона. Лотов тем больше, чем ближе пробой к границе канала:
 три, два или один.
@@ -49,11 +50,13 @@ SHORT_CLOCK_CAP = 5.0
 LONG_CANDIDATES = (12_480, 12_960)
 
 
-# Короткое окно: счёт 100 000, залог 1 000. Убыток одной сделки — 7% счёта.
+# Короткое окно: счёт 100 000, залог 1 000. Стоп 450 руб. на контракт.
+# Контрактов столько, чтобы этот стоп забирал не больше 10% счёта.
 # Сделка, которая через 1 500 минут всё ещё в минусе, закрывается.
 SHORT_CASH = 100_000.0
 SHORT_MARGIN = 1_000.0
-SHORT_RISK = 0.07
+SHORT_RISK = 0.10
+SHORT_STOP_RUB = 450.0
 SHORT_LOSS_BARS = 1_500
 
 
@@ -69,6 +72,7 @@ class Window(NamedTuple):
     risk_fraction: float | None = None
     cash: float = 1_000_000.0
     margin: float = 20_000.0
+    stop_rub: float | None = None
 
 
 WINDOWS = (
@@ -82,6 +86,7 @@ WINDOWS = (
         SHORT_RISK,
         SHORT_CASH,
         SHORT_MARGIN,
+        SHORT_STOP_RUB,
     ),
     Window(LONG_WINDOW, 0, LONG_STOP, None, "inverse"),
 )
@@ -144,6 +149,7 @@ class MinuteDonchian(bt.Strategy):
         loss_bars=0,
         risk_fraction=0.0,
         margin=MARGIN,
+        stop_rub=0.0,
     )
 
     def __init__(self) -> None:
@@ -278,7 +284,12 @@ class MinuteDonchian(bt.Strategy):
         prior_low = float(self.data.prior_low[0])
         prior_range = float(self.data.prior_range[0])
         if self.p.risk_fraction:
-            sized = _risk_size(float(self.broker.getvalue()), float(self.p.risk_fraction), float(self.p.margin))
+            sized = _risk_size(
+                float(self.broker.getvalue()),
+                float(self.p.risk_fraction),
+                float(self.p.margin),
+                float(self.p.stop_rub),
+            )
             if sized is None:
                 return
             self.pending_size, self.stop_dist = sized
@@ -444,6 +455,7 @@ def simulate(
     loss_bars: int | None = None,
     risk_fraction: float | None = None,
     margin: float = MARGIN,
+    stop_rub: float | None = None,
     cash: float | None = None,
     view: pd.DataFrame | None = None,
 ) -> list[dict[str, object]]:
@@ -462,7 +474,8 @@ def simulate(
     trade_from — первый день истекающего контракта. Более ранние минуты
     только собирают окно: сделка открывается не раньше открытия этого дня.
     loss_bars закрывает сделку, которая столько минут всё ещё в минусе.
-    risk_fraction ставит стоп на эту долю текущего счёта. cash — счёт на входе,
+    risk_fraction — доля счёта, которую может забрать стоп stop_rub на всех контрактах.
+    cash — счёт на входе,
     он растёт и уменьшается от сделки к сделке. margin — залог на контракт.
     view — уже посчитанные уровни; иначе они строятся из channel и exit_channel.
     """
@@ -593,7 +606,7 @@ def simulate(
             if risk_fraction is not None:
                 if equity is None:
                     raise ValueError("Для доли риска нужен текущий счёт")
-                sized = _risk_size(equity, risk_fraction, margin)
+                sized = _risk_size(equity, risk_fraction, margin, 0.0 if stop_rub is None else stop_rub)
                 if sized is None:
                     continue
                 pending_lots, stop_dist = sized
@@ -610,15 +623,22 @@ def simulate(
     return trades
 
 
-def _risk_size(equity: float, risk_fraction: float, margin: float) -> tuple[int, float] | None:
-    """Контракты по залогу и дистанция стопа, чтобы стоп забирал долю счёта."""
-    contracts = int(equity // (margin + COMMISSION))
+def _risk_size(
+    equity: float,
+    risk_fraction: float,
+    margin: float,
+    stop_rub: float,
+) -> tuple[int, float] | None:
+    """Контракты так, чтобы стоп stop_rub плюс комиссия забирали не больше доли счёта."""
+    if stop_rub <= 0:
+        return None
+    unit = stop_rub + 2 * COMMISSION
+    by_risk = int((risk_fraction * equity) // unit)
+    by_margin = int(equity // (margin + COMMISSION))
+    contracts = min(by_risk, by_margin)
     if contracts < 1:
         return None
-    per_contract = risk_fraction * equity / contracts
-    if per_contract <= 2 * COMMISSION:
-        return None
-    return contracts, (per_contract - 2 * COMMISSION) / MULTIPLIER
+    return contracts, stop_rub / MULTIPLIER
 
 
 def _apply_cash(equity: float | None, trades: list[dict[str, object]]) -> float | None:
@@ -880,6 +900,7 @@ def run_contract(
     risk_fraction: float | None = None,
     cash: float = START_CASH,
     margin: float = MARGIN,
+    stop_rub: float | None = None,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
@@ -897,6 +918,7 @@ def run_contract(
         loss_bars=0 if loss_bars is None else loss_bars,
         risk_fraction=0.0 if risk_fraction is None else risk_fraction,
         margin=margin,
+        stop_rub=0.0 if stop_rub is None else stop_rub,
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(cash)
@@ -983,6 +1005,7 @@ def run_account(
             risk_fraction=window.risk_fraction,
             cash=equity,
             margin=window.margin,
+            stop_rub=window.stop_rub,
         )
         equity = float(strategy.broker.getvalue())
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
@@ -1008,6 +1031,7 @@ def run_account(
         "size_mode": window.size_mode,
         "loss_bars": window.loss_bars,
         "risk_fraction": window.risk_fraction,
+        "stop_rub": window.stop_rub,
         "cash": window.cash,
         "equity": equity,
         "margin": window.margin,
@@ -1111,8 +1135,9 @@ def report(summary: dict[str, object]) -> str:
         worst = min((_max_drawdown(item["values"]) for item in contracts), default=0.0)
     clock_cap = summary.get("clock_cap")
     size_mode = str(summary.get("size_mode", "flat"))
-    if risk_fraction:
-        stop_text = f"стоп на {float(risk_fraction):.0%} счёта"
+    stop_rub = summary.get("stop_rub")
+    if risk_fraction and stop_rub:
+        stop_text = f"стоп {float(stop_rub):.0f} руб. на контракт, не больше {float(risk_fraction):.0%} счёта"
     elif stop_mult is None:
         stop_text = "защитного стопа нет"
     else:
@@ -1124,8 +1149,8 @@ def report(summary: dict[str, object]) -> str:
     loss_bars = summary.get("loss_bars")
     if risk_fraction:
         size_text = (
-            f"контрактов столько, сколько пускает залог {float(summary.get('margin', 0)):.0f} руб., "
-            f"счёт с {float(summary.get('cash', 0)):,.0f} руб"
+            f"контрактов столько, сколько проходит в {float(risk_fraction):.0%} счёта, "
+            f"старт {float(summary.get('cash', 0)):,.0f} руб"
         )
     elif size_mode == "inverse":
         size_text = "лоты 3, 2 или 1: чем ближе пробой к границе канала, тем больше"
