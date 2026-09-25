@@ -307,7 +307,7 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("inverse", 1, 12.0, 10.0, 9.0, 1.0) == 1
     assert entry_lots("flat", 1, 10.10, 10.05, 9.95, 0.10) == 1
     assert WINDOWS[0].size_mode == "flat" and WINDOWS[0].clock_cap == 5
-    assert WINDOWS[0].loss_bars == 1500 and WINDOWS[0].risk_fraction == 0.10
+    assert WINDOWS[0].loss_bars == 1450 and WINDOWS[0].risk_fraction == 0.10
     assert WINDOWS[0].stop_rub == 285
     assert WINDOWS[1].size_mode == "inverse" and WINDOWS[1].clock_cap is None
 
