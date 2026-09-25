@@ -555,7 +555,7 @@ def run_grid(
 
 
 def _net(by_secid: dict[str, list[dict[str, object]]], secids: list[str]) -> float:
-    return sum(float(trade["pnlcomm"]) for secid in secids for trade in by_secid[secid])
+    return sum(float(trade["pnlcomm"]) for secid in secids for trade in by_secid.get(secid, ()))
 
 
 def score_window(

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from backtest import buy_and_hold, choose_window, refine_windows, run_contract, simulate
+from backtest import _part_nets, buy_and_hold, choose_window, refine_windows, run_contract, simulate
 
 
 def _days(rows: list[tuple[float, float, float, float, float]]) -> pd.DataFrame:
@@ -99,6 +99,12 @@ def _scored(channel: int, parts: tuple[float, ...], per: tuple[float, ...] | Non
         "parts": parts,
         "per_contract": (4.0, 4.0, 4.0, 4.0, 4.0) if per is None else per,
     }
+
+
+def test_part_nets_treat_a_contract_without_trades_as_zero():
+    parts = _part_nets([{"secid": "CRU2", "pnlcomm": 10.0}])
+    assert parts[0] == 10.0
+    assert parts[1:] == (0.0, 0.0, 0.0, 0.0)
 
 
 def test_choose_window_prefers_the_stronger_weakest_part():
