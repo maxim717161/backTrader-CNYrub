@@ -13,8 +13,10 @@
 сразу: окно к этому дню уже собрано.
 
 В работе два окна, и правила у них разные. Короткое окно 525 минут
-закрывается каналом той же длины, без защитного стопа, одним лотом.
-Минута сигнала ещё и не громче пяти медиан той же минуты суток за пять дней.
+закрывается каналом той же длины. Минута сигнала не громче пяти медиан
+той же минуты суток за пять дней. Счёт 100 000 руб., залог 1 000 руб.
+Позиция закрывается, когда убыток достигает 7% счёта, и ещё если через
+1 500 минут она всё ещё в минусе. Число контрактов растёт вместе со счётом.
 Длинное окно 12 420 минут не выходит по каналу и держит стоп в 22 медианы
 минутного диапазона. Лотов тем больше, чем ближе пробой к границе канала:
 три, два или один.
@@ -47,6 +49,14 @@ SHORT_CLOCK_CAP = 5.0
 LONG_CANDIDATES = (12_480, 12_960)
 
 
+# Короткое окно: счёт 100 000, залог 1 000. Убыток одной сделки — 7% счёта.
+# Сделка, которая через 1 500 минут всё ещё в минусе, закрывается.
+SHORT_CASH = 100_000.0
+SHORT_MARGIN = 1_000.0
+SHORT_RISK = 0.07
+SHORT_LOSS_BARS = 1_500
+
+
 class Window(NamedTuple):
     """Свои вход, выход, стоп, потолок объёма и размер позиции."""
 
@@ -55,10 +65,24 @@ class Window(NamedTuple):
     stop_mult: float | None
     clock_cap: float | None = None
     size_mode: str = "flat"
+    loss_bars: int | None = None
+    risk_fraction: float | None = None
+    cash: float = 1_000_000.0
+    margin: float = 20_000.0
 
 
 WINDOWS = (
-    Window(SHORT_WINDOW, SHORT_WINDOW, None, SHORT_CLOCK_CAP, "flat"),
+    Window(
+        SHORT_WINDOW,
+        SHORT_WINDOW,
+        None,
+        SHORT_CLOCK_CAP,
+        "flat",
+        SHORT_LOSS_BARS,
+        SHORT_RISK,
+        SHORT_CASH,
+        SHORT_MARGIN,
+    ),
     Window(LONG_WINDOW, 0, LONG_STOP, None, "inverse"),
 )
 CHANNEL = SHORT_WINDOW
@@ -117,6 +141,9 @@ class MinuteDonchian(bt.Strategy):
         clock_cap=None,
         size_mode="flat",
         trade_from="",
+        loss_bars=0,
+        risk_fraction=0.0,
+        margin=MARGIN,
     )
 
     def __init__(self) -> None:
@@ -125,6 +152,8 @@ class MinuteDonchian(bt.Strategy):
         self.stop_dist = None
         self.pending = ""
         self.pending_size = 1
+        self.entry_len: int | None = None
+        self.entry_price: float | None = None
         self.entry_sizes: list[int] = []
         self.reasons: list[str] = []
         self.seen_day: date | None = None
@@ -148,6 +177,8 @@ class MinuteDonchian(bt.Strategy):
             self.entry_order = self.sell(size=size)
         elif pending == "exit":
             self._exit("channel")
+        elif pending == "time":
+            self._exit("time")
 
     def next(self) -> None:
         self.values.append((self.data.datetime.datetime(0), float(self.broker.getvalue())))
@@ -175,6 +206,8 @@ class MinuteDonchian(bt.Strategy):
         if self.entry_order is None or order.ref != self.entry_order.ref:
             return
         self.entry_sizes.append(abs(int(order.executed.size)))
+        self.entry_len = len(self)
+        self.entry_price = float(order.executed.price)
         self._arm_stop(order)
         self.entry_order = None
 
@@ -203,12 +236,25 @@ class MinuteDonchian(bt.Strategy):
         return date.fromisoformat(str(value)[:10])
 
     def _schedule_exit(self) -> None:
+        if self._schedule_time_exit():
+            return
         if float(self.data.exit_ready[0]) < 1:
             return
         if float(self.position.size) > 0 and float(self.data.close[0]) < float(self.data.exit_low[0]):
             self.pending = "exit"
         elif float(self.position.size) < 0 and float(self.data.close[0]) > float(self.data.exit_high[0]):
             self.pending = "exit"
+
+    def _schedule_time_exit(self) -> bool:
+        if not self.p.loss_bars or self.entry_len is None or self.entry_price is None:
+            return False
+        if len(self) - self.entry_len < int(self.p.loss_bars):
+            return False
+        side = 1 if float(self.position.size) > 0 else -1
+        if (float(self.data.close[0]) - float(self.entry_price)) * side < 0:
+            self.pending = "time"
+            return True
+        return False
 
     def _front_day(self) -> date | None:
         return _as_date(self.p.trade_from)
@@ -231,14 +277,21 @@ class MinuteDonchian(bt.Strategy):
         prior_high = float(self.data.prior_high[0])
         prior_low = float(self.data.prior_low[0])
         prior_range = float(self.data.prior_range[0])
-        if self.p.use_stop:
+        if self.p.risk_fraction:
+            sized = _risk_size(float(self.broker.getvalue()), float(self.p.risk_fraction), float(self.p.margin))
+            if sized is None:
+                return
+            self.pending_size, self.stop_dist = sized
+        elif self.p.use_stop:
             self.stop_dist = self.p.stop_mult * prior_range
         if close > prior_high:
             self.pending = "long"
-            self.pending_size = entry_lots(self.p.size_mode, 1, close, prior_high, prior_low, prior_range)
+            if not self.p.risk_fraction:
+                self.pending_size = entry_lots(self.p.size_mode, 1, close, prior_high, prior_low, prior_range)
         elif close < prior_low:
             self.pending = "short"
-            self.pending_size = entry_lots(self.p.size_mode, -1, close, prior_high, prior_low, prior_range)
+            if not self.p.risk_fraction:
+                self.pending_size = entry_lots(self.p.size_mode, -1, close, prior_high, prior_low, prior_range)
 
     def _exit(self, reason: str) -> None:
         if not self.position:
@@ -388,6 +441,10 @@ def simulate(
     exit_channel: int | None = None,
     trail: bool = False,
     trade_from: date | None = None,
+    loss_bars: int | None = None,
+    risk_fraction: float | None = None,
+    margin: float = MARGIN,
+    cash: float | None = None,
     view: pd.DataFrame | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
@@ -404,6 +461,9 @@ def simulate(
     на исходную дистанцию, уже после проверки стопа на этой минуте.
     trade_from — первый день истекающего контракта. Более ранние минуты
     только собирают окно: сделка открывается не раньше открытия этого дня.
+    loss_bars закрывает сделку, которая столько минут всё ещё в минусе.
+    risk_fraction ставит стоп на эту долю текущего счёта. cash — счёт на входе,
+    он растёт и уменьшается от сделки к сделке. margin — залог на контракт.
     view — уже посчитанные уровни; иначе они строятся из channel и exit_channel.
     """
     if view is None:
@@ -439,6 +499,7 @@ def simulate(
     pending = ""
     pending_lots = 1
     cooldown_until = 0
+    equity = cash
 
     for i in range(len(view)):
         if pending == "long" and position == 0:
@@ -455,27 +516,37 @@ def simulate(
             stop_px = float("inf") if stop_dist is None else entry_px + stop_dist
         elif pending == "exit" and position != 0:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "channel", lots)
+            equity = _apply_cash(equity, trades)
+            position = 0
+        elif pending == "time" and position != 0:
+            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "time", lots)
+            equity = _apply_cash(equity, trades)
             position = 0
         elif pending == "expiry" and position != 0:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "expiry", lots)
+            equity = _apply_cash(equity, trades)
             position = 0
         pending = ""
 
         stopped = False
         if position == 1 and opened[i] <= stop_px:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop", lots)
+            equity = _apply_cash(equity, trades)
             position = 0
             stopped = True
         elif position == 1 and low[i] <= stop_px:
             _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop", lots)
+            equity = _apply_cash(equity, trades)
             position = 0
             stopped = True
         elif position == -1 and opened[i] >= stop_px:
             _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop", lots)
+            equity = _apply_cash(equity, trades)
             position = 0
             stopped = True
         elif position == -1 and high[i] >= stop_px:
             _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop", lots)
+            equity = _apply_cash(equity, trades)
             position = 0
             stopped = True
         if stopped and cooldown:
@@ -496,6 +567,13 @@ def simulate(
             pending = "exit"
         elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
             pending = "exit"
+        elif (
+            position != 0
+            and loss_bars is not None
+            and i - entry_i >= loss_bars
+            and (close[i] - entry_px) * position < 0
+        ):
+            pending = "time"
         elif position == 0 and prior_high[i] == prior_high[i] and i >= cooldown_until:
             if trade_from is not None and days[i + 1] < trade_from:
                 continue
@@ -512,14 +590,41 @@ def simulate(
                 if clock == clock and clock > 0 and volume[i] > clock_cap * clock:
                     continue
             room = clearance * prior_range[i]
-            stop_dist = None if stop_mult is None else stop_mult * prior_range[i]
+            if risk_fraction is not None:
+                if equity is None:
+                    raise ValueError("Для доли риска нужен текущий счёт")
+                sized = _risk_size(equity, risk_fraction, margin)
+                if sized is None:
+                    continue
+                pending_lots, stop_dist = sized
+            else:
+                stop_dist = None if stop_mult is None else stop_mult * prior_range[i]
             if close[i] > prior_high[i] + room:
                 pending = "long"
-                pending_lots = entry_lots(size_mode, 1, close[i], prior_high[i], prior_low[i], prior_range[i])
+                if risk_fraction is None:
+                    pending_lots = entry_lots(size_mode, 1, close[i], prior_high[i], prior_low[i], prior_range[i])
             elif close[i] < prior_low[i] - room:
                 pending = "short"
-                pending_lots = entry_lots(size_mode, -1, close[i], prior_high[i], prior_low[i], prior_range[i])
+                if risk_fraction is None:
+                    pending_lots = entry_lots(size_mode, -1, close[i], prior_high[i], prior_low[i], prior_range[i])
     return trades
+
+
+def _risk_size(equity: float, risk_fraction: float, margin: float) -> tuple[int, float] | None:
+    """Контракты по залогу и дистанция стопа, чтобы стоп забирал долю счёта."""
+    contracts = int(equity // (margin + COMMISSION))
+    if contracts < 1:
+        return None
+    per_contract = risk_fraction * equity / contracts
+    if per_contract <= 2 * COMMISSION:
+        return None
+    return contracts, (per_contract - 2 * COMMISSION) / MULTIPLIER
+
+
+def _apply_cash(equity: float | None, trades: list[dict[str, object]]) -> float | None:
+    if equity is None:
+        return None
+    return equity + float(trades[-1]["pnlcomm"])
 
 
 def entry_lots(
@@ -771,6 +876,10 @@ def run_contract(
     clock_cap: float | None = None,
     size_mode: str = "flat",
     trade_from: date | None = None,
+    loss_bars: int | None = None,
+    risk_fraction: float | None = None,
+    cash: float = START_CASH,
+    margin: float = MARGIN,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
@@ -781,18 +890,21 @@ def run_contract(
         secid=secid,
         last_day=last_day,
         stop_mult=STOP_MULT if stop_mult is None else stop_mult,
-        use_stop=stop_mult is not None,
+        use_stop=stop_mult is not None or risk_fraction is not None,
         clock_cap=clock_cap,
         size_mode=size_mode,
         trade_from="" if trade_from is None else trade_from.isoformat(),
+        loss_bars=0 if loss_bars is None else loss_bars,
+        risk_fraction=0.0 if risk_fraction is None else risk_fraction,
+        margin=margin,
     )
     cerebro.adddata(SignalData(dataname=view))
-    cerebro.broker.setcash(START_CASH)
+    cerebro.broker.setcash(cash)
     cerebro.broker.setcommission(
         commission=COMMISSION,
         commtype=bt.CommInfoBase.COMM_FIXED,
         mult=MULTIPLIER,
-        margin=MARGIN,
+        margin=margin,
         stocklike=False,
     )
     return cerebro.run()[0]
@@ -847,8 +959,63 @@ def run_all(
     }
 
 
-def _max_drawdown(values: list[tuple[object, float]]) -> float:
-    peak = START_CASH
+def run_account(
+    frames: dict[str, pd.DataFrame],
+    window: Window,
+    trade_from: dict[str, date] | None = None,
+) -> dict[str, object]:
+    """Один счёт на все контракты: размер следующей сделки зависит от результата предыдущей."""
+    equity = window.cash
+    results = []
+    for secid, frame in frames.items():
+        print(secid, flush=True)
+        front = None if trade_from is None else trade_from.get(secid)
+        strategy = run_contract(
+            secid,
+            frame,
+            window.channel,
+            stop_mult=window.stop_mult,
+            exit_channel=window.exit_channel,
+            clock_cap=window.clock_cap,
+            size_mode=window.size_mode,
+            trade_from=front,
+            loss_bars=window.loss_bars,
+            risk_fraction=window.risk_fraction,
+            cash=equity,
+            margin=window.margin,
+        )
+        equity = float(strategy.broker.getvalue())
+        gross = sum(float(trade["pnl"]) for trade in strategy.trades)
+        net = sum(float(trade["pnlcomm"]) for trade in strategy.trades)
+        results.append(
+            {
+                "secid": secid,
+                "trades": strategy.trades,
+                "gross": gross,
+                "net": net,
+                "hold": buy_and_hold(frame, window.channel, front),
+                "values": strategy.values,
+            }
+        )
+    trades = [trade for item in results for trade in item["trades"]]
+    return {
+        "contracts": results,
+        "trades": trades,
+        "channel": window.channel,
+        "exit": window.exit_channel,
+        "stop_mult": window.stop_mult,
+        "clock_cap": window.clock_cap,
+        "size_mode": window.size_mode,
+        "loss_bars": window.loss_bars,
+        "risk_fraction": window.risk_fraction,
+        "cash": window.cash,
+        "equity": equity,
+        "margin": window.margin,
+    }
+
+
+def _max_drawdown(values: list[tuple[object, float]], start: float = START_CASH) -> float:
+    peak = start
     worst = 0.0
     for _moment, value in values:
         peak = max(peak, value)
@@ -936,10 +1103,17 @@ def report(summary: dict[str, object]) -> str:
     wins = [trade for trade in trades if float(trade["pnlcomm"]) > 0]
     factor = _profit_factor(trades)
     factor_text = "—" if factor is None else f"{factor:.2f}"
-    worst = min((_max_drawdown(item["values"]) for item in contracts), default=0.0)
+    risk_fraction = summary.get("risk_fraction")
+    if risk_fraction:
+        stitched = [point for item in contracts for point in item["values"]]
+        worst = _max_drawdown(stitched, start=float(summary.get("cash", START_CASH)))
+    else:
+        worst = min((_max_drawdown(item["values"]) for item in contracts), default=0.0)
     clock_cap = summary.get("clock_cap")
     size_mode = str(summary.get("size_mode", "flat"))
-    if stop_mult is None:
+    if risk_fraction:
+        stop_text = f"стоп на {float(risk_fraction):.0%} счёта"
+    elif stop_mult is None:
         stop_text = "защитного стопа нет"
     else:
         stop_text = f"стоп {float(stop_mult):.0f} медиан минутного диапазона"
@@ -947,7 +1121,13 @@ def report(summary: dict[str, object]) -> str:
         exit_text = "выход по каналу выключен"
     else:
         exit_text = f"выход по каналу {exit_channel} минут"
-    if size_mode == "inverse":
+    loss_bars = summary.get("loss_bars")
+    if risk_fraction:
+        size_text = (
+            f"контрактов столько, сколько пускает залог {float(summary.get('margin', 0)):.0f} руб., "
+            f"счёт с {float(summary.get('cash', 0)):,.0f} руб."
+        )
+    elif size_mode == "inverse":
         size_text = "лоты 3, 2 или 1: чем ближе пробой к границе канала, тем больше"
     else:
         size_text = "1 лот"
@@ -964,17 +1144,28 @@ def report(summary: dict[str, object]) -> str:
         volume_text,
         f"Комиссия {COMMISSION:.0f} руб. за контракт за сторону. В последний день позиция закрывается.",
         "Сделки только в истекающем контракте. Месяц до него прогревает окно и не торгуется.",
+    ]
+    if loss_bars:
+        lines.append(f"Если через {int(loss_bars)} минут сделка всё ещё в минусе, она закрывается.")
+    if risk_fraction and summary.get("equity") is not None:
+        lines.append(f"Счёт в конце: {float(summary['equity']):,.0f} руб.")
+    lines.extend([
         "Части: " + ", ".join(f"Ч{index} {_money(part)}" for index, part in enumerate(part_nets, start=1)),
         f"Сделок: {len(trades)}. Прибыльных: {len(wins)}.",
         _lots_line(trades),
         f"Лонгов: {len(longs)}, результат {sum(float(trade['pnlcomm']) for trade in longs):,.0f} руб.",
         f"Шортов: {len(shorts)}, результат {sum(float(trade['pnlcomm']) for trade in shorts):,.0f} руб.",
         f"Без комиссии: {gross:,.0f} руб. После комиссии: {net:,.0f} руб.",
-        f"Фактор прибыли: {factor_text}. Худшая просадка одного контракта: {worst:,.0f} руб.",
+        f"Фактор прибыли: {factor_text}. "
+        + (
+            f"Худшая просадка счёта: {worst:,.0f} руб."
+            if risk_fraction
+            else f"Худшая просадка одного контракта: {worst:,.0f} руб."
+        ),
         f"Просто лонг на тех же историях: {hold:,.0f} руб.",
         "",
         f"{'SECID':<8} {'СДЕЛОК':>7} {'СТРАТЕГИЯ':>12} {'ЛОНГ':>12}",
-    ]
+    ])
     for item in contracts:
         lines.append(
             f"{item['secid']:<8} {len(item['trades']):>7} {item['net']:>12,.0f} {item['hold']:>12,.0f}"
@@ -1164,19 +1355,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     for window in WINDOWS:
-        print(
-            report(
-                run_all(
-                    frames,
-                    window.channel,
-                    stop_mult=window.stop_mult,
-                    exit_channel=window.exit_channel,
-                    clock_cap=window.clock_cap,
-                    size_mode=window.size_mode,
-                    trade_from=starts,
+        if window.risk_fraction:
+            print(report(run_account(frames, window, starts)))
+        else:
+            print(
+                report(
+                    run_all(
+                        frames,
+                        window.channel,
+                        stop_mult=window.stop_mult,
+                        exit_channel=window.exit_channel,
+                        clock_cap=window.clock_cap,
+                        size_mode=window.size_mode,
+                        trade_from=starts,
+                    )
                 )
             )
-        )
         print()
     return 0
 

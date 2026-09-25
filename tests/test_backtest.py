@@ -242,6 +242,46 @@ def test_trade_starts_follow_the_expiring_contract_not_the_warmup_month():
     assert starts["CRZ6"] == date(2026, 9, 18)
 
 
+def test_a_stop_at_seven_percent_matches_backtrader():
+    rows = [_quiet() for _ in range(5)]
+    rows.append((10.0, 10.40, 10.20, 10.30, 1000))
+    rows.append((10.30, 10.35, 10.20, 10.22, 1000))
+    rows.extend(_quiet(10.22) for _ in range(3))
+    frame = _days(rows)
+    cash = 10_000.0
+    simulated = simulate(
+        "CRZ5", frame, 5, stop_mult=None, exit_channel=0,
+        risk_fraction=0.07, margin=1_000.0, cash=cash,
+    )
+    strategy = run_contract(
+        "CRZ5", frame, 5, stop_mult=None, exit_channel=0,
+        risk_fraction=0.07, margin=1_000.0, cash=cash,
+    )
+    assert len(simulated) == len(strategy.trades) == 1
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["lots"] == 9
+        assert trade["reason"] == "stop"
+        assert trade["pnlcomm"] == pytest.approx(-0.07 * cash)
+
+
+def test_a_trade_still_negative_after_the_time_limit_is_closed():
+    rows = [_quiet() for _ in range(5)]
+    rows.append((10.0, 10.40, 10.20, 10.30, 1000))
+    rows.append((10.30, 10.35, 10.22, 10.25, 1000))
+    rows.append((10.25, 10.28, 10.20, 10.24, 1000))
+    rows.append((10.22, 10.26, 10.18, 10.24, 1000))
+    rows.append(_quiet(10.24))
+    frame = _days(rows)
+    simulated = simulate("CRZ5", frame, 5, stop_mult=None, exit_channel=0, loss_bars=1)
+    strategy = run_contract("CRZ5", frame, 5, stop_mult=None, exit_channel=0, loss_bars=1)
+    assert len(simulated) == len(strategy.trades) == 1
+    entry = float(frame["open"].iloc[6])
+    exit_ = float(frame["open"].iloc[8])
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["reason"] == "time"
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
+
+
 def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("inverse", 1, 10.5, 10.0, 9.0, 1.0) == 3
     assert entry_lots("inverse", 1, 11.0, 10.0, 9.0, 1.0) == 2
@@ -249,6 +289,7 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("inverse", 1, 12.0, 10.0, 9.0, 1.0) == 1
     assert entry_lots("flat", 1, 10.10, 10.05, 9.95, 0.10) == 1
     assert WINDOWS[0].size_mode == "flat" and WINDOWS[0].clock_cap == 5
+    assert WINDOWS[0].loss_bars == 1500 and WINDOWS[0].risk_fraction == 0.07
     assert WINDOWS[1].size_mode == "inverse" and WINDOWS[1].clock_cap is None
 
 
