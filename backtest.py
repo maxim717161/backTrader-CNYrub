@@ -1,11 +1,13 @@
 """Канал по закрытиям минуток каждого квартального CNY/RUB.
 
 Склеенного ряда нет: у каждого контракта свой прогон. Сигнал — закрытие
-минуты за пределами предыдущих N максимумов или минимумов. Вход на открытии
-следующей минуты, если объём минуты сигнала не ниже медианы этих N минут.
-Выход — обратный пробой более короткого окна или стоп в нескольких медианах
-минутного диапазона. В последний день новая сделка не открывается, открытая
-закрывается на первом открытии этого дня.
+минуты за пределами предыдущих N максимумов или минимумов. Позиция меняется
+не быстрее 10 контрактов в минуту, каждый кусок по закрытию этой минуты.
+Первый кусок — на следующей минуте после сигнала, если объём минуты сигнала
+не ниже медианы этих N минут. Выход — обратный пробой более короткого окна
+или стоп в нескольких медианах минутного диапазона: закрытие тоже идёт
+по 10 контрактов в минуту. В последний день новая сделка не открывается,
+открытая так же разбирается по минутам.
 
 Сделки идут только в истекающем контракте, со следующего дня после экспирации
 предыдущего. Месяц до этого дня уже лежит в файле и прогревает окно, но
@@ -21,7 +23,10 @@
 Длинное окно 12 420 минут не выходит по каналу и держит стоп в 22 медианы
 минутного диапазона. Ноль медиан пробоя — это 100% контрактов, которые
 пускает залог, от одной до двух медиан — 50%, двенадцать медиан — 0%. Счёт 100 000 руб.,
-залог 1 000 руб.
+залог 1 000 руб. Пока сделка открыта, запоминается лучшая цена закрытия.
+Откат на 100 медиан минутного диапазона уменьшает позицию до половины
+исходного размера. Когда откат сжимается до 50 медиан, размер возвращается.
+Обычный день — это около 50 таких медиан. Куски те же: 10 контрактов в минуту.
 """
 
 from __future__ import annotations
@@ -54,6 +59,13 @@ LONG_MARGIN = 1_000.0
 LONG_BREAKOUT_SPAN = 12.0
 LONG_BREAKOUT_LOW = 1.0
 LONG_BREAKOUT_HIGH = 2.0
+# Откат от лучшей цены сделки, в медианах минутного диапазона на входе.
+# 100 медиан — около двух обычных дней: позиция уменьшается до половины.
+# 50 медиан — около одного дня: размер возвращается. До нуля не режем,
+# чтобы ту же сделку можно было набрать обратно.
+LONG_SCALE_STEP = 100.0
+LONG_SCALE_BACK = 50.0
+LONG_SCALE_FLOOR = 0.5
 SHORT_CLOCK_CAP = 5.0
 LONG_CANDIDATES = (12_480, 12_960)
 
@@ -82,6 +94,9 @@ class Window(NamedTuple):
     margin: float = 20_000.0
     stop_rub: float | None = None
     breakout_span: float | None = None
+    scale_step: float | None = None
+    scale_back: float | None = None
+    scale_floor: float = LONG_SCALE_FLOOR
 
 
 WINDOWS = (
@@ -109,6 +124,9 @@ WINDOWS = (
         LONG_MARGIN,
         None,
         LONG_BREAKOUT_SPAN,
+        LONG_SCALE_STEP,
+        LONG_SCALE_BACK,
+        LONG_SCALE_FLOOR,
     ),
 )
 CHANNEL = SHORT_WINDOW
@@ -128,6 +146,8 @@ PARTS = (
 )
 MULTIPLIER = 1000.0
 COMMISSION = 1.0
+# За минуту позиция меняется не больше чем на столько контрактов.
+FILL_PER_MINUTE = 10
 MARGIN = 20_000.0
 START_CASH = 1_000_000.0
 BARS_DIR = Path("data/bars")
@@ -158,6 +178,314 @@ class SignalData(bt.feeds.PandasData):
     )
 
 
+class _FillBook:
+    """Текущая позиция и цель. К цели идём кусками по закрытию минуты."""
+
+    def __init__(self, secid: str, equity: float | None) -> None:
+        self.secid = secid
+        self.equity = equity
+        self.held = 0
+        self.target = 0
+        self.avg = 0.0
+        self.stop_dist: float | None = None
+        self.stop_px: float | None = None
+        self.trail = False
+        self.entry_i: int | None = None
+        self.reason = ""
+        self.opened = 0
+        self.gross = 0.0
+        self.commission = 0.0
+        self.cooldown_until = 0
+        self.last_signed = 0
+        self.trades: list[dict[str, object]] = []
+        self.base = 0
+        self.best: float | None = None
+        self.unit = 0.0
+        self.scale_level = 0
+        self.scaled = False
+        self.peak = 0
+
+    def stop_hit(self, opened: float, high: float, low: float) -> bool:
+        if self.held == 0 or self.stop_px is None:
+            return False
+        if self.held > 0:
+            return opened <= self.stop_px or low <= self.stop_px
+        return opened >= self.stop_px or high >= self.stop_px
+
+    def move(self, price: float, index: int, limit: int) -> int:
+        """Сдвинуть позицию к цели не больше чем на limit контрактов."""
+        self.last_signed = 0
+        delta = self.target - self.held
+        if delta == 0 or limit <= 0:
+            return 0
+        step = max(-limit, min(limit, delta))
+        if self.held > 0:
+            step = max(step, -self.held)
+        elif self.held < 0:
+            step = min(step, -self.held)
+        if step == 0:
+            return 0
+        self._apply(step, price, index)
+        self.last_signed = step
+        return step
+
+    def _sync_stop(self) -> None:
+        if self.held == 0 or self.stop_dist is None:
+            self.stop_px = None
+            return
+        base = self.avg - self.stop_dist if self.held > 0 else self.avg + self.stop_dist
+        if self.stop_px is None or not self.trail:
+            self.stop_px = base
+        elif self.held > 0:
+            self.stop_px = max(self.stop_px, base)
+        else:
+            self.stop_px = min(self.stop_px, base)
+
+    def _apply(self, step: int, price: float, index: int) -> None:
+        if self.held == 0:
+            self.avg = price
+            self.held = step
+            self.entry_i = index
+            self.opened = abs(step)
+            self.peak = abs(step)
+            self.gross = 0.0
+            self.commission = COMMISSION * abs(step)
+            self.reason = ""
+            self.best = price
+            self._sync_stop()
+            return
+        if step * self.held > 0:
+            total = abs(self.held) + abs(step)
+            self.avg = (self.avg * abs(self.held) + price * abs(step)) / total
+            self.held += step
+            self.opened += abs(step)
+            self.peak = max(self.peak, abs(self.held))
+            self.commission += COMMISSION * abs(step)
+            self._sync_stop()
+            return
+        sign = 1 if self.held > 0 else -1
+        lots = abs(step)
+        self.gross += (price - self.avg) * sign * lots * MULTIPLIER
+        self.commission += COMMISSION * lots
+        self.held += step
+        if self.held != 0:
+            return
+        pnlcomm = self.gross - self.commission
+        self.trades.append(
+            {
+                "secid": self.secid,
+                "direction": "long" if sign > 0 else "short",
+                "lots": self.peak or self.opened,
+                "pnl": self.gross,
+                "pnlcomm": pnlcomm,
+                "bars": index - int(self.entry_i),
+                "reason": self.reason,
+                "scaled": self.scaled,
+            }
+        )
+        if self.equity is not None:
+            self.equity += pnlcomm
+        self.avg = 0.0
+        self.stop_dist = None
+        self.stop_px = None
+        self.entry_i = None
+        self.reason = ""
+        self.opened = 0
+        self.gross = 0.0
+        self.commission = 0.0
+        self.base = 0
+        self.best = None
+        self.unit = 0.0
+        self.scale_level = 0
+        self.scaled = False
+        self.peak = 0
+
+
+def marked_equity(book: _FillBook, close: float) -> float:
+    """Счёт с открытой позицией по этой цене: уже закрытый результат плюс текущий."""
+    settled = 0.0 if book.equity is None else book.equity
+    return settled + book.gross - book.commission + (close - book.avg) * book.held * MULTIPLIER
+
+
+def _resize_for_pullback(
+    book: _FillBook,
+    close: float,
+    step: float,
+    floor: float,
+    restore: float,
+) -> None:
+    """Уменьшить цель, когда цена ушла против лучшей цены сделки, и вернуть, когда она вернулась.
+
+    step и restore — медианы минутного диапазона, зафиксированные на входе.
+    На step и дальше цель равна доле floor от исходного размера. На restore
+    и ближе к лучшей цене цель снова полная. Между ними цель не меняется,
+    чтобы откат туда-сюда не крутил позицию. До нуля цель не падает.
+    """
+    if book.held == 0 or book.base == 0 or not book.unit > 0 or not step > 0:
+        return
+    if restore >= step:
+        restore = step / 2
+    if book.best is None:
+        book.best = close
+    if book.held > 0:
+        book.best = max(book.best, close)
+        pullback = book.best - close
+    else:
+        book.best = min(book.best, close)
+        pullback = close - book.best
+    ranges = pullback / book.unit if pullback > 0 else 0.0
+    if ranges >= step:
+        book.scale_level = 1
+    elif ranges <= restore:
+        book.scale_level = 0
+    if book.scale_level:
+        book.scaled = True
+    fraction = floor if book.scale_level else 1.0
+    desired = int(abs(book.base) * fraction)
+    if desired < 1:
+        desired = 1
+    book.target = (1 if book.base > 0 else -1) * desired
+
+
+def step_minute(
+    book: _FillBook,
+    index: int,
+    *,
+    opened: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+    day: date,
+    next_day: date | None,
+    last_day: date,
+    prior_high: float,
+    prior_low: float,
+    prior_vol: float,
+    prior_range: float,
+    exit_high: float,
+    exit_low: float,
+    clock_vol: float,
+    entry_ready: float,
+    clearance: float,
+    cooldown: int,
+    clock_volume: bool,
+    clock_cap: float | None,
+    size_mode: str,
+    stop_mult: float | None,
+    loss_bars: int | None,
+    risk_fraction: float | None,
+    margin: float,
+    stop_rub: float | None,
+    breakout_span: float | None,
+    trade_from: date | None,
+    trail: bool,
+    scale_step: float | None = None,
+    scale_floor: float = LONG_SCALE_FLOOR,
+    scale_back: float | None = None,
+) -> None:
+    """Одна минута: сначала кусок по её закрытию, потом решение на следующие."""
+    if day == last_day and (book.held != 0 or book.target != 0):
+        book.target = 0
+        if book.held != 0 and not book.reason:
+            book.reason = "expiry"
+    elif book.stop_hit(opened, high, low):
+        book.target = 0
+        book.reason = "stop"
+        if cooldown:
+            book.cooldown_until = index + cooldown
+
+    limit = abs(book.target - book.held) if next_day is None else FILL_PER_MINUTE
+    book.move(close, index, limit)
+    if trail and book.held != 0 and book.stop_dist is not None and book.stop_px is not None:
+        if book.held > 0:
+            book.stop_px = max(book.stop_px, close - book.stop_dist)
+        else:
+            book.stop_px = min(book.stop_px, close + book.stop_dist)
+
+    if day == last_day or next_day is None:
+        return
+    if book.held != 0 and book.target != 0:
+        if (
+            loss_bars
+            and book.entry_i is not None
+            and index - book.entry_i >= loss_bars
+            and (close - book.avg) * book.held < 0
+        ):
+            book.target = 0
+            book.reason = "time"
+            return
+        if exit_low == exit_low and book.held > 0 and close < exit_low:
+            book.target = 0
+            book.reason = "channel"
+            return
+        if exit_high == exit_high and book.held < 0 and close > exit_high:
+            book.target = 0
+            book.reason = "channel"
+            return
+        if scale_step:
+            restore = scale_step / 2 if scale_back is None else scale_back
+            _resize_for_pullback(book, close, scale_step, scale_floor, restore)
+        return
+    if book.held != 0 or book.target != 0 or next_day == last_day or index < book.cooldown_until:
+        return
+    if trade_from is not None and next_day < trade_from:
+        return
+    if entry_ready < 1 or prior_high != prior_high:
+        return
+    if clock_volume:
+        if clock_vol != clock_vol:
+            return
+        typical = clock_vol
+    else:
+        typical = prior_vol
+    if typical == typical and typical > 0 and volume < typical:
+        return
+    if clock_cap is not None and clock_vol == clock_vol and clock_vol > 0 and volume > clock_cap * clock_vol:
+        return
+    room = clearance * prior_range if prior_range == prior_range else 0.0
+    if close > prior_high + room:
+        side = 1
+    elif prior_low == prior_low and close < prior_low - room:
+        side = -1
+    else:
+        return
+    if breakout_span:
+        if prior_range == prior_range and prior_range > 0:
+            beyond = (close - prior_high) / prior_range if side > 0 else (prior_low - close) / prior_range
+        else:
+            beyond = float("inf")
+        if book.equity is None:
+            raise ValueError("Для доли пробоя нужен текущий счёт")
+        sized = breakout_lots(book.equity, margin, beyond, breakout_span)
+        if sized is None:
+            return
+        lots = sized
+        book.stop_dist = None if stop_mult is None else stop_mult * prior_range
+    elif risk_fraction:
+        if book.equity is None:
+            raise ValueError("Для доли риска нужен текущий счёт")
+        sized_risk = _risk_size(
+            book.equity,
+            risk_fraction,
+            margin,
+            0.0 if stop_rub is None else stop_rub,
+        )
+        if sized_risk is None:
+            return
+        lots, book.stop_dist = sized_risk
+    else:
+        book.stop_dist = None if stop_mult is None else stop_mult * prior_range
+        lots = entry_lots(size_mode, side, close, prior_high, prior_low, prior_range)
+    book.reason = ""
+    book.base = side * lots
+    book.unit = float(prior_range) if prior_range == prior_range and prior_range > 0 else 0.0
+    book.best = None
+    book.scale_level = 0
+    book.scaled = False
+    book.target = side * lots
+
+
 class MinuteDonchian(bt.Strategy):
     params = dict(
         secid="",
@@ -172,88 +500,75 @@ class MinuteDonchian(bt.Strategy):
         margin=MARGIN,
         stop_rub=0.0,
         breakout_span=0.0,
+        scale_step=0.0,
+        scale_floor=LONG_SCALE_FLOOR,
+        scale_back=0.0,
     )
 
     def __init__(self) -> None:
-        self.entry_order = None
-        self.protective = None
-        self.stop_dist = None
-        self.pending = ""
-        self.pending_size = 1
-        self.entry_len: int | None = None
-        self.entry_price: float | None = None
-        self.entry_sizes: list[int] = []
-        self.reasons: list[str] = []
-        self.seen_day: date | None = None
-        self.trades: list[dict[str, object]] = []
+        self.book = _FillBook(str(self.p.secid), None)
+        self.trades = self.book.trades
         self.values: list[tuple[object, float]] = []
 
-    def next_open(self) -> None:
-        today = self.data.datetime.date(0)
-        if self.seen_day != today and today == self._last_day():
-            self.pending = ""
-            self.seen_day = today
-            self._exit("expiry")
-            return
-        self.seen_day = today
-        pending = self.pending
-        size = self.pending_size
-        self.pending = ""
-        if pending == "long":
-            self.entry_order = self.buy(size=size)
-        elif pending == "short":
-            self.entry_order = self.sell(size=size)
-        elif pending == "exit":
-            self._exit("channel")
-        elif pending == "time":
-            self._exit("time")
+    def start(self) -> None:
+        self.book.equity = float(self.broker.getvalue())
 
     def next(self) -> None:
-        self.values.append((self.data.datetime.datetime(0), float(self.broker.getvalue())))
-        if self.data.datetime.date(0) == self._last_day():
-            return
-        if self.position:
-            self._schedule_exit()
-            return
-        if self.entry_order is not None or self.pending:
-            return
-        self._schedule_entry()
-
-    def notify_order(self, order: bt.Order) -> None:
-        if order.status in (order.Canceled, order.Margin, order.Rejected, order.Expired):
-            if self.entry_order is not None and order.ref == self.entry_order.ref:
-                self.entry_order = None
-            return
-        if order.status != order.Completed:
-            return
-        if order.info.get("reason"):
-            self.reasons.append(str(order.info["reason"]))
-            if self.protective is not None and order.ref == self.protective.ref:
-                self.protective = None
-            return
-        if self.entry_order is None or order.ref != self.entry_order.ref:
-            return
-        self.entry_sizes.append(abs(int(order.executed.size)))
-        self.entry_len = len(self)
-        self.entry_price = float(order.executed.price)
-        self._arm_stop(order)
-        self.entry_order = None
-
-    def notify_trade(self, trade: bt.Trade) -> None:
-        if not trade.isclosed:
-            return
-        lots = self.entry_sizes.pop(0) if self.entry_sizes else 1
-        self.trades.append(
-            {
-                "secid": self.p.secid,
-                "direction": "long" if trade.long else "short",
-                "lots": lots,
-                "pnl": float(trade.pnl),
-                "pnlcomm": float(trade.pnlcomm),
-                "bars": int(trade.barlen),
-                "reason": self.reasons.pop(0) if self.reasons else "",
-            }
+        book = self.book
+        close = float(self.data.close[0])
+        step_minute(
+            book,
+            len(self) - 1,
+            opened=float(self.data.open[0]),
+            high=float(self.data.high[0]),
+            low=float(self.data.low[0]),
+            close=close,
+            volume=float(self.data.volume[0]),
+            day=self.data.datetime.date(0),
+            next_day=self._following_day(),
+            last_day=self._last_day(),
+            prior_high=float(self.data.prior_high[0]),
+            prior_low=float(self.data.prior_low[0]),
+            prior_vol=float(self.data.prior_vol[0]),
+            prior_range=float(self.data.prior_range[0]),
+            exit_high=float(self.data.exit_high[0]),
+            exit_low=float(self.data.exit_low[0]),
+            clock_vol=float(self.data.clock_vol[0]),
+            entry_ready=float(self.data.entry_ready[0]),
+            clearance=0.0,
+            cooldown=0,
+            clock_volume=False,
+            clock_cap=None if self.p.clock_cap is None else float(self.p.clock_cap),
+            size_mode=str(self.p.size_mode),
+            stop_mult=None if not self.p.use_stop or self.p.risk_fraction else float(self.p.stop_mult),
+            loss_bars=int(self.p.loss_bars) or None,
+            risk_fraction=float(self.p.risk_fraction) or None,
+            margin=float(self.p.margin),
+            stop_rub=float(self.p.stop_rub) or None,
+            breakout_span=float(self.p.breakout_span) or None,
+            trade_from=self._front_day(),
+            trail=False,
+            scale_step=float(self.p.scale_step) or None,
+            scale_floor=float(self.p.scale_floor),
+            scale_back=float(self.p.scale_back) or None,
         )
+        if book.last_signed:
+            self._fill_broker(book.last_signed, close)
+        self.broker._get_value()
+        self.values.append((self.data.datetime.datetime(0), float(self.broker.getvalue())))
+
+    def _following_day(self) -> date | None:
+        if len(self.data) >= self.data.buflen():
+            return None
+        return self.data.datetime.date(1)
+
+    def _fill_broker(self, signed: int, price: float) -> None:
+        """Исполнить кусок по закрытию этой минуты, без второй сделки на открытии следующей."""
+        order = self.buy(size=signed) if signed > 0 else self.sell(size=-signed)
+        broker = self.broker
+        broker.submitted.remove(order)
+        order.accept()
+        broker._execute(order, ago=0, price=price)
 
     def _last_day(self) -> date:
         value = self.p.last_day
@@ -263,127 +578,8 @@ class MinuteDonchian(bt.Strategy):
             return value
         return date.fromisoformat(str(value)[:10])
 
-    def _schedule_exit(self) -> None:
-        if self._schedule_time_exit():
-            return
-        if float(self.data.exit_ready[0]) < 1:
-            return
-        if float(self.position.size) > 0 and float(self.data.close[0]) < float(self.data.exit_low[0]):
-            self.pending = "exit"
-        elif float(self.position.size) < 0 and float(self.data.close[0]) > float(self.data.exit_high[0]):
-            self.pending = "exit"
-
-    def _schedule_time_exit(self) -> bool:
-        if not self.p.loss_bars or self.entry_len is None or self.entry_price is None:
-            return False
-        if len(self) - self.entry_len < int(self.p.loss_bars):
-            return False
-        side = 1 if float(self.position.size) > 0 else -1
-        if (float(self.data.close[0]) - float(self.entry_price)) * side < 0:
-            self.pending = "time"
-            return True
-        return False
-
     def _front_day(self) -> date | None:
         return _as_date(self.p.trade_from)
-
-    def _schedule_entry(self) -> None:
-        front = self._front_day()
-        if front is not None and self.data.datetime.date(1) < front:
-            return
-        if float(self.data.entry_ready[0]) < 1:
-            return
-        typical = float(self.data.prior_vol[0])
-        volume = float(self.data.volume[0])
-        if typical > 0 and volume < typical:
-            return
-        if self.p.clock_cap is not None:
-            clock = float(self.data.clock_vol[0])
-            if clock > 0 and volume > self.p.clock_cap * clock:
-                return
-        close = float(self.data.close[0])
-        prior_high = float(self.data.prior_high[0])
-        prior_low = float(self.data.prior_low[0])
-        prior_range = float(self.data.prior_range[0])
-        if close > prior_high:
-            side = 1
-        elif close < prior_low:
-            side = -1
-        else:
-            return
-        if self.p.breakout_span:
-            if prior_range > 0:
-                beyond = (close - prior_high) / prior_range if side > 0 else (prior_low - close) / prior_range
-            else:
-                beyond = float("inf")
-            lots = breakout_lots(
-                float(self.broker.getvalue()),
-                float(self.p.margin),
-                beyond,
-                float(self.p.breakout_span),
-            )
-            if lots is None:
-                return
-            self.pending_size = lots
-            if self.p.use_stop:
-                self.stop_dist = self.p.stop_mult * prior_range
-        elif self.p.risk_fraction:
-            sized = _risk_size(
-                float(self.broker.getvalue()),
-                float(self.p.risk_fraction),
-                float(self.p.margin),
-                float(self.p.stop_rub),
-            )
-            if sized is None:
-                return
-            self.pending_size, self.stop_dist = sized
-        elif self.p.use_stop:
-            self.stop_dist = self.p.stop_mult * prior_range
-            self.pending_size = entry_lots(self.p.size_mode, side, close, prior_high, prior_low, prior_range)
-        else:
-            self.pending_size = entry_lots(self.p.size_mode, side, close, prior_high, prior_low, prior_range)
-        self.pending = "long" if side > 0 else "short"
-
-    def _exit(self, reason: str) -> None:
-        if not self.position:
-            self._drop_protective()
-            return
-        self._drop_protective()
-        closing = self.close()
-        if closing is not None:
-            closing.addinfo(reason=reason)
-
-    def _drop_protective(self) -> None:
-        if self.protective is not None:
-            self.cancel(self.protective)
-            self.protective = None
-
-    def _arm_stop(self, entry: bt.Order) -> None:
-        if not self.p.use_stop:
-            return
-        fill = float(entry.executed.price)
-        dist = float(self.stop_dist)
-        if entry.isbuy():
-            stop_px = fill - dist
-            protective = self.sell(exectype=bt.Order.Stop, price=stop_px, size=entry.executed.size)
-        else:
-            stop_px = fill + dist
-            protective = self.buy(exectype=bt.Order.Stop, price=stop_px, size=entry.executed.size)
-        protective.addinfo(reason="stop")
-        broker = self.broker
-        broker.submitted.remove(protective)
-        protective.accept()
-        broker._try_exec_stop(
-            protective,
-            self.data.open[0],
-            self.data.high[0],
-            self.data.low[0],
-            stop_px,
-            self.data.close[0],
-        )
-        if protective.alive():
-            broker.pending.append(protective)
-            self.protective = protective
 
 
 def _as_feed(frame: pd.DataFrame) -> pd.DataFrame:
@@ -499,8 +695,15 @@ def simulate(
     cash: float | None = None,
     view: pd.DataFrame | None = None,
     breakout_span: float | None = None,
+    scale_step: float | None = None,
+    scale_floor: float = LONG_SCALE_FLOOR,
+    scale_back: float | None = None,
+    marks: list[float] | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
+
+    Позиция меняется не быстрее чем на FILL_PER_MINUTE контрактов за минуту,
+    каждый кусок по закрытию этой минуты.
 
     clearance — на сколько медиан диапазона закрытие должно пробить канал.
     cooldown — сколько минут после стопа нельзя открывать новую сделку.
@@ -517,6 +720,11 @@ def simulate(
     trade_from — первый день истекающего контракта. Более ранние минуты
     только собирают окно: сделка открывается не раньше открытия этого дня.
     loss_bars закрывает сделку, которая столько минут всё ещё в минусе.
+    Исполнение — не больше FILL_PER_MINUTE контрактов за минуту по её закрытию.
+    scale_step уменьшает позицию до доли scale_floor, когда закрытие отходит
+    от лучшей цены сделки на столько медиан минутного диапазона. scale_back
+    возвращает полный размер, когда откат сжимается до стольких медиан.
+    marks, если передан, получает счёт после каждой минуты, с открытой позицией.
     risk_fraction — доля счёта, которую может забрать стоп stop_rub на всех контрактах.
     cash — счёт на входе,
     он растёт и уменьшается от сделки к сделке. margin — залог на контракт.
@@ -545,148 +753,49 @@ def simulate(
     trade_from = _as_date(trade_from)
     days = view.index.date
     last_day = days[-1]
-    trades: list[dict[str, object]] = []
-    position = 0
-    lots = 1
-    entry_px = 0.0
-    entry_i = 0
-    stop_px = 0.0
-    stop_dist = 0.0
-    pending = ""
-    pending_lots = 1
-    cooldown_until = 0
-    equity = cash
-
+    ready = view["entry_ready"].to_numpy(dtype=float)
+    book = _FillBook(secid, cash)
+    book.trail = trail
     for i in range(len(view)):
-        if pending == "long" and position == 0:
-            position = 1
-            lots = pending_lots
-            entry_px = opened[i]
-            entry_i = i
-            stop_px = float("-inf") if stop_dist is None else entry_px - stop_dist
-        elif pending == "short" and position == 0:
-            position = -1
-            lots = pending_lots
-            entry_px = opened[i]
-            entry_i = i
-            stop_px = float("inf") if stop_dist is None else entry_px + stop_dist
-        elif pending == "exit" and position != 0:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "channel", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-        elif pending == "time" and position != 0:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "time", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-        elif pending == "expiry" and position != 0:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "expiry", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-        pending = ""
-
-        stopped = False
-        if position == 1 and opened[i] <= stop_px:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-            stopped = True
-        elif position == 1 and low[i] <= stop_px:
-            _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-            stopped = True
-        elif position == -1 and opened[i] >= stop_px:
-            _close_trade(trades, secid, position, entry_px, opened[i], entry_i, i, "stop", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-            stopped = True
-        elif position == -1 and high[i] >= stop_px:
-            _close_trade(trades, secid, position, entry_px, stop_px, entry_i, i, "stop", lots)
-            equity = _apply_cash(equity, trades)
-            position = 0
-            stopped = True
-        if stopped and cooldown:
-            cooldown_until = i + cooldown
-        elif trail and position != 0 and stop_dist is not None:
-            if position == 1:
-                stop_px = max(stop_px, close[i] - stop_dist)
-            else:
-                stop_px = min(stop_px, close[i] + stop_dist)
-
-        if i + 1 >= len(view) or days[i] == last_day:
-            continue
-        if days[i + 1] == last_day:
-            if position != 0:
-                pending = "expiry"
-            continue
-        if (
-            position != 0
-            and loss_bars is not None
-            and i - entry_i >= loss_bars
-            and (close[i] - entry_px) * position < 0
-        ):
-            pending = "time"
-        elif position == 1 and exit_low[i] == exit_low[i] and close[i] < exit_low[i]:
-            pending = "exit"
-        elif position == -1 and exit_high[i] == exit_high[i] and close[i] > exit_high[i]:
-            pending = "exit"
-        elif position == 0 and prior_high[i] == prior_high[i] and i >= cooldown_until:
-            if trade_from is not None and days[i + 1] < trade_from:
-                continue
-            if clock_volume:
-                typical = clock_typical[i]
-                if typical != typical:
-                    continue
-            else:
-                typical = prior_vol[i]
-            if typical > 0 and volume[i] < typical:
-                continue
-            if clock_cap is not None and clock_typical is not None:
-                clock = clock_typical[i]
-                if clock == clock and clock > 0 and volume[i] > clock_cap * clock:
-                    continue
-            room = clearance * prior_range[i]
-            if breakout_span is not None:
-                if close[i] > prior_high[i] + room:
-                    side = 1
-                    beyond = (
-                        (close[i] - prior_high[i]) / prior_range[i] if prior_range[i] > 0 else float("inf")
-                    )
-                elif close[i] < prior_low[i] - room:
-                    side = -1
-                    beyond = (
-                        (prior_low[i] - close[i]) / prior_range[i] if prior_range[i] > 0 else float("inf")
-                    )
-                else:
-                    continue
-                if equity is None:
-                    raise ValueError("Для доли пробоя нужен текущий счёт")
-                sized = breakout_lots(equity, margin, beyond, breakout_span)
-                if sized is None:
-                    continue
-                pending_lots = sized
-                stop_dist = None if stop_mult is None else stop_mult * prior_range[i]
-                pending = "long" if side > 0 else "short"
-            elif risk_fraction is not None:
-                if equity is None:
-                    raise ValueError("Для доли риска нужен текущий счёт")
-                sized = _risk_size(equity, risk_fraction, margin, 0.0 if stop_rub is None else stop_rub)
-                if sized is None:
-                    continue
-                pending_lots, stop_dist = sized
-                if close[i] > prior_high[i] + room:
-                    pending = "long"
-                elif close[i] < prior_low[i] - room:
-                    pending = "short"
-            else:
-                stop_dist = None if stop_mult is None else stop_mult * prior_range[i]
-                if close[i] > prior_high[i] + room:
-                    pending = "long"
-                    pending_lots = entry_lots(size_mode, 1, close[i], prior_high[i], prior_low[i], prior_range[i])
-                elif close[i] < prior_low[i] - room:
-                    pending = "short"
-                    pending_lots = entry_lots(size_mode, -1, close[i], prior_high[i], prior_low[i], prior_range[i])
-    return trades
+        step_minute(
+            book,
+            i,
+            opened=float(opened[i]),
+            high=float(high[i]),
+            low=float(low[i]),
+            close=float(close[i]),
+            volume=float(volume[i]),
+            day=days[i],
+            next_day=None if i + 1 >= len(view) else days[i + 1],
+            last_day=last_day,
+            prior_high=float(prior_high[i]),
+            prior_low=float(prior_low[i]),
+            prior_vol=float(prior_vol[i]),
+            prior_range=float(prior_range[i]),
+            exit_high=float(exit_high[i]),
+            exit_low=float(exit_low[i]),
+            clock_vol=float("nan") if clock_typical is None else float(clock_typical[i]),
+            entry_ready=float(ready[i]),
+            clearance=clearance,
+            cooldown=cooldown,
+            clock_volume=clock_volume,
+            clock_cap=clock_cap,
+            size_mode=size_mode,
+            stop_mult=stop_mult,
+            loss_bars=loss_bars,
+            risk_fraction=risk_fraction,
+            margin=margin,
+            stop_rub=stop_rub,
+            breakout_span=breakout_span,
+            trade_from=trade_from,
+            trail=trail,
+            scale_step=scale_step,
+            scale_floor=scale_floor,
+            scale_back=scale_back,
+        )
+        if marks is not None:
+            marks.append(marked_equity(book, float(close[i])))
+    return book.trades
 
 
 def _risk_size(
@@ -705,12 +814,6 @@ def _risk_size(
     if contracts < 1:
         return None
     return contracts, stop_rub / MULTIPLIER
-
-
-def _apply_cash(equity: float | None, trades: list[dict[str, object]]) -> float | None:
-    if equity is None:
-        return None
-    return equity + float(trades[-1]["pnlcomm"])
 
 
 def breakout_fraction(
@@ -768,31 +871,6 @@ def entry_lots(
     if beyond < 2.0:
         return 2
     return 1
-
-
-def _close_trade(
-    trades: list[dict[str, object]],
-    secid: str,
-    position: int,
-    entry_px: float,
-    exit_px: float,
-    entry_i: int,
-    exit_i: int,
-    reason: str,
-    lots: int = 1,
-) -> None:
-    gross = (exit_px - entry_px) * position * lots * MULTIPLIER
-    trades.append(
-        {
-            "secid": secid,
-            "direction": "long" if position > 0 else "short",
-            "lots": lots,
-            "pnl": gross,
-            "pnlcomm": gross - 2 * COMMISSION * lots,
-            "bars": exit_i - entry_i,
-            "reason": reason,
-        }
-    )
 
 
 def buy_and_hold(frame: pd.DataFrame, channel: int, trade_from: date | None = None) -> float:
@@ -1004,11 +1082,14 @@ def run_contract(
     margin: float = MARGIN,
     stop_rub: float | None = None,
     breakout_span: float | None = None,
+    scale_step: float | None = None,
+    scale_floor: float = LONG_SCALE_FLOOR,
+    scale_back: float | None = None,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
     last_day = pd.Timestamp(view.index[-1]).date().isoformat()
-    cerebro = bt.Cerebro(stdstats=False, cheat_on_open=True)
+    cerebro = bt.Cerebro(stdstats=False)
     cerebro.addstrategy(
         MinuteDonchian,
         secid=secid,
@@ -1023,6 +1104,9 @@ def run_contract(
         margin=margin,
         stop_rub=0.0 if stop_rub is None else stop_rub,
         breakout_span=0.0 if breakout_span is None else breakout_span,
+        scale_step=0.0 if scale_step is None else scale_step,
+        scale_floor=scale_floor,
+        scale_back=0.0 if scale_back is None else scale_back,
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(cash)
@@ -1111,6 +1195,9 @@ def run_account(
             margin=window.margin,
             stop_rub=window.stop_rub,
             breakout_span=window.breakout_span,
+            scale_step=window.scale_step,
+            scale_floor=window.scale_floor,
+            scale_back=window.scale_back,
         )
         equity = float(strategy.broker.getvalue())
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
@@ -1138,6 +1225,9 @@ def run_account(
         "risk_fraction": window.risk_fraction,
         "stop_rub": window.stop_rub,
         "breakout_span": window.breakout_span,
+        "scale_step": window.scale_step,
+        "scale_floor": window.scale_floor,
+        "scale_back": window.scale_back,
         "cash": window.cash,
         "equity": equity,
         "margin": window.margin,
@@ -1281,11 +1371,24 @@ def report(summary: dict[str, object]) -> str:
     lines = [
         f"Минутный канал {channel}, {exit_text}, {stop_text}. {size_text}.",
         volume_text,
-        f"Комиссия {COMMISSION:.0f} руб. за контракт за сторону. В последний день позиция закрывается.",
+        f"Комиссия {COMMISSION:.0f} руб. за контракт за сторону. "
+        f"Позиция меняется по {FILL_PER_MINUTE} контрактов в минуту, по закрытию этой минуты. "
+        "В последний день новая позиция не открывается.",
         "Сделки только в истекающем контракте. Месяц до него прогревает окно и не торгуется.",
     ]
     if loss_bars:
         lines.append(f"Если через {int(loss_bars)} минут сделка всё ещё в минусе, она закрывается.")
+    scale_step = summary.get("scale_step")
+    if scale_step:
+        scaled = sum(bool(trade.get("scaled")) for trade in trades)
+        back = summary.get("scale_back")
+        back_text = f"{float(scale_step) / 2:.0f}" if back is None else f"{float(back):.0f}"
+        lines.append(
+            f"Откат от лучшей цены сделки на {float(scale_step):.0f} медиан минутного диапазона "
+            f"уменьшает позицию до {float(summary.get('scale_floor', LONG_SCALE_FLOOR)):.0%} исходного размера. "
+            f"Когда откат сжимается до {back_text} медиан, размер возвращается. "
+            f"Так сработало в {scaled} сделках."
+        )
     if account and summary.get("equity") is not None:
         lines.append(f"Счёт в конце: {float(summary['equity']):,.0f} руб.")
     lines.extend([
