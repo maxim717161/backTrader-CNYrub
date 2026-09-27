@@ -46,11 +46,13 @@ def test_stop_is_measured_from_the_fill_in_backtrader_and_the_simulator():
     strategy = run_contract("CRZ5", frame, 20)
     assert len(simulated) == 1
     assert len(strategy.trades) == 1
+    entry = float(frame["close"].iloc[21])
+    exit_ = float(frame["close"].iloc[26])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["direction"] == "long"
         assert trade["reason"] == "stop"
-        assert trade["pnl"] == pytest.approx(-250.0)
-        assert trade["pnlcomm"] == pytest.approx(-252.0)
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
 
 
 def test_tighter_stop_without_a_channel_exit_matches_backtrader():
@@ -59,11 +61,13 @@ def test_tighter_stop_without_a_channel_exit_matches_backtrader():
     strategy = run_contract("CRZ5", frame, 20, stop_mult=2.0, exit_channel=0)
     assert len(simulated) == 1
     assert len(strategy.trades) == 1
+    entry = float(frame["close"].iloc[21])
+    exit_ = float(frame["close"].iloc[26])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["direction"] == "long"
         assert trade["reason"] == "stop"
-        assert trade["pnl"] == pytest.approx(-200.0)
-        assert trade["pnlcomm"] == pytest.approx(-202.0)
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
 
 
 def test_without_a_stop_the_position_is_held_until_expiry():
@@ -72,8 +76,8 @@ def test_without_a_stop_the_position_is_held_until_expiry():
     strategy = run_contract("CRZ5", frame, 20, stop_mult=None, exit_channel=0)
     assert len(simulated) == 1
     assert len(strategy.trades) == 1
-    entry = float(frame["open"].iloc[21])
-    exit_ = float(frame["open"].iloc[-1])
+    entry = float(frame["close"].iloc[21])
+    exit_ = float(frame["close"].iloc[-1])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
@@ -83,13 +87,13 @@ def test_without_a_stop_the_position_is_held_until_expiry():
 def test_open_position_is_closed_on_the_last_day_and_not_reopened():
     rows = [_quiet() for _ in range(20)]
     rows.append((10.0, 10.40, 10.20, 10.30, 1000))
-    rows.extend((10.30, 10.50, 10.20, 10.45, 1000) for _ in range(8))
+    rows.extend((10.30, 10.50, 10.30, 10.45, 1000) for _ in range(8))
     frame = _days(rows)
     simulated = simulate("CRH6", frame, 20)
     strategy = run_contract("CRH6", frame, 20)
     assert len(simulated) == len(strategy.trades) == 1
-    entry = float(frame["open"].iloc[21])
-    exit_ = float(frame["open"].iloc[-1])
+    entry = float(frame["close"].iloc[21])
+    exit_ = float(frame["close"].iloc[-1])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == (exit_ - entry) * 1000
@@ -244,10 +248,11 @@ def test_trade_starts_follow_the_expiring_contract_not_the_warmup_month():
     assert starts["CRZ6"] == date(2026, 9, 18)
 
 
-def test_a_fixed_ruble_stop_stays_inside_ten_percent_of_the_account():
+def test_a_fixed_ruble_stop_sizes_the_position_and_exits_at_the_minute_close():
     rows = [_quiet() for _ in range(5)]
     rows.append((10.0, 10.40, 10.20, 10.30, 1000))
-    rows.append((10.30, 10.35, 9.80, 9.90, 1000))
+    rows.append((10.30, 10.35, 10.20, 10.32, 1000))
+    rows.append((10.32, 10.34, 9.80, 9.90, 1000))
     rows.append(_quiet(9.90))
     frame = _days(rows)
     cash = 10_000.0
@@ -260,12 +265,15 @@ def test_a_fixed_ruble_stop_stays_inside_ten_percent_of_the_account():
         risk_fraction=0.10, margin=1_000.0, stop_rub=285.0, cash=cash,
     )
     assert len(simulated) == len(strategy.trades) == 1
+    entry = float(frame["close"].iloc[6])
+    exit_ = float(frame["close"].iloc[7])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["lots"] == 3
         assert trade["reason"] == "stop"
-        assert trade["pnl"] == pytest.approx(-285.0 * 3)
-        assert trade["pnlcomm"] == pytest.approx(-285.0 * 3 - 6)
-        assert trade["pnlcomm"] >= -0.10 * cash
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 3 * 1000)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6)
+        assert 3 * 285 + 6 <= 0.10 * cash
+    assert strategy.broker.getvalue() == pytest.approx(cash + simulated[0]["pnlcomm"])
 
 
 def test_a_trade_still_negative_after_the_time_limit_is_closed():
@@ -279,8 +287,8 @@ def test_a_trade_still_negative_after_the_time_limit_is_closed():
     simulated = simulate("CRZ5", frame, 5, stop_mult=None, exit_channel=0, loss_bars=1)
     strategy = run_contract("CRZ5", frame, 5, stop_mult=None, exit_channel=0, loss_bars=1)
     assert len(simulated) == len(strategy.trades) == 1
-    entry = float(frame["open"].iloc[6])
-    exit_ = float(frame["open"].iloc[8])
+    entry = float(frame["close"].iloc[6])
+    exit_ = float(frame["close"].iloc[8])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["reason"] == "time"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
@@ -297,9 +305,11 @@ def test_the_time_limit_wins_when_the_channel_breaks_on_the_same_bar():
     simulated = simulate("CRZ5", frame, 5, stop_mult=None, exit_channel=5, loss_bars=1)
     strategy = run_contract("CRZ5", frame, 5, stop_mult=None, exit_channel=5, loss_bars=1)
     assert len(simulated) == len(strategy.trades) == 1
+    entry = float(frame["close"].iloc[6])
+    exit_ = float(frame["close"].iloc[8])
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["reason"] == "time"
-        assert trade["pnl"] == pytest.approx(-800.0)
+        assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
 
 
 def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
@@ -330,6 +340,57 @@ def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
     far[5] = (10.0, 22.5, 10.0, 22.5, 1000.0)
     assert simulate("CRZ5", _days(far), 5, **kwargs) == []
     assert run_contract("CRZ5", _days(far), 5, **kwargs).trades == []
+
+
+def test_a_position_above_ten_contracts_is_built_and_closed_one_minute_at_a_time():
+    start = datetime(2024, 1, 2, 10, 0)
+    rows = [_quiet() for _ in range(3)]
+    rows.append((10.0, 10.50, 10.00, 10.40, 1000))
+    rows.extend(
+        (
+            (10.00, 10.20, 9.95, 10.00, 1000),
+            (10.10, 10.30, 9.95, 10.10, 1000),
+            (10.20, 10.40, 9.95, 10.20, 1000),
+            (10.30, 10.50, 9.95, 10.30, 1000),
+        )
+    )
+    rows.append((10.20, 10.30, 9.50, 9.70, 1000))
+    rows.extend(
+        (
+            (9.70, 9.80, 9.40, 9.60, 1000),
+            (9.60, 9.70, 9.30, 9.50, 1000),
+            (9.50, 9.60, 9.20, 9.40, 1000),
+        )
+    )
+    stamps = [start + timedelta(minutes=i) for i in range(len(rows))]
+    stamps.append(start + timedelta(days=1))
+    rows.append(_quiet(9.40))
+    frame = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=pd.to_datetime(stamps))
+    frame.index.name = "datetime"
+    cash = 100_000.0
+    kwargs = dict(
+        stop_mult=None,
+        exit_channel=0,
+        risk_fraction=0.10,
+        margin=1_000.0,
+        stop_rub=285.0,
+        cash=cash,
+    )
+    simulated = simulate("CRZ5", frame, 3, **kwargs)
+    strategy = run_contract("CRZ5", frame, 3, **kwargs)
+    assert len(simulated) == len(strategy.trades) == 1
+    bought = (10.00, 10.10, 10.20, 10.30)
+    sold = (9.70, 9.60, 9.50, 9.40)
+    sizes = (10, 10, 10, 4)
+    average = sum(price * size for price, size in zip(bought, sizes)) / 34
+    gross = sum((price - average) * size * 1000 for price, size in zip(sold, sizes))
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["lots"] == 34
+        assert trade["reason"] == "stop"
+        assert trade["bars"] == 7
+        assert trade["pnl"] == pytest.approx(gross)
+        assert trade["pnlcomm"] == pytest.approx(gross - 68)
+    assert strategy.broker.getvalue() == pytest.approx(cash + simulated[0]["pnlcomm"])
 
 
 def test_entry_lots_step_down_as_the_breakout_grows():
