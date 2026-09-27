@@ -23,7 +23,10 @@
 Длинное окно 12 420 минут не выходит по каналу и держит стоп в 22 медианы
 минутного диапазона. Ноль медиан пробоя — это 100% контрактов, которые
 пускает залог, от одной до двух медиан — 50%, двенадцать медиан — 0%. Счёт 100 000 руб.,
-залог 1 000 руб.
+залог 1 000 руб. Пока сделка открыта, запоминается лучшая цена закрытия.
+Откат на 100 медиан минутного диапазона уменьшает позицию до половины
+исходного размера. Когда откат сжимается до 50 медиан, размер возвращается.
+Обычный день — это около 50 таких медиан. Куски те же: 10 контрактов в минуту.
 """
 
 from __future__ import annotations
@@ -56,6 +59,13 @@ LONG_MARGIN = 1_000.0
 LONG_BREAKOUT_SPAN = 12.0
 LONG_BREAKOUT_LOW = 1.0
 LONG_BREAKOUT_HIGH = 2.0
+# Откат от лучшей цены сделки, в медианах минутного диапазона на входе.
+# 100 медиан — около двух обычных дней: позиция уменьшается до половины.
+# 50 медиан — около одного дня: размер возвращается. До нуля не режем,
+# чтобы ту же сделку можно было набрать обратно.
+LONG_SCALE_STEP = 100.0
+LONG_SCALE_BACK = 50.0
+LONG_SCALE_FLOOR = 0.5
 SHORT_CLOCK_CAP = 5.0
 LONG_CANDIDATES = (12_480, 12_960)
 
@@ -84,6 +94,9 @@ class Window(NamedTuple):
     margin: float = 20_000.0
     stop_rub: float | None = None
     breakout_span: float | None = None
+    scale_step: float | None = None
+    scale_back: float | None = None
+    scale_floor: float = LONG_SCALE_FLOOR
 
 
 WINDOWS = (
@@ -111,6 +124,9 @@ WINDOWS = (
         LONG_MARGIN,
         None,
         LONG_BREAKOUT_SPAN,
+        LONG_SCALE_STEP,
+        LONG_SCALE_BACK,
+        LONG_SCALE_FLOOR,
     ),
 )
 CHANNEL = SHORT_WINDOW
@@ -182,6 +198,12 @@ class _FillBook:
         self.cooldown_until = 0
         self.last_signed = 0
         self.trades: list[dict[str, object]] = []
+        self.base = 0
+        self.best: float | None = None
+        self.unit = 0.0
+        self.scale_level = 0
+        self.scaled = False
+        self.peak = 0
 
     def stop_hit(self, opened: float, high: float, low: float) -> bool:
         if self.held == 0 or self.stop_px is None:
@@ -225,9 +247,11 @@ class _FillBook:
             self.held = step
             self.entry_i = index
             self.opened = abs(step)
+            self.peak = abs(step)
             self.gross = 0.0
             self.commission = COMMISSION * abs(step)
             self.reason = ""
+            self.best = price
             self._sync_stop()
             return
         if step * self.held > 0:
@@ -235,6 +259,7 @@ class _FillBook:
             self.avg = (self.avg * abs(self.held) + price * abs(step)) / total
             self.held += step
             self.opened += abs(step)
+            self.peak = max(self.peak, abs(self.held))
             self.commission += COMMISSION * abs(step)
             self._sync_stop()
             return
@@ -250,11 +275,12 @@ class _FillBook:
             {
                 "secid": self.secid,
                 "direction": "long" if sign > 0 else "short",
-                "lots": self.opened,
+                "lots": self.peak or self.opened,
                 "pnl": self.gross,
                 "pnlcomm": pnlcomm,
                 "bars": index - int(self.entry_i),
                 "reason": self.reason,
+                "scaled": self.scaled,
             }
         )
         if self.equity is not None:
@@ -267,6 +293,58 @@ class _FillBook:
         self.opened = 0
         self.gross = 0.0
         self.commission = 0.0
+        self.base = 0
+        self.best = None
+        self.unit = 0.0
+        self.scale_level = 0
+        self.scaled = False
+        self.peak = 0
+
+
+def marked_equity(book: _FillBook, close: float) -> float:
+    """Счёт с открытой позицией по этой цене: уже закрытый результат плюс текущий."""
+    settled = 0.0 if book.equity is None else book.equity
+    return settled + book.gross - book.commission + (close - book.avg) * book.held * MULTIPLIER
+
+
+def _resize_for_pullback(
+    book: _FillBook,
+    close: float,
+    step: float,
+    floor: float,
+    restore: float,
+) -> None:
+    """Уменьшить цель, когда цена ушла против лучшей цены сделки, и вернуть, когда она вернулась.
+
+    step и restore — медианы минутного диапазона, зафиксированные на входе.
+    На step и дальше цель равна доле floor от исходного размера. На restore
+    и ближе к лучшей цене цель снова полная. Между ними цель не меняется,
+    чтобы откат туда-сюда не крутил позицию. До нуля цель не падает.
+    """
+    if book.held == 0 or book.base == 0 or not book.unit > 0 or not step > 0:
+        return
+    if restore >= step:
+        restore = step / 2
+    if book.best is None:
+        book.best = close
+    if book.held > 0:
+        book.best = max(book.best, close)
+        pullback = book.best - close
+    else:
+        book.best = min(book.best, close)
+        pullback = close - book.best
+    ranges = pullback / book.unit if pullback > 0 else 0.0
+    if ranges >= step:
+        book.scale_level = 1
+    elif ranges <= restore:
+        book.scale_level = 0
+    if book.scale_level:
+        book.scaled = True
+    fraction = floor if book.scale_level else 1.0
+    desired = int(abs(book.base) * fraction)
+    if desired < 1:
+        desired = 1
+    book.target = (1 if book.base > 0 else -1) * desired
 
 
 def step_minute(
@@ -302,6 +380,9 @@ def step_minute(
     breakout_span: float | None,
     trade_from: date | None,
     trail: bool,
+    scale_step: float | None = None,
+    scale_floor: float = LONG_SCALE_FLOOR,
+    scale_back: float | None = None,
 ) -> None:
     """Одна минута: сначала кусок по её закрытию, потом решение на следующие."""
     if day == last_day and (book.held != 0 or book.target != 0):
@@ -342,6 +423,9 @@ def step_minute(
             book.target = 0
             book.reason = "channel"
             return
+        if scale_step:
+            restore = scale_step / 2 if scale_back is None else scale_back
+            _resize_for_pullback(book, close, scale_step, scale_floor, restore)
         return
     if book.held != 0 or book.target != 0 or next_day == last_day or index < book.cooldown_until:
         return
@@ -394,6 +478,11 @@ def step_minute(
         book.stop_dist = None if stop_mult is None else stop_mult * prior_range
         lots = entry_lots(size_mode, side, close, prior_high, prior_low, prior_range)
     book.reason = ""
+    book.base = side * lots
+    book.unit = float(prior_range) if prior_range == prior_range and prior_range > 0 else 0.0
+    book.best = None
+    book.scale_level = 0
+    book.scaled = False
     book.target = side * lots
 
 
@@ -411,6 +500,9 @@ class MinuteDonchian(bt.Strategy):
         margin=MARGIN,
         stop_rub=0.0,
         breakout_span=0.0,
+        scale_step=0.0,
+        scale_floor=LONG_SCALE_FLOOR,
+        scale_back=0.0,
     )
 
     def __init__(self) -> None:
@@ -456,6 +548,9 @@ class MinuteDonchian(bt.Strategy):
             breakout_span=float(self.p.breakout_span) or None,
             trade_from=self._front_day(),
             trail=False,
+            scale_step=float(self.p.scale_step) or None,
+            scale_floor=float(self.p.scale_floor),
+            scale_back=float(self.p.scale_back) or None,
         )
         if book.last_signed:
             self._fill_broker(book.last_signed, close)
@@ -600,6 +695,10 @@ def simulate(
     cash: float | None = None,
     view: pd.DataFrame | None = None,
     breakout_span: float | None = None,
+    scale_step: float | None = None,
+    scale_floor: float = LONG_SCALE_FLOOR,
+    scale_back: float | None = None,
+    marks: list[float] | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
 
@@ -622,6 +721,10 @@ def simulate(
     только собирают окно: сделка открывается не раньше открытия этого дня.
     loss_bars закрывает сделку, которая столько минут всё ещё в минусе.
     Исполнение — не больше FILL_PER_MINUTE контрактов за минуту по её закрытию.
+    scale_step уменьшает позицию до доли scale_floor, когда закрытие отходит
+    от лучшей цены сделки на столько медиан минутного диапазона. scale_back
+    возвращает полный размер, когда откат сжимается до стольких медиан.
+    marks, если передан, получает счёт после каждой минуты, с открытой позицией.
     risk_fraction — доля счёта, которую может забрать стоп stop_rub на всех контрактах.
     cash — счёт на входе,
     он растёт и уменьшается от сделки к сделке. margin — залог на контракт.
@@ -686,7 +789,12 @@ def simulate(
             breakout_span=breakout_span,
             trade_from=trade_from,
             trail=trail,
+            scale_step=scale_step,
+            scale_floor=scale_floor,
+            scale_back=scale_back,
         )
+        if marks is not None:
+            marks.append(marked_equity(book, float(close[i])))
     return book.trades
 
 
@@ -974,6 +1082,9 @@ def run_contract(
     margin: float = MARGIN,
     stop_rub: float | None = None,
     breakout_span: float | None = None,
+    scale_step: float | None = None,
+    scale_floor: float = LONG_SCALE_FLOOR,
+    scale_back: float | None = None,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
@@ -993,6 +1104,9 @@ def run_contract(
         margin=margin,
         stop_rub=0.0 if stop_rub is None else stop_rub,
         breakout_span=0.0 if breakout_span is None else breakout_span,
+        scale_step=0.0 if scale_step is None else scale_step,
+        scale_floor=scale_floor,
+        scale_back=0.0 if scale_back is None else scale_back,
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(cash)
@@ -1081,6 +1195,9 @@ def run_account(
             margin=window.margin,
             stop_rub=window.stop_rub,
             breakout_span=window.breakout_span,
+            scale_step=window.scale_step,
+            scale_floor=window.scale_floor,
+            scale_back=window.scale_back,
         )
         equity = float(strategy.broker.getvalue())
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
@@ -1108,6 +1225,9 @@ def run_account(
         "risk_fraction": window.risk_fraction,
         "stop_rub": window.stop_rub,
         "breakout_span": window.breakout_span,
+        "scale_step": window.scale_step,
+        "scale_floor": window.scale_floor,
+        "scale_back": window.scale_back,
         "cash": window.cash,
         "equity": equity,
         "margin": window.margin,
@@ -1258,6 +1378,17 @@ def report(summary: dict[str, object]) -> str:
     ]
     if loss_bars:
         lines.append(f"Если через {int(loss_bars)} минут сделка всё ещё в минусе, она закрывается.")
+    scale_step = summary.get("scale_step")
+    if scale_step:
+        scaled = sum(bool(trade.get("scaled")) for trade in trades)
+        back = summary.get("scale_back")
+        back_text = f"{float(scale_step) / 2:.0f}" if back is None else f"{float(back):.0f}"
+        lines.append(
+            f"Откат от лучшей цены сделки на {float(scale_step):.0f} медиан минутного диапазона "
+            f"уменьшает позицию до {float(summary.get('scale_floor', LONG_SCALE_FLOOR)):.0%} исходного размера. "
+            f"Когда откат сжимается до {back_text} медиан, размер возвращается. "
+            f"Так сработало в {scaled} сделках."
+        )
     if account and summary.get("equity") is not None:
         lines.append(f"Счёт в конце: {float(summary['equity']):,.0f} руб.")
     lines.extend([

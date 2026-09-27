@@ -393,6 +393,63 @@ def test_a_position_above_ten_contracts_is_built_and_closed_one_minute_at_a_time
     assert strategy.broker.getvalue() == pytest.approx(cash + simulated[0]["pnlcomm"])
 
 
+def _minute_frame(closes: list[float], last_on_next_day: bool = True) -> pd.DataFrame:
+    start = datetime(2024, 1, 2, 10, 0)
+    rows = [(close, close + 0.05, close - 0.05, close, 1000.0) for close in closes]
+    stamps = [start + timedelta(minutes=i) for i in range(len(rows))]
+    if last_on_next_day:
+        stamps[-1] = start + timedelta(days=1)
+    frame = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=pd.to_datetime(stamps))
+    frame.index.name = "datetime"
+    return frame
+
+
+def test_a_pullback_cuts_the_position_and_a_return_builds_it_back():
+    # Диапазон каждой минуты 0.10. Откат на 0.10 уменьшает 40 контрактов до 75%,
+    # откат до 0.05 и меньше возвращает полный размер.
+    closes = [10.0, 10.0, 10.0, 10.40, 10.00, 10.10, 10.20, 10.30, 10.20, 10.15, 10.26, 10.28, 10.28]
+    frame = _minute_frame(closes)
+    cash = 114_800.0
+    kwargs = dict(
+        stop_mult=None,
+        exit_channel=0,
+        risk_fraction=0.10,
+        margin=1_000.0,
+        stop_rub=285.0,
+        cash=cash,
+        scale_step=1.0,
+        scale_floor=0.75,
+        scale_back=0.5,
+    )
+    marks: list[float] = []
+    simulated = simulate("CRZ5", frame, 3, marks=marks, **kwargs)
+    strategy = run_contract("CRZ5", frame, 3, **kwargs)
+    assert len(simulated) == len(strategy.trades) == 1
+    bought = (10.00, 10.10, 10.20, 10.30)
+    average = sum(bought) / 4
+    held_after_sale = 30
+    restored = (average * held_after_sale + 10.28 * 10) / 40
+    gross = (10.15 - average) * 10 * 1000 + (10.28 - restored) * 40 * 1000
+    for trade in (simulated[0], strategy.trades[0]):
+        assert trade["direction"] == "long"
+        assert trade["lots"] == 40
+        assert trade["reason"] == "expiry"
+        assert trade["scaled"] is True
+        assert trade["pnl"] == pytest.approx(gross)
+        assert trade["pnlcomm"] == pytest.approx(gross - 100)
+    assert len(strategy.values) == len(marks)
+    for (_, broker_value), marked in zip(strategy.values, marks, strict=True):
+        assert broker_value == pytest.approx(marked, abs=0.02)
+    assert strategy.broker.getvalue() == pytest.approx(cash + simulated[0]["pnlcomm"])
+
+    quiet = _minute_frame([10.0, 10.0, 10.0, 10.40, 10.00, 10.10, 10.20, 10.30, 10.26, 10.26])
+    held = simulate("CRZ5", quiet, 3, **kwargs)
+    assert len(held) == 1
+    assert held[0]["scaled"] is False
+    plain = (10.26 - average) * 40 * 1000
+    assert held[0]["pnlcomm"] == pytest.approx(plain - 80)
+
+
 def test_entry_lots_step_down_as_the_breakout_grows():
     assert entry_lots("inverse", 1, 10.5, 10.0, 9.0, 1.0) == 3
     assert entry_lots("inverse", 1, 11.0, 10.0, 9.0, 1.0) == 2
@@ -405,6 +462,9 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert WINDOWS[1].size_mode == "span" and WINDOWS[1].clock_cap is None
     assert WINDOWS[1].breakout_span == 12 and WINDOWS[1].cash == 100_000
     assert WINDOWS[1].margin == 1_000
+    assert WINDOWS[1].scale_step == 100 and WINDOWS[1].scale_back == 50
+    assert WINDOWS[1].scale_floor == 0.5
+    assert WINDOWS[0].scale_step is None
 
 
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():
