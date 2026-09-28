@@ -1,0 +1,77 @@
+"""Обработчик Cloud Functions.
+
+Каждый запуск, и таймер и тестовый вызов, ставит заявки на реальный счёт
+Т-Инвестиций. Токен передаётся полем token в тестовом JSON либо полем
+secret_id: тогда он читается из Lockbox, ключ записи token или TOKEN.
+В лог и в ответ функции токен не попадает.
+
+Окружение функции:
+  STATE_BUCKET — бакет Object Storage, один JSON на стратегию и счёт
+  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — статический ключ бакета
+
+Сервисный аккаунт функции должен читать Lockbox. Повторы таймера лучше
+выключить: следующая минута подхватит пропуск сама.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from datetime import datetime
+from urllib.request import Request, urlopen
+
+from cnyrub.live.broker import TinkoffClient
+from cnyrub.live.config import parse_event
+from cnyrub.live.service import run_minute
+from cnyrub.live.state import StateStore, object_store_from_env
+
+_METADATA = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
+_LOCKBOX = "https://payload.lockbox.api.cloud.yandex.net/lockbox/v1/secrets/{secret_id}/payload"
+
+
+def handle(
+    event: object,
+    context: object = None,
+    *,
+    broker_factory: Callable[[str], object] | None = None,
+    store: StateStore | None = None,
+    now: datetime | None = None,
+    secret_reader: Callable[[str], str] | None = None,
+) -> dict[str, object]:
+    """Разобрать событие, достать токен и прогнать одну минуту."""
+    request = parse_event(event)
+    token = request.token
+    if token is None:
+        reader = secret_reader or read_lockbox_token
+        secret_id = request.secret_id or ""
+        token = reader(secret_id)
+    if broker_factory is None:
+        broker = TinkoffClient(token)
+    else:
+        broker = broker_factory(token)
+    if store is None:
+        store = object_store_from_env()
+    return run_minute(request, broker, store, now=now)
+
+
+def read_lockbox_token(secret_id: str, get: Callable[[str, dict[str, str]], dict] | None = None) -> str:
+    """IAM из метаданных виртуалки, затем поле token секрета Lockbox."""
+    fetch = get or _urllib_get
+    issued = fetch(_METADATA, {"Metadata-Flavor": "Google"})
+    access = issued.get("access_token")
+    if not access:
+        raise RuntimeError("метаданные не выдали IAM-токен")
+    payload = fetch(_LOCKBOX.format(secret_id=secret_id), {"Authorization": f"Bearer {access}"})
+    for entry in payload.get("entries") or []:
+        if entry.get("key") in {"token", "TOKEN"} and entry.get("textValue"):
+            return str(entry["textValue"])
+    raise RuntimeError("в секрете Lockbox нет ключа token")
+
+
+def _urllib_get(url: str, headers: dict[str, str]) -> dict:
+    request = Request(url, headers=headers, method="GET")
+    with urlopen(request, timeout=10) as response:
+        document = json.loads(response.read().decode("utf-8"))
+    if not isinstance(document, dict):
+        raise RuntimeError("пустой ответ Lockbox")
+    return document

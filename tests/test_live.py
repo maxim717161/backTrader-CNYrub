@@ -1,0 +1,632 @@
+"""Живой контур без сети: разбор событий, история, заявка, стоп и сверка."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import pytest
+
+from backtest import WINDOWS, channel_view
+from cnyrub.engine import _FillBook, export_book, reprice_fill, step_minute
+from cnyrub.live.broker import (
+    FillReport,
+    Instrument,
+    choose_front,
+    margin_rub,
+    parse_candle,
+    parse_fill,
+    parse_instrument,
+    quotation,
+)
+from cnyrub.live.config import PRESETS, parse_event
+from cnyrub.live.handler import handle, read_lockbox_token
+from cnyrub.live.indicators import bar_levels
+from cnyrub.live.service import following_day, make_order_id, run_minute
+from cnyrub.live.state import MemoryStore, state_key
+
+MSK = ZoneInfo("Europe/Moscow")
+ACCOUNT = "acc-short"
+
+
+def test_presets_match_the_researched_windows():
+    short, long = WINDOWS
+    assert PRESETS["short"].channel == short.channel == 525
+    assert PRESETS["short"].exit_channel == short.exit_channel
+    assert PRESETS["short"].stop_mult is None and short.stop_mult is None
+    assert PRESETS["short"].clock_cap == short.clock_cap == 5
+    assert PRESETS["short"].loss_bars == short.loss_bars == 1450
+    assert PRESETS["short"].risk_fraction == short.risk_fraction == 0.10
+    assert PRESETS["short"].stop_rub == short.stop_rub == 285
+    assert PRESETS["short"].scale_step is None and short.scale_step is None
+    assert PRESETS["short"].breakout_span is None
+    assert PRESETS["long"].channel == long.channel == 12420
+    assert PRESETS["long"].exit_channel == 0
+    assert PRESETS["long"].stop_mult == long.stop_mult == 22
+    assert PRESETS["long"].breakout_span == long.breakout_span == 12
+    assert PRESETS["long"].scale_step == long.scale_step == 100
+    assert PRESETS["long"].scale_back == long.scale_back == 50
+    assert PRESETS["long"].scale_floor == long.scale_floor == 0.5
+    assert PRESETS["long"].clock_cap is None
+    assert not hasattr(PRESETS["short"], "margin")
+
+
+def test_levels_match_channel_view():
+    index = pd.date_range("2026-09-01 10:00", periods=48, freq="min", tz="Europe/Moscow")
+    frame = pd.DataFrame(
+        {
+            "open": [10 + i * 0.01 for i in range(len(index))],
+            "high": [10.2 + (i % 5) * 0.01 for i in range(len(index))],
+            "low": [9.8 + (i % 4) * 0.02 for i in range(len(index))],
+            "close": [10.05 + i * 0.01 for i in range(len(index))],
+            "volume": [100 + (i % 7) * 3 for i in range(len(index))],
+        },
+        index=index,
+    )
+    # Пять предыдущих дней той же минуты: часы 10:00 повторяются отдельно.
+    clock = pd.date_range("2026-09-01 10:00", periods=8, freq="D", tz="Europe/Moscow")
+    extra = pd.DataFrame(
+        {
+            "open": [11] * len(clock),
+            "high": [11.4] * len(clock),
+            "low": [10.6] * len(clock),
+            "close": [11.1] * len(clock),
+            "volume": [50 + day * 10 for day in range(len(clock))],
+        },
+        index=clock,
+    )
+    frame = pd.concat([frame, extra]).sort_index()
+    view = channel_view(frame, 5, 3)
+    bars = [
+        {
+            "t": moment.isoformat(),
+            "o": float(row.open),
+            "h": float(row.high),
+            "l": float(row.low),
+            "c": float(row.close),
+            "v": float(row.volume),
+        }
+        for moment, row in frame.iterrows()
+    ]
+    params = PRESETS["short"]
+    params = type(params)(
+        channel=5,
+        exit_channel=3,
+        stop_mult=params.stop_mult,
+        clock_cap=params.clock_cap,
+        size_mode=params.size_mode,
+        loss_bars=params.loss_bars,
+        risk_fraction=params.risk_fraction,
+        stop_rub=params.stop_rub,
+        breakout_span=params.breakout_span,
+        scale_step=params.scale_step,
+        scale_back=params.scale_back,
+        scale_floor=params.scale_floor,
+    )
+    for end in (6, 12, 20, len(bars)):
+        levels = bar_levels(bars[:end], params, clock_days=5)
+        row = view.iloc[end - 1]
+        for name in ("prior_high", "prior_low", "prior_vol", "prior_range", "exit_high", "exit_low", "clock_vol"):
+            got = levels[name]
+            expected = float(row[name])
+            if pd.isna(expected):
+                assert pd.isna(got)
+            else:
+                assert got == pytest.approx(expected)
+        assert levels["entry_ready"] == float(row["entry_ready"])
+
+
+def test_parse_timer_envelope_and_direct_json():
+    direct = parse_event(
+        {"strategy": "long", "account_id": "42", "token": "secret-token", "reconcile": "false"}
+    )
+    assert direct.strategy == "long"
+    assert direct.account_id == "42"
+    assert direct.token == "secret-token"
+    assert direct.reconcile is False
+    assert direct.params.channel == 12420
+    assert direct.fill_per_minute == 10
+
+    timer = parse_event(
+        {
+            "messages": [
+                {
+                    "details": {
+                        "payload": '{"strategy":"short","account_id":"7","secret_id":"lockbox","fill_per_minute":2}'
+                    }
+                }
+            ]
+        }
+    )
+    assert timer.strategy == "short"
+    assert timer.secret_id == "lockbox"
+    assert timer.token is None
+    assert timer.fill_per_minute == 2
+    assert timer.params.channel == 525
+
+
+def test_parse_requires_account_and_a_secret():
+    with pytest.raises(ValueError):
+        parse_event({"strategy": "short", "token": "t"})
+    with pytest.raises(ValueError):
+        parse_event({"strategy": "short", "account_id": "1"})
+    with pytest.raises(ValueError):
+        parse_event({"strategy": "short", "account_id": "1", "token": "t", "fill_per_minute": 11})
+
+
+def test_lockbox_reads_token_entry_without_returning_it_in_the_url():
+    seen: list[str] = []
+
+    def get(url: str, headers: dict[str, str]) -> dict:
+        seen.append(url)
+        if "computeMetadata" in url:
+            assert headers["Metadata-Flavor"] == "Google"
+            return {"access_token": "iam"}
+        assert headers["Authorization"] == "Bearer iam"
+        return {"entries": [{"key": "token", "textValue": "real-token"}]}
+
+    assert read_lockbox_token("secret-1", get) == "real-token"
+    assert seen[1].endswith("/secrets/secret-1/payload")
+
+
+def test_quotation_margin_candle_and_front_contract():
+    assert quotation({"units": "11", "nano": 250000000}) == pytest.approx(11.25)
+    assert margin_rub(
+        {"initialMarginOnBuy": {"units": "1400", "nano": 0}, "initialMarginOnSell": {"units": "1500", "nano": 0}}
+    ) == 1500
+    candle = parse_candle(
+        {
+            "time": "2026-09-28T07:00:00Z",
+            "open": {"units": "11", "nano": 0},
+            "high": {"units": "12", "nano": 0},
+            "low": {"units": "10", "nano": 0},
+            "close": {"units": "11", "nano": 500000000},
+            "volume": "40",
+            "isComplete": True,
+        }
+    )
+    assert candle is not None
+    assert candle.close == pytest.approx(11.5)
+    assert candle.time.astimezone(MSK).hour == 10
+    assert parse_candle({"time": "2026-09-28T07:01:00Z", "isComplete": False, "open": {}, "high": {}, "low": {}, "close": {}}) is None
+    assert parse_fill(
+        {"orderId": "abc", "lotsRequested": "10", "lotsExecuted": "10", "executedOrderPrice": {"units": "11", "nano": 0}},
+        "fallback",
+    ) == FillReport("abc", 10, 10, 11.0)
+    instrument = parse_instrument(
+        {
+            "ticker": "CRZ6",
+            "uid": "uid-1",
+            "figi": "FUT",
+            "classCode": "SPBFUT",
+            "lot": 1000,
+            "basicAsset": "CNYRUB",
+            "firstTradeDate": "2026-06-16T00:00:00Z",
+            "lastTradeDate": "2026-12-15T00:00:00Z",
+        }
+    )
+    assert instrument is not None
+    assert instrument.lsttrade == date(2026, 12, 15)
+    assert parse_instrument({**_row(), "ticker": "CNYRUBF"}) is None
+    previous = Instrument("CRU6", "uid-0", "", date(2026, 3, 17), date(2026, 6, 15), 1000)
+    front, trade_from = choose_front([previous, instrument], date(2026, 9, 28))
+    assert front.secid == "CRZ6"
+    assert trade_from == date(2026, 6, 16)
+
+
+def _row() -> dict:
+    return {
+        "ticker": "CRZ6",
+        "uid": "uid-1",
+        "figi": "FUT",
+        "classCode": "SPBFUT",
+        "lot": 1000,
+        "basicAsset": "CNYRUB",
+        "firstTradeDate": "2026-06-16T00:00:00Z",
+        "lastTradeDate": "2026-12-15T00:00:00Z",
+    }
+
+
+class FakeBroker:
+    def __init__(self) -> None:
+        self.instrument = Instrument("CRZ6", "uid-1", "FUT", date(2026, 6, 16), date(2026, 12, 15), 1000)
+        self._candles: list = []
+        self.margin_value = 5_000.0
+        self.lots = 0
+        self.avg_price: float | None = None
+        self.equity_value = 100_000.0
+        self.orders: list[dict] = []
+        self.fill_price: float | None = None
+        self.executed: int | None = None
+        self.fail = False
+
+    def cny_futures(self):
+        return [self.instrument]
+
+    def candles(self, uid, start, end):
+        assert uid == self.instrument.uid
+        start_m = start.astimezone(MSK)
+        end_m = end.astimezone(MSK)
+        return [candle for candle in self._candles if start_m <= candle.time.astimezone(MSK) < end_m]
+
+    def margin(self, uid):
+        return self.margin_value
+
+    def futures_position(self, account_id, uid):
+        return self.lots
+
+    def position_price(self, account_id, uid):
+        return self.avg_price
+
+    def equity(self, account_id):
+        return self.equity_value
+
+    def market_order(self, account_id, uid, signed, order_id):
+        self.orders.append({"signed": signed, "order_id": order_id, "account": account_id})
+        if self.fail:
+            raise RuntimeError("timeout")
+        executed = abs(signed) if self.executed is None else self.executed
+        if executed == abs(signed):
+            self.lots += signed
+        elif executed:
+            self.lots += int(signed / abs(signed) * executed)
+        return FillReport(order_id, abs(signed), executed, self.fill_price)
+
+
+def _candle(moment: datetime, close: float, *, high: float | None = None, low: float | None = None, volume: float = 100):
+    from cnyrub.live.broker import Candle
+
+    high = close if high is None else high
+    low = close if low is None else low
+    return Candle(moment, close, high, low, close, volume)
+
+
+def _request(**overrides):
+    payload = {"strategy": "short", "account_id": ACCOUNT, "token": "t", "channel": 5, "exit_channel": 5, "clock_cap": None}
+    payload.update(overrides)
+    return parse_event(payload)
+
+
+def _quiet_bars(start: datetime, count: int, price: float = 10.0) -> list[dict]:
+    bars = []
+    for i in range(count):
+        moment = start + timedelta(minutes=i)
+        bars.append({"t": moment.isoformat(), "o": price, "h": price + 0.05, "l": price - 0.05, "c": price, "v": 100})
+    return bars
+
+
+def _ready(store: MemoryStore, bars: list[dict], book: dict | None = None, strategy: str = "short") -> None:
+    store.save(
+        state_key(strategy, ACCOUNT),
+        {
+            "version": 1,
+            "strategy": strategy,
+            "account_id": ACCOUNT,
+            "instrument": {
+                "secid": "CRZ6",
+                "uid": "uid-1",
+                "figi": "FUT",
+                "frsttrade": "2026-06-16",
+                "lsttrade": "2026-12-15",
+                "trade_from": "2026-06-16",
+            },
+            "bars": bars,
+            "ready": True,
+            "last_bar": bars[-1]["t"],
+            "history_before": "2026-09-01",
+            "history_walked": 1,
+            "halted": None,
+            "book": book,
+        },
+    )
+
+
+def test_history_loads_one_day_and_does_not_order_until_the_next_call():
+    broker = FakeBroker()
+    store = MemoryStore()
+    day = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    previous = datetime(2026, 9, 27, 10, 0, tzinfo=MSK)
+    broker._candles = [_candle(previous + timedelta(minutes=i), 10.0) for i in range(2)]
+    broker._candles += [_candle(day + timedelta(minutes=i), 10.0) for i in range(2)]
+    request = _request(channel=4, exit_channel=4)
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=MSK)
+    first = run_minute(request, broker, store, now=now)
+    assert first["phase"] == "history"
+    assert first["ready"] is False
+    assert first["order"] is None
+    assert broker.orders == []
+    second = run_minute(request, broker, store, now=now)
+    assert second["phase"] == "history"
+    assert second["ready"] is True
+    assert second["bars"] == 4
+    assert broker.orders == []
+    broker._candles.append(_candle(datetime(2026, 9, 28, 10, 2, tzinfo=MSK), 10.4, high=10.4, low=10.3))
+    third = run_minute(request, broker, store, now=datetime(2026, 9, 28, 12, 5, tzinfo=MSK))
+    assert third["order"] is None
+    assert third["phase"] == "signal"
+    assert third["target"] != 0
+    assert broker.orders == []
+
+
+def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():
+    broker = FakeBroker()
+    store = MemoryStore()
+    monday = datetime(2026, 9, 21, 18, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(monday - timedelta(minutes=4), 5))
+    friday = datetime(2026, 9, 25, 12, 0, tzinfo=MSK)
+    broker._candles.append(_candle(friday, 10.0))
+    now = datetime(2026, 9, 25, 12, 5, tzinfo=MSK)
+    request = _request()
+    first = run_minute(request, broker, store, now=now)
+    assert first["phase"] == "catchup"
+    assert first["order"] is None
+    assert broker.orders == []
+    saved = store.load(state_key("short", ACCOUNT))
+    assert datetime.fromisoformat(saved["sync_from"]) > monday
+    second = run_minute(request, broker, store, now=now)
+    assert second["phase"] == "hold"
+    assert second["order"] is None
+    assert broker.orders == []
+    assert any(bar["t"].startswith("2026-09-25T12:00") for bar in store.load(state_key("short", ACCOUNT))["bars"])
+
+
+def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    signal = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert signal["phase"] == "signal"
+    assert signal["order"] is None
+    assert broker.orders == []
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    broker.fill_price = 10.8
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["phase"] == "order"
+    order = filled["order"]
+    assert order["signed"] == 10
+    assert order["executed"] == 10
+    assert order["id"] == "short-202609281006"
+    assert len(order["id"]) <= 36
+    assert order["price"] == 10.8
+    saved = store.load(state_key("short", ACCOUNT))
+    assert saved["book"]["held"] == 10
+    assert saved["book"]["avg"] == pytest.approx(10.8)
+    assert saved["book"]["target"] == 19
+    assert broker.lots == 10
+
+
+def test_smaller_pace_is_the_order_size():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request(fill_per_minute=2)
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["order"]["signed"] == 2
+    assert store.load(state_key("short", ACCOUNT))["book"]["held"] == 2
+
+
+def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
+    broker = FakeBroker()
+    broker.lots = 4
+    broker.avg_price = 11.5
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    halted = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert halted["phase"] == "halted"
+    assert "4" in halted["halted"]
+    assert broker.orders == []
+    again = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert again["phase"] == "halted"
+    assert broker.orders == []
+    adopted = run_minute(_request(reconcile=True), broker, store, now=start + timedelta(minutes=8))
+    assert adopted["phase"] == "reconciled"
+    assert adopted["held"] == 4
+    assert adopted["halted"] is None
+    book = store.load(state_key("short", ACCOUNT))["book"]
+    assert book["held"] == 4
+    assert book["target"] == 4
+    assert book["avg"] == pytest.approx(11.5)
+    assert broker.orders == []
+
+
+def test_partial_fill_restores_the_book_and_halts():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    broker.executed = 3
+    halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert halted["phase"] == "halted"
+    assert "3" in halted["halted"]
+    book = store.load(state_key("short", ACCOUNT))["book"]
+    assert book["held"] == 0
+    assert book["target"] != 0
+    assert len(broker.orders) == 1
+
+
+def test_missed_bar_stop_sends_one_reduce_and_keeps_open_equity():
+    broker = FakeBroker()
+    broker.lots = 12
+    broker.equity_value = 999_999.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    book = _FillBook("CRZ6", 50_000.0)
+    book.held = 12
+    book.target = 12
+    book.avg = 10.0
+    book.stop_dist = 0.2
+    book.stop_px = 9.8
+    book.base = 12
+    book.entry_i = 1
+    _ready(store, _quiet_bars(start, 5), export_book(book))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.0, high=10.1, low=9.9))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert result["phase"] == "order"
+    assert result["order"]["signed"] == -10
+    assert len(broker.orders) == 1
+    saved = store.load(state_key("short", ACCOUNT))["book"]
+    assert saved["held"] == 2
+    assert saved["equity"] == pytest.approx(50_000.0)
+    assert saved["reason"] == "stop"
+
+
+def test_failed_order_does_not_keep_the_fill():
+    broker = FakeBroker()
+    broker.fail = True
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    halted = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert halted["phase"] == "halted"
+    assert store.load(state_key("short", ACCOUNT))["book"]["held"] == 0
+
+
+def test_two_accounts_keep_separate_state():
+    assert state_key("short", "one") != state_key("long", "two")
+
+
+def test_following_day_flattens_only_at_the_end_of_expiry():
+    last = date(2026, 12, 15)
+    assert following_day(datetime(2026, 12, 15, 23, 39, tzinfo=MSK), last) == last
+    assert following_day(datetime(2026, 12, 15, 23, 40, tzinfo=MSK), last) is None
+    assert following_day(datetime(2026, 12, 14, 23, 50, tzinfo=MSK), last) == date(2026, 12, 14)
+
+
+def test_reprice_open_add_reduce_and_close():
+    book = _FillBook("CRZ6", 100_000.0)
+    book.target = 10
+    before = export_book(book)
+    book.move(10.0, 1, 10)
+    reprice_fill(book, before, 10.0, 10.5)
+    assert book.held == 10
+    assert book.avg == pytest.approx(10.5)
+    assert book.best == pytest.approx(10.5)
+
+    before = export_book(book)
+    book.target = 20
+    book.move(11.0, 2, 10)
+    reprice_fill(book, before, 11.0, 12.0)
+    assert book.avg == pytest.approx((10.5 * 10 + 12 * 10) / 20)
+
+    before = export_book(book)
+    book.target = 10
+    book.move(13.0, 3, 10)
+    gross_at_close = book.gross
+    reprice_fill(book, before, 13.0, 14.0)
+    assert book.held == 10
+    assert book.gross == pytest.approx(gross_at_close + (14.0 - 13.0) * 10 * 1000)
+
+    before = export_book(book)
+    book.target = 0
+    book.move(13.0, 4, 10)
+    priced_at_close = book.equity
+    pnl_at_close = float(book.trades[-1]["pnl"])
+    reprice_fill(book, before, 13.0, 15.0)
+    assert book.held == 0
+    assert book.equity == pytest.approx(priced_at_close + 20_000)
+    assert book.trades[-1]["pnl"] == pytest.approx(pnl_at_close + 20_000)
+
+
+def test_step_minute_pace_override_does_not_change_the_default():
+    def run(pace):
+        book = _FillBook("CRZ6", 100_000.0)
+        book.target = 25
+        step_minute(
+            book,
+            1,
+            opened=10,
+            high=10,
+            low=10,
+            close=10,
+            volume=100,
+            day=date(2026, 9, 28),
+            next_day=date(2026, 9, 28),
+            last_day=date(2026, 12, 15),
+            prior_high=float("nan"),
+            prior_low=float("nan"),
+            prior_vol=float("nan"),
+            prior_range=float("nan"),
+            exit_high=float("nan"),
+            exit_low=float("nan"),
+            clock_vol=float("nan"),
+            entry_ready=0,
+            clearance=0,
+            cooldown=0,
+            clock_volume=False,
+            clock_cap=None,
+            size_mode="flat",
+            stop_mult=None,
+            loss_bars=None,
+            risk_fraction=None,
+            margin=1000,
+            stop_rub=None,
+            breakout_span=None,
+            trade_from=date(2026, 6, 16),
+            trail=False,
+            fill_per_minute=pace,
+        )
+        return book.held
+
+    assert run(None) == 10
+    assert run(2) == 2
+
+
+def test_handler_uses_the_token_only_to_build_the_broker():
+    seen: list[str] = []
+
+    class Quiet(FakeBroker):
+        pass
+
+    def factory(token: str):
+        seen.append(token)
+        broker = Quiet()
+        broker._candles = []
+        return broker
+
+    result = handle(
+        {"strategy": "short", "account_id": ACCOUNT, "secret_id": "box", "channel": 3, "exit_channel": 0, "clock_cap": None},
+        store=MemoryStore(),
+        now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+        secret_reader=lambda secret_id: "from-lockbox",
+        broker_factory=factory,
+    )
+    assert seen == ["from-lockbox"]
+    assert "token" not in result
+    assert "from-lockbox" not in str(result)
+    assert result["phase"] == "history"
+
+
+def test_order_id_is_stable_for_the_minute():
+    moment = datetime(2026, 9, 28, 10, 6, tzinfo=MSK)
+    assert make_order_id("long", moment) == make_order_id("long", moment)
+    assert make_order_id("long", moment) == "long-202609281006"
+
+
+def test_live_package_does_not_import_backtrader_or_pandas():
+    code = (
+        "import cnyrub.live.handler, cnyrub.live.service, cnyrub.engine; "
+        "import sys; "
+        "assert 'backtrader' not in sys.modules; "
+        "assert 'pandas' not in sys.modules"
+    )
+    subprocess.check_call([sys.executable, "-c", code], cwd="/workspace")
