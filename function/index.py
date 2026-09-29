@@ -15,8 +15,10 @@
     --environment AWS_ACCESS_KEY_ID=<ключ> \\
     --environment AWS_SECRET_ACCESS_KEY=<секрет>
 
-Три таймера на минуту, пока идёт сессия деривативов, повторы выключены.
-В payload таймера JSON: strategy (short, long или thirty), account_id, secret_id.
+Четыре таймера на минуту, пока идёт сессия деривативов, повторы выключены.
+В payload таймера JSON: strategy (short, long, thirty или fortyfive), account_id, secret_id.
+Свободные рубли покупают LQDT (или TMON в поле cash_ticker). Перед заявкой,
+которой нужно дополнительное обеспечение, этот фонд продаётся.
 Тестовый вызов шлёт тот же JSON, но с полем token вместо secret_id.
 Оба пути торгуют реальный счёт. Залог читается из API, история окна
 догружается сама по одному дню и в этот вызов заявка не ставится.

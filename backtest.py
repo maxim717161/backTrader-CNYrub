@@ -14,7 +14,7 @@
 позиция в нём не открывается. После экспирации следующий контракт торгуется
 сразу: окно к этому дню уже собрано.
 
-В работе три окна, и правила у них разные. Короткое окно 525 минут
+В работе четыре окна, и правила у них разные. Короткое окно 525 минут
 закрывается каналом той же длины. Минута сигнала не громче пяти медиан
 той же минуты суток за пять дней. Счёт 100 000 руб., залог 1 000 руб.
 Стоп — 285 руб. на контракт. Контрактов столько, чтобы этот стоп забирал
@@ -33,6 +33,9 @@
 300 минут. Прямота этих 30 закрытий — доля пути, которая осталась чистым
 ходом в сторону сделки, — от 0,15 до 0,5. Счёт 100 000 руб., плечо 4:
 контрактов столько, сколько это плечо пускает по цене закрытия.
+Окно 45 минут устроено так же: стоп 8 медиан, потолок пяти медиан той же
+минуты суток, выхода по каналу нет. Фильтра прямоты и потолка громкости нет.
+Счёт 100 000 руб., плечо 4.
 """
 
 from __future__ import annotations
@@ -98,6 +101,12 @@ THIRTY_EFF_LOW = 0.15
 THIRTY_EFF_HIGH = 0.5
 THIRTY_SURGE_CAP = 3.0
 THIRTY_LEVERAGE = 4.0
+FORTYFIVE_WINDOW = 45
+FORTYFIVE_STOP = 8.0
+FORTYFIVE_CLOCK_CAP = 5.0
+FORTYFIVE_CASH = 100_000.0
+FORTYFIVE_MARGIN = 1_000.0
+FORTYFIVE_LEVERAGE = 4.0
 LONG_CANDIDATES = (12_480, 12_960)
 
 
@@ -182,6 +191,26 @@ WINDOWS = (
         THIRTY_EFF_HIGH,
         THIRTY_SURGE_CAP,
         THIRTY_LEVERAGE,
+    ),
+    Window(
+        FORTYFIVE_WINDOW,
+        0,
+        FORTYFIVE_STOP,
+        FORTYFIVE_CLOCK_CAP,
+        "flat",
+        None,
+        None,
+        FORTYFIVE_CASH,
+        FORTYFIVE_MARGIN,
+        None,
+        None,
+        None,
+        None,
+        LONG_SCALE_FLOOR,
+        None,
+        None,
+        None,
+        FORTYFIVE_LEVERAGE,
     ),
 )
 CHANNEL = SHORT_WINDOW

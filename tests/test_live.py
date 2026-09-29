@@ -13,11 +13,13 @@ import pytest
 from backtest import WINDOWS, channel_view
 from cnyrub.engine import _FillBook, export_book, reprice_fill, step_minute
 from cnyrub.live.broker import (
+    CashFund,
     FillReport,
     Instrument,
     choose_front,
     margin_rub,
     parse_candle,
+    parse_cash_fund,
     parse_fill,
     parse_instrument,
     quotation,
@@ -25,7 +27,15 @@ from cnyrub.live.broker import (
 from cnyrub.live.config import PRESETS, parse_event
 from cnyrub.live.handler import handle, read_lockbox_token
 from cnyrub.live.indicators import bar_levels
-from cnyrub.live.service import following_day, history_goal, make_order_id, run_minute
+from cnyrub.live.service import (
+    extra_margin,
+    following_day,
+    fund_lots_to_buy,
+    fund_lots_to_sell,
+    history_goal,
+    make_order_id,
+    run_minute,
+)
 from cnyrub.live.state import MemoryStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -33,7 +43,7 @@ ACCOUNT = "acc-short"
 
 
 def test_presets_match_the_researched_windows():
-    short, long, thirty = WINDOWS
+    short, long, thirty, fortyfive = WINDOWS
     assert PRESETS["short"].channel == short.channel == 525
     assert PRESETS["short"].exit_channel == short.exit_channel
     assert PRESETS["short"].stop_mult is None and short.stop_mult is None
@@ -61,6 +71,17 @@ def test_presets_match_the_researched_windows():
     assert PRESETS["thirty"].surge_cap == thirty.surge_cap == 3
     assert PRESETS["thirty"].leverage == thirty.leverage == 4
     assert thirty.cash == 100_000
+    assert PRESETS["fortyfive"].channel == fortyfive.channel == 45
+    assert PRESETS["fortyfive"].exit_channel == 0
+    assert PRESETS["fortyfive"].stop_mult == fortyfive.stop_mult == 8
+    assert PRESETS["fortyfive"].clock_cap == 5
+    assert PRESETS["fortyfive"].eff_low is None and fortyfive.eff_low is None
+    assert PRESETS["fortyfive"].surge_cap is None and fortyfive.surge_cap is None
+    assert PRESETS["fortyfive"].leverage == fortyfive.leverage == 4
+    assert fortyfive.cash == 100_000
+    assert parse_event(
+        {"strategy": "fortyfive", "account_id": "1", "token": "t"}
+    ).cash_ticker == "LQDT"
 
 
 def test_levels_match_channel_view():
@@ -296,6 +317,10 @@ class FakeBroker:
         self.lots = 0
         self.avg_price: float | None = None
         self.equity_value = 100_000.0
+        self.fund = CashFund("LQDT", "fund-1", 1)
+        self.fund_lots_value = 0
+        self.free_value = 0.0
+        self.fund_price = 1.0
         self.orders: list[dict] = []
         self.fill_price: float | None = None
         self.executed: int | None = None
@@ -322,11 +347,27 @@ class FakeBroker:
     def equity(self, account_id):
         return self.equity_value
 
+    def cash_fund(self, ticker):
+        return self.fund
+
+    def last_price(self, uid):
+        return self.fund_price
+
+    def free_rub(self, account_id):
+        return self.free_value
+
+    def fund_lots(self, account_id, uid, lot):
+        return self.fund_lots_value
+
     def market_order(self, account_id, uid, signed, order_id):
-        self.orders.append({"signed": signed, "order_id": order_id, "account": account_id})
+        self.orders.append({"signed": signed, "order_id": order_id, "account": account_id, "uid": uid})
         if self.fail:
             raise RuntimeError("timeout")
         executed = abs(signed) if self.executed is None else self.executed
+        if uid == self.fund.uid:
+            if executed == abs(signed):
+                self.fund_lots_value += signed
+            return FillReport(order_id, abs(signed), executed, self.fund_price)
         if executed == abs(signed):
             self.lots += signed
         elif executed:
@@ -471,6 +512,84 @@ def test_smaller_pace_is_the_order_size():
     filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
     assert filled["order"]["signed"] == 2
     assert store.load(state_key("short", ACCOUNT))["book"]["held"] == 2
+
+
+def test_free_cash_buys_the_money_fund_when_futures_stay_flat():
+    broker = FakeBroker()
+    broker.free_value = 5_000.0
+    broker.fund_price = 100.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.0))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    assert result["order"] is None
+    assert result["cash_order"]["ticker"] == "LQDT"
+    assert result["cash_order"]["signed"] == 49
+    assert broker.fund_lots_value == 49
+    assert broker.orders[0]["order_id"] == "short-c-202609281005"
+
+
+def test_cash_ticker_off_leaves_rubles_alone():
+    broker = FakeBroker()
+    broker.free_value = 5_000.0
+    broker.fund_price = 100.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.0))
+    result = run_minute(_request(cash_ticker="off"), broker, store, now=start + timedelta(minutes=6))
+    assert result["cash_order"] is None
+    assert broker.orders == []
+
+
+def test_fund_is_sold_before_the_futures_order_that_needs_margin():
+    broker = FakeBroker()
+    broker.fund_lots_value = 100_000
+    broker.free_value = 0.0
+    broker.fund_price = 1.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    broker.fill_price = 10.8
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert [item["uid"] for item in broker.orders] == ["fund-1", broker.instrument.uid]
+    assert broker.orders[0]["signed"] == -95_000
+    assert broker.orders[0]["order_id"] == "short-c-202609281006"
+    assert filled["order"]["signed"] == 10
+    assert filled["cash_order"]["signed"] == -95_000
+    assert broker.lots == 10
+    assert broker.fund_lots_value == 5_000
+
+
+def test_reducing_a_future_does_not_sell_the_fund():
+    assert extra_margin(10, 0, 5_000) == 0
+    assert extra_margin(0, 19, 5_000) == 95_000
+    assert fund_lots_to_sell(100_000, 0, 1, 1, 95_000) == 95_000
+    assert fund_lots_to_sell(10, 0, 1, 1, 95_000) == 10
+    assert fund_lots_to_sell(100, 95_000, 1, 1, 95_000) == 0
+    assert fund_lots_to_buy(5_000, 100, 1) == 49
+    assert fund_lots_to_buy(10, 100, 1) == 0
+
+
+def test_cash_fund_parser_keeps_lqdt_and_tmon():
+    lqdt = {
+        "ticker": "LQDT",
+        "uid": "uid-lqdt",
+        "lot": 1,
+        "classCode": "TQTF",
+        "instrumentType": "etf",
+    }
+    assert parse_cash_fund(lqdt, "LQDT") == CashFund("LQDT", "uid-lqdt", 1)
+    assert parse_cash_fund({**lqdt, "ticker": "TMON", "uid": "uid-tmon"}, "TMON").uid == "uid-tmon"
+    assert parse_cash_fund({**lqdt, "ticker": "SBER"}, "LQDT") is None
+    assert parse_cash_fund({**lqdt, "classCode": "TQBR"}, "LQDT") is None
+    with pytest.raises(ValueError):
+        parse_event({"strategy": "short", "account_id": "1", "token": "t", "cash_ticker": "SBER"})
 
 
 def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
