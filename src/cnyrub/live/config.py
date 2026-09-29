@@ -38,6 +38,7 @@ class StrategyParams:
 # Те же числа, что у WINDOWS в исследовании. Короткое окно без уменьшения
 # на откате. Длинное — стоп 22 медианы и уменьшение до половины на 100 медианах.
 # Окно 30 минут — прямота 0,15–0,5, плечо 4 и объём тише трёх медиан за 300 минут.
+# Окно 45 минут — стоп 8, плечо 4, без фильтра прямоты и без потолка громкости.
 PRESETS: dict[str, StrategyParams] = {
     "short": StrategyParams(
         channel=525,
@@ -85,6 +86,21 @@ PRESETS: dict[str, StrategyParams] = {
         surge_cap=3.0,
         leverage=4.0,
     ),
+    "fortyfive": StrategyParams(
+        channel=45,
+        exit_channel=0,
+        stop_mult=8.0,
+        clock_cap=5.0,
+        size_mode="flat",
+        loss_bars=None,
+        risk_fraction=None,
+        stop_rub=None,
+        breakout_span=None,
+        scale_step=None,
+        scale_back=None,
+        scale_floor=0.5,
+        leverage=4.0,
+    ),
 }
 
 _OPTIONAL_FLOATS = (
@@ -113,11 +129,12 @@ class RunRequest:
     fill_per_minute: int
     reconcile: bool
     params: StrategyParams
+    cash_ticker: str | None
 
 
 def preset(strategy: str) -> StrategyParams:
     if strategy not in PRESETS:
-        raise ValueError("strategy должен быть short, long или thirty")
+        raise ValueError("strategy должен быть short, long, thirty или fortyfive")
     return PRESETS[strategy]
 
 
@@ -146,6 +163,7 @@ def parse_event(event: object) -> RunRequest:
         fill_per_minute=fill_per_minute,
         reconcile=_flag(data.get("reconcile")),
         params=params,
+        cash_ticker=_cash_ticker(data.get("cash_ticker", "LQDT")),
     )
 
 
@@ -189,6 +207,18 @@ def _payload(event: object) -> dict[str, object]:
             raise ValueError("payload таймера должен быть JSON-объектом")
         return parsed
     return loaded
+
+
+def _cash_ticker(value: object) -> str | None:
+    """Фонд денежного рынка на свободные рубли. Пустое значение выключает его."""
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if text in {"", "NONE", "OFF", "0"}:
+        return None
+    if text not in {"LQDT", "TMON"}:
+        raise ValueError("cash_ticker должен быть LQDT или TMON")
+    return text
 
 
 def _text(value: object) -> str | None:
