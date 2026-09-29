@@ -29,10 +29,15 @@ class StrategyParams:
     scale_step: float | None
     scale_back: float | None
     scale_floor: float
+    eff_low: float | None = None
+    eff_high: float | None = None
+    surge_cap: float | None = None
+    leverage: float | None = None
 
 
 # Те же числа, что у WINDOWS в исследовании. Короткое окно без уменьшения
 # на откате. Длинное — стоп 22 медианы и уменьшение до половины на 100 медианах.
+# Окно 30 минут — прямота 0,15–0,5, плечо 4 и объём тише трёх медиан за 300 минут.
 PRESETS: dict[str, StrategyParams] = {
     "short": StrategyParams(
         channel=525,
@@ -62,6 +67,24 @@ PRESETS: dict[str, StrategyParams] = {
         scale_back=50.0,
         scale_floor=0.5,
     ),
+    "thirty": StrategyParams(
+        channel=30,
+        exit_channel=0,
+        stop_mult=8.0,
+        clock_cap=5.0,
+        size_mode="flat",
+        loss_bars=None,
+        risk_fraction=None,
+        stop_rub=None,
+        breakout_span=None,
+        scale_step=None,
+        scale_back=None,
+        scale_floor=0.5,
+        eff_low=0.15,
+        eff_high=0.5,
+        surge_cap=3.0,
+        leverage=4.0,
+    ),
 }
 
 _OPTIONAL_FLOATS = (
@@ -73,6 +96,10 @@ _OPTIONAL_FLOATS = (
     "scale_step",
     "scale_back",
     "scale_floor",
+    "eff_low",
+    "eff_high",
+    "surge_cap",
+    "leverage",
 )
 _OPTIONAL_INTS = ("channel", "exit_channel", "loss_bars")
 
@@ -90,7 +117,7 @@ class RunRequest:
 
 def preset(strategy: str) -> StrategyParams:
     if strategy not in PRESETS:
-        raise ValueError("strategy должен быть short или long")
+        raise ValueError("strategy должен быть short, long или thirty")
     return PRESETS[strategy]
 
 

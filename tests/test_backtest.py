@@ -3,6 +3,8 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import pytest
 
+from cnyrub.engine import _FillBook, step_minute
+
 from backtest import (
     WINDOWS,
     _part_nets,
@@ -98,6 +100,86 @@ def test_open_position_is_closed_on_the_last_day_and_not_reopened():
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == (exit_ - entry) * 1000
         assert buy_and_hold(frame, 20) == trade["pnlcomm"]
+
+
+def _signal_book(**overrides: object) -> _FillBook:
+    book = _FillBook("CRZ5", 100_000.0)
+    args = dict(
+        opened=10.0,
+        high=10.3,
+        low=9.9,
+        close=10.2,
+        volume=100.0,
+        day=date(2024, 6, 3),
+        next_day=date(2024, 6, 4),
+        last_day=date(2024, 9, 18),
+        prior_high=10.0,
+        prior_low=9.5,
+        prior_vol=80.0,
+        prior_range=0.05,
+        exit_high=float("nan"),
+        exit_low=float("nan"),
+        clock_vol=40.0,
+        entry_ready=1.0,
+        clearance=0.0,
+        cooldown=0,
+        clock_volume=False,
+        clock_cap=5.0,
+        size_mode="flat",
+        stop_mult=8.0,
+        loss_bars=None,
+        risk_fraction=None,
+        margin=1000.0,
+        stop_rub=None,
+        breakout_span=None,
+        trade_from=date(2024, 6, 1),
+        trail=False,
+        drift=0.30,
+        path=1.0,
+        surge_vol=50.0,
+        eff_low=0.15,
+        eff_high=0.5,
+        surge_cap=3.0,
+        leverage=4.0,
+    )
+    args.update(overrides)
+    step_minute(book, 100, **args)
+    return book
+
+
+def test_thirty_window_sizes_a_straight_quiet_breakout_at_four_times():
+    book = _signal_book()
+    assert book.target == 39
+    assert book.held == 0
+
+
+def test_thirty_window_skips_a_loud_or_crooked_breakout():
+    assert _signal_book(volume=200.0).target == 0
+    assert _signal_book(drift=0.10).target == 0
+    assert _signal_book(drift=0.60).target == 0
+    assert _signal_book(surge_vol=float("nan")).target == 39
+
+
+def test_thirty_rules_match_in_backtrader_and_the_simulator():
+    frame = _stop_frame()
+    kwargs = dict(
+        stop_mult=8.0,
+        exit_channel=0,
+        clock_cap=5.0,
+        cash=100_000.0,
+        eff_low=0.15,
+        eff_high=0.5,
+        surge_cap=3.0,
+        leverage=4.0,
+    )
+    simulated = simulate("CRZ5", frame, 20, **kwargs)
+    strategy = run_contract("CRZ5", frame, 20, **kwargs)
+    assert len(simulated) == len(strategy.trades)
+    for left, right in zip(simulated, strategy.trades, strict=True):
+        assert left["direction"] == right["direction"]
+        assert left["lots"] == right["lots"]
+        assert left["reason"] == right["reason"]
+        assert left["pnlcomm"] == pytest.approx(right["pnlcomm"])
 
 
 def test_breakout_below_the_median_volume_is_skipped():
@@ -465,6 +547,11 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert WINDOWS[1].scale_step == 100 and WINDOWS[1].scale_back == 50
     assert WINDOWS[1].scale_floor == 0.5
     assert WINDOWS[0].scale_step is None
+    assert WINDOWS[2].channel == 30 and WINDOWS[2].exit_channel == 0
+    assert WINDOWS[2].stop_mult == 8 and WINDOWS[2].clock_cap == 5
+    assert WINDOWS[2].eff_low == 0.15 and WINDOWS[2].eff_high == 0.5
+    assert WINDOWS[2].surge_cap == 3 and WINDOWS[2].leverage == 4
+    assert WINDOWS[2].cash == 100_000
 
 
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():

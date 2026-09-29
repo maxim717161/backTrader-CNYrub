@@ -15,6 +15,9 @@ COMMISSION = 1.0
 # За минуту позиция меняется не больше чем на столько контрактов.
 FILL_PER_MINUTE = 10
 CLOCK_DAYS = 5
+# Медиана объёма предыдущих 300 минут. Меньше 60 минуток — медианы ещё нет.
+SURGE_BARS = 300
+SURGE_MIN_PERIODS = 60
 # От одной до двух медиан пробоя доля размера держится на 50%.
 LONG_BREAKOUT_LOW = 1.0
 LONG_BREAKOUT_HIGH = 2.0
@@ -227,6 +230,13 @@ def step_minute(
     scale_floor: float = LONG_SCALE_FLOOR,
     scale_back: float | None = None,
     fill_per_minute: int | None = None,
+    drift: float = float("nan"),
+    path: float = float("nan"),
+    surge_vol: float = float("nan"),
+    eff_low: float | None = None,
+    eff_high: float | None = None,
+    surge_cap: float | None = None,
+    leverage: float | None = None,
 ) -> None:
     """Одна минута: сначала кусок по её закрытию, потом решение на следующие."""
     if day == last_day and (book.held != 0 or book.target != 0):
@@ -295,7 +305,28 @@ def step_minute(
         side = -1
     else:
         return
-    if breakout_span:
+    if eff_low is not None and eff_high is not None:
+        if not path > 0 or drift != drift:
+            return
+        efficiency = side * drift / path
+        if not eff_low <= efficiency < eff_high:
+            return
+    if (
+        surge_cap is not None
+        and surge_vol == surge_vol
+        and surge_vol > 0
+        and surge_vol != float("inf")
+        and volume >= surge_cap * surge_vol
+    ):
+        return
+    if leverage is not None and leverage > 0:
+        if book.equity is None:
+            raise ValueError("Для плеча нужен текущий счёт")
+        lots = int(leverage * book.equity // (close * MULTIPLIER))
+        if lots < 1:
+            return
+        book.stop_dist = None if stop_mult is None else stop_mult * prior_range
+    elif breakout_span:
         if prior_range == prior_range and prior_range > 0:
             beyond = (close - prior_high) / prior_range if side > 0 else (prior_low - close) / prior_range
         else:

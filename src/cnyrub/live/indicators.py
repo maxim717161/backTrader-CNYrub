@@ -10,7 +10,7 @@ import math
 import statistics
 from datetime import datetime
 
-from cnyrub.engine import CLOCK_DAYS
+from cnyrub.engine import CLOCK_DAYS, SURGE_BARS, SURGE_MIN_PERIODS
 from cnyrub.live.config import StrategyParams
 
 
@@ -26,6 +26,9 @@ def bar_levels(bars: list[dict[str, object]], params: StrategyParams, clock_days
         "exit_low": nan,
         "clock_vol": nan,
         "entry_ready": 0.0,
+        "surge_vol": nan,
+        "drift": nan,
+        "path": nan,
     }
     if not bars:
         return levels
@@ -39,6 +42,8 @@ def bar_levels(bars: list[dict[str, object]], params: StrategyParams, clock_days
             levels["exit_high"] = high
             levels["exit_low"] = low
     levels["clock_vol"] = _clock_volume(bars, clock_days)
+    levels["surge_vol"] = _surge_volume(bars)
+    levels["drift"], levels["path"] = _straight_path(bars, params.channel)
     return levels
 
 
@@ -67,6 +72,27 @@ def _clock_volume(bars: list[dict[str, object]], lookback: int) -> float:
     if len(seen) < lookback:
         return float("nan")
     return float(statistics.median(seen[-lookback:]))
+
+
+def _surge_volume(bars: list[dict[str, object]]) -> float:
+    """Медиана объёма предыдущих SURGE_BARS минут, без текущей."""
+    if len(bars) < SURGE_MIN_PERIODS + 1:
+        return float("nan")
+    window = bars[-(SURGE_BARS + 1) : -1] if len(bars) > SURGE_BARS else bars[:-1]
+    if len(window) < SURGE_MIN_PERIODS:
+        return float("nan")
+    return float(statistics.median(float(bar["v"]) for bar in window))
+
+
+def _straight_path(bars: list[dict[str, object]], channel: int) -> tuple[float, float]:
+    """Чистый ход и длина пути за channel закрытий, включая текущее."""
+    nan = float("nan")
+    if channel <= 0 or len(bars) <= channel:
+        return nan, nan
+    closes = [float(bar["c"]) for bar in bars[-(channel + 1) :]]
+    drift = closes[-1] - closes[0]
+    path = sum(abs(closes[index + 1] - closes[index]) for index in range(channel))
+    return drift, path
 
 
 def _minute_of_day(stamp: str) -> int:

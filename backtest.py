@@ -14,7 +14,7 @@
 позиция в нём не открывается. После экспирации следующий контракт торгуется
 сразу: окно к этому дню уже собрано.
 
-В работе два окна, и правила у них разные. Короткое окно 525 минут
+В работе три окна, и правила у них разные. Короткое окно 525 минут
 закрывается каналом той же длины. Минута сигнала не громче пяти медиан
 той же минуты суток за пять дней. Счёт 100 000 руб., залог 1 000 руб.
 Стоп — 285 руб. на контракт. Контрактов столько, чтобы этот стоп забирал
@@ -27,6 +27,12 @@
 Откат на 100 медиан минутного диапазона уменьшает позицию до половины
 исходного размера. Когда откат сжимается до 50 медиан, размер возвращается.
 Обычный день — это около 50 таких медиан. Куски те же: 10 контрактов в минуту.
+Окно 30 минут не выходит по каналу и держит стоп в 8 медиан минутного
+диапазона. Минута сигнала не тише медианы этих 30 минут и не громче пяти
+медиан той же минуты суток. Она же не громче трёх медиан объёма предыдущих
+300 минут. Прямота этих 30 закрытий — доля пути, которая осталась чистым
+ходом в сторону сделки, — от 0,15 до 0,5. Счёт 100 000 руб., плечо 4:
+контрактов столько, сколько это плечо пускает по цене закрытия.
 """
 
 from __future__ import annotations
@@ -49,6 +55,8 @@ from cnyrub.engine import (
     LONG_BREAKOUT_LOW,
     LONG_SCALE_FLOOR,
     MULTIPLIER,
+    SURGE_BARS,
+    SURGE_MIN_PERIODS,
     _FillBook,
     breakout_fraction,
     breakout_lots,
@@ -81,6 +89,15 @@ LONG_BREAKOUT_SPAN = 12.0
 LONG_SCALE_STEP = 100.0
 LONG_SCALE_BACK = 50.0
 SHORT_CLOCK_CAP = 5.0
+THIRTY_WINDOW = 30
+THIRTY_STOP = 8.0
+THIRTY_CLOCK_CAP = 5.0
+THIRTY_CASH = 100_000.0
+THIRTY_MARGIN = 1_000.0
+THIRTY_EFF_LOW = 0.15
+THIRTY_EFF_HIGH = 0.5
+THIRTY_SURGE_CAP = 3.0
+THIRTY_LEVERAGE = 4.0
 LONG_CANDIDATES = (12_480, 12_960)
 
 
@@ -111,6 +128,10 @@ class Window(NamedTuple):
     scale_step: float | None = None
     scale_back: float | None = None
     scale_floor: float = LONG_SCALE_FLOOR
+    eff_low: float | None = None
+    eff_high: float | None = None
+    surge_cap: float | None = None
+    leverage: float | None = None
 
 
 WINDOWS = (
@@ -141,6 +162,26 @@ WINDOWS = (
         LONG_SCALE_STEP,
         LONG_SCALE_BACK,
         LONG_SCALE_FLOOR,
+    ),
+    Window(
+        THIRTY_WINDOW,
+        0,
+        THIRTY_STOP,
+        THIRTY_CLOCK_CAP,
+        "flat",
+        None,
+        None,
+        THIRTY_CASH,
+        THIRTY_MARGIN,
+        None,
+        None,
+        None,
+        None,
+        LONG_SCALE_FLOOR,
+        THIRTY_EFF_LOW,
+        THIRTY_EFF_HIGH,
+        THIRTY_SURGE_CAP,
+        THIRTY_LEVERAGE,
     ),
 )
 CHANNEL = SHORT_WINDOW
@@ -173,6 +214,9 @@ class SignalData(bt.feeds.PandasData):
         "entry_ready",
         "exit_ready",
         "clock_vol",
+        "surge_vol",
+        "drift",
+        "path",
     )
     params = (
         ("prior_high", -1),
@@ -184,6 +228,9 @@ class SignalData(bt.feeds.PandasData):
         ("entry_ready", -1),
         ("exit_ready", -1),
         ("clock_vol", -1),
+        ("surge_vol", -1),
+        ("drift", -1),
+        ("path", -1),
     )
 
 
@@ -204,6 +251,10 @@ class MinuteDonchian(bt.Strategy):
         scale_step=0.0,
         scale_floor=LONG_SCALE_FLOOR,
         scale_back=0.0,
+        eff_low=0.0,
+        eff_high=0.0,
+        surge_cap=0.0,
+        leverage=0.0,
     )
 
     def __init__(self) -> None:
@@ -252,6 +303,13 @@ class MinuteDonchian(bt.Strategy):
             scale_step=float(self.p.scale_step) or None,
             scale_floor=float(self.p.scale_floor),
             scale_back=float(self.p.scale_back) or None,
+            drift=float(self.data.drift[0]),
+            path=float(self.data.path[0]),
+            surge_vol=float(self.data.surge_vol[0]),
+            eff_low=None if float(self.p.eff_high) <= 0 else float(self.p.eff_low),
+            eff_high=None if float(self.p.eff_high) <= 0 else float(self.p.eff_high),
+            surge_cap=float(self.p.surge_cap) or None,
+            leverage=float(self.p.leverage) or None,
         )
         if book.last_signed:
             self._fill_broker(book.last_signed, close)
@@ -352,7 +410,27 @@ def channel_view(frame: pd.DataFrame, channel: int, exit_channel: int | None = N
         view["exit_ready"] = 0.0
     view["entry_ready"] = view["prior_high"].notna().astype(float)
     view["clock_vol"] = _clock_volume(pd.DatetimeIndex(view.index), frame["volume"].to_numpy(dtype=float), CLOCK_DAYS)
+    view["surge_vol"] = (
+        frame["volume"].rolling(SURGE_BARS, min_periods=SURGE_MIN_PERIODS).median().shift(1)
+    )
+    view["drift"], view["path"] = _straight_path(frame["close"].to_numpy(dtype=float), channel)
     return view
+
+
+def _straight_path(close: np.ndarray, channel: int) -> tuple[np.ndarray, np.ndarray]:
+    """Чистый ход и длина пути за channel закрытий, включая текущее."""
+    count = len(close)
+    drift = np.full(count, np.nan)
+    path = np.full(count, np.nan)
+    if channel <= 0 or count <= channel:
+        return drift, path
+    drift[channel:] = close[channel:] - close[:-channel]
+    changes = np.abs(np.diff(close))
+    cumulative = np.cumsum(changes)
+    path[channel] = cumulative[channel - 1]
+    if count > channel + 1:
+        path[channel + 1 :] = cumulative[channel:] - cumulative[: count - channel - 1]
+    return drift, path
 
 
 def _clock_volume(index: pd.DatetimeIndex, volume: np.ndarray, lookback: int) -> np.ndarray:
@@ -400,6 +478,10 @@ def simulate(
     scale_floor: float = LONG_SCALE_FLOOR,
     scale_back: float | None = None,
     marks: list[float] | None = None,
+    eff_low: float | None = None,
+    eff_high: float | None = None,
+    surge_cap: float | None = None,
+    leverage: float | None = None,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
 
@@ -455,6 +537,11 @@ def simulate(
     days = view.index.date
     last_day = days[-1]
     ready = view["entry_ready"].to_numpy(dtype=float)
+    drift = view["drift"].to_numpy(dtype=float) if "drift" in view.columns else np.full(len(view), np.nan)
+    path = view["path"].to_numpy(dtype=float) if "path" in view.columns else np.full(len(view), np.nan)
+    surge_vol = (
+        view["surge_vol"].to_numpy(dtype=float) if "surge_vol" in view.columns else np.full(len(view), np.nan)
+    )
     book = _FillBook(secid, cash)
     book.trail = trail
     for i in range(len(view)):
@@ -493,6 +580,13 @@ def simulate(
             scale_step=scale_step,
             scale_floor=scale_floor,
             scale_back=scale_back,
+            drift=float(drift[i]),
+            path=float(path[i]),
+            surge_vol=float(surge_vol[i]),
+            eff_low=eff_low,
+            eff_high=eff_high,
+            surge_cap=surge_cap,
+            leverage=leverage,
         )
         if marks is not None:
             marks.append(marked_equity(book, float(close[i])))
@@ -711,9 +805,14 @@ def run_contract(
     scale_step: float | None = None,
     scale_floor: float = LONG_SCALE_FLOOR,
     scale_back: float | None = None,
+    eff_low: float | None = None,
+    eff_high: float | None = None,
+    surge_cap: float | None = None,
+    leverage: float | None = None,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
+    view["surge_vol"] = view["surge_vol"].fillna(float("inf"))
     last_day = pd.Timestamp(view.index[-1]).date().isoformat()
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.addstrategy(
@@ -733,6 +832,10 @@ def run_contract(
         scale_step=0.0 if scale_step is None else scale_step,
         scale_floor=scale_floor,
         scale_back=0.0 if scale_back is None else scale_back,
+        eff_low=0.0 if eff_low is None else eff_low,
+        eff_high=0.0 if eff_high is None else eff_high,
+        surge_cap=0.0 if surge_cap is None else surge_cap,
+        leverage=0.0 if leverage is None else leverage,
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(cash)
@@ -824,6 +927,10 @@ def run_account(
             scale_step=window.scale_step,
             scale_floor=window.scale_floor,
             scale_back=window.scale_back,
+            eff_low=window.eff_low,
+            eff_high=window.eff_high,
+            surge_cap=window.surge_cap,
+            leverage=window.leverage,
         )
         equity = float(strategy.broker.getvalue())
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
@@ -854,6 +961,10 @@ def run_account(
         "scale_step": window.scale_step,
         "scale_floor": window.scale_floor,
         "scale_back": window.scale_back,
+        "eff_low": window.eff_low,
+        "eff_high": window.eff_high,
+        "surge_cap": window.surge_cap,
+        "leverage": window.leverage,
         "cash": window.cash,
         "equity": equity,
         "margin": window.margin,
@@ -1223,7 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     for window in WINDOWS:
-        if window.risk_fraction or window.breakout_span:
+        if window.risk_fraction or window.breakout_span or window.leverage:
             print(report(run_account(frames, window, starts)))
         else:
             print(
