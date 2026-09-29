@@ -25,7 +25,7 @@ from cnyrub.live.broker import (
 from cnyrub.live.config import PRESETS, parse_event
 from cnyrub.live.handler import handle, read_lockbox_token
 from cnyrub.live.indicators import bar_levels
-from cnyrub.live.service import following_day, make_order_id, run_minute
+from cnyrub.live.service import following_day, history_goal, make_order_id, run_minute
 from cnyrub.live.state import MemoryStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -33,7 +33,7 @@ ACCOUNT = "acc-short"
 
 
 def test_presets_match_the_researched_windows():
-    short, long = WINDOWS
+    short, long, thirty = WINDOWS
     assert PRESETS["short"].channel == short.channel == 525
     assert PRESETS["short"].exit_channel == short.exit_channel
     assert PRESETS["short"].stop_mult is None and short.stop_mult is None
@@ -52,6 +52,15 @@ def test_presets_match_the_researched_windows():
     assert PRESETS["long"].scale_floor == long.scale_floor == 0.5
     assert PRESETS["long"].clock_cap is None
     assert not hasattr(PRESETS["short"], "margin")
+    assert PRESETS["thirty"].channel == thirty.channel == 30
+    assert PRESETS["thirty"].exit_channel == 0
+    assert PRESETS["thirty"].stop_mult == thirty.stop_mult == 8
+    assert PRESETS["thirty"].clock_cap == 5
+    assert PRESETS["thirty"].eff_low == thirty.eff_low == 0.15
+    assert PRESETS["thirty"].eff_high == thirty.eff_high == 0.5
+    assert PRESETS["thirty"].surge_cap == thirty.surge_cap == 3
+    assert PRESETS["thirty"].leverage == thirty.leverage == 4
+    assert thirty.cash == 100_000
 
 
 def test_levels_match_channel_view():
@@ -109,7 +118,18 @@ def test_levels_match_channel_view():
     for end in (6, 12, 20, len(bars)):
         levels = bar_levels(bars[:end], params, clock_days=5)
         row = view.iloc[end - 1]
-        for name in ("prior_high", "prior_low", "prior_vol", "prior_range", "exit_high", "exit_low", "clock_vol"):
+        for name in (
+            "prior_high",
+            "prior_low",
+            "prior_vol",
+            "prior_range",
+            "exit_high",
+            "exit_low",
+            "clock_vol",
+            "surge_vol",
+            "drift",
+            "path",
+        ):
             got = levels[name]
             expected = float(row[name])
             if pd.isna(expected):
@@ -117,6 +137,44 @@ def test_levels_match_channel_view():
             else:
                 assert got == pytest.approx(expected)
         assert levels["entry_ready"] == float(row["entry_ready"])
+
+
+def test_surge_and_straightness_match_channel_view():
+    index = pd.date_range("2026-01-05 10:00", periods=400, freq="min", tz="Europe/Moscow")
+    frame = pd.DataFrame(
+        {
+            "open": [10.0] * len(index),
+            "high": [10.2] * len(index),
+            "low": [9.8] * len(index),
+            "close": [10.0 + i * 0.001 for i in range(len(index))],
+            "volume": [10 + (i % 17) * 3 + (i % 2) for i in range(len(index))],
+        },
+        index=index,
+    )
+    view = channel_view(frame, 30, 0)
+    bars = [
+        {
+            "t": moment.isoformat(),
+            "o": float(row.open),
+            "h": float(row.high),
+            "l": float(row.low),
+            "c": float(row.close),
+            "v": float(row.volume),
+        }
+        for moment, row in frame.iterrows()
+    ]
+    params = PRESETS["thirty"]
+    for end in (60, 61, 80, 300, 301, 400):
+        levels = bar_levels(bars[:end], params)
+        row = view.iloc[end - 1]
+        for name in ("surge_vol", "drift", "path", "prior_high", "prior_vol"):
+            got = levels[name]
+            expected = float(row[name])
+            if pd.isna(expected):
+                assert pd.isna(got)
+            else:
+                assert got == pytest.approx(expected)
+    assert history_goal(params) == (5 + 1) * 18 * 60
 
 
 def test_parse_timer_envelope_and_direct_json():

@@ -12,7 +12,16 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from cnyrub.engine import CLOCK_DAYS, _FillBook, export_book, load_book, reprice_fill, restore_book, step_minute
+from cnyrub.engine import (
+    CLOCK_DAYS,
+    SURGE_BARS,
+    _FillBook,
+    export_book,
+    load_book,
+    reprice_fill,
+    restore_book,
+    step_minute,
+)
 from cnyrub.live.broker import Candle, Instrument, choose_front
 from cnyrub.live.config import RunRequest
 from cnyrub.live.indicators import bar_levels
@@ -33,6 +42,8 @@ def history_goal(params) -> int:
         goal = max(goal, params.exit_channel)
     if params.clock_cap is not None:
         goal = max(goal, (CLOCK_DAYS + 1) * SESSION_MINUTES)
+    if params.surge_cap is not None:
+        goal = max(goal, SURGE_BARS)
     return goal
 
 
@@ -182,6 +193,13 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         scale_floor=request.params.scale_floor,
         scale_back=request.params.scale_back,
         fill_per_minute=request.fill_per_minute,
+        drift=levels["drift"],
+        path=levels["path"],
+        surge_vol=levels["surge_vol"],
+        eff_low=request.params.eff_low,
+        eff_high=request.params.eff_high,
+        surge_cap=request.params.surge_cap,
+        leverage=request.params.leverage,
     )
     stamp = _bar(last)["t"]
     signed = int(book.last_signed)
