@@ -39,6 +39,7 @@ class StrategyParams:
 # на откате. Длинное — стоп 22 медианы и уменьшение до половины на 100 медианах.
 # Окно 30 минут — прямота 0,15–0,5, плечо 4 и объём тише трёх медиан за 300 минут.
 # Окно 45 минут — стоп 8, плечо 4, без фильтра прямоты и без потолка громкости.
+# Окно 60 минут — те же правила, плечо 5.
 PRESETS: dict[str, StrategyParams] = {
     "short": StrategyParams(
         channel=525,
@@ -101,6 +102,21 @@ PRESETS: dict[str, StrategyParams] = {
         scale_floor=0.5,
         leverage=4.0,
     ),
+    "sixty": StrategyParams(
+        channel=60,
+        exit_channel=0,
+        stop_mult=8.0,
+        clock_cap=5.0,
+        size_mode="flat",
+        loss_bars=None,
+        risk_fraction=None,
+        stop_rub=None,
+        breakout_span=None,
+        scale_step=None,
+        scale_back=None,
+        scale_floor=0.5,
+        leverage=5.0,
+    ),
 }
 
 _OPTIONAL_FLOATS = (
@@ -134,7 +150,7 @@ class RunRequest:
 
 def preset(strategy: str) -> StrategyParams:
     if strategy not in PRESETS:
-        raise ValueError("strategy должен быть short, long, thirty или fortyfive")
+        raise ValueError("strategy должен быть short, long, thirty, fortyfive или sixty")
     return PRESETS[strategy]
 
 

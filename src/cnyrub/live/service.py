@@ -6,8 +6,9 @@
 проверяются на стоп, шаг считается только по последней закрытой свече, и на
 фьючерс уходит не больше одного рыночного ордера.
 
-Свободные рубли покупают фонд денежного рынка. Перед заявкой, которой нужно
-дополнительное обеспечение, этот фонд продаётся.
+Свободные рубли всех окон покупают фонд денежного рынка. Залог на сделку
+этой минуты — fill_per_minute лотов — остаётся в рублях и с запасом в половину.
+Фонд продаётся только если этих рублей не хватает, чтобы увеличить позицию.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ FLATTEN_AT = time(23, 40)
 SESSION_MINUTES = 18 * 60
 HISTORY_WALKS = 90
 CATCHUP_DAYS = 3
+# Запас сверх залога на минутную сделку: в рублях лежит полтора таких залога.
+CASH_MARGIN_BUFFER = 1.5
 
 
 def history_goal(params) -> int:
@@ -85,6 +88,18 @@ def extra_margin(before_held: int, target: int, margin: float) -> float:
     return (abs(target) - abs(before_held)) * margin
 
 
+def cash_to_keep(fill_per_minute: int, margin: float) -> float:
+    """Рубли, которые не уходят в фонд: залог на минутную сделку и запас."""
+    if margin <= 0 or fill_per_minute <= 0:
+        return 0.0
+    return fill_per_minute * margin * CASH_MARGIN_BUFFER
+
+
+def minute_adds_margin(before_held: int, signed: int) -> bool:
+    """Эта минута увеличивает позицию, а не только сокращает её."""
+    return abs(before_held + signed) > abs(before_held)
+
+
 def fund_lots_to_sell(held: int, free_rub: float, price: float, lot: int, extra: float) -> int:
     """Сколько лотов фонда продать, чтобы свободных рублей хватило на обеспечение."""
     if held <= 0 or extra <= free_rub:
@@ -96,13 +111,14 @@ def fund_lots_to_sell(held: int, free_rub: float, price: float, lot: int, extra:
     return max(0, min(held, need))
 
 
-def fund_lots_to_buy(free_rub: float, price: float, lot: int) -> int:
-    """Сколько лотов фонда купить на свободные рубли, оставив запас на комиссию."""
+def fund_lots_to_buy(free_rub: float, price: float, lot: int, keep: float = 0.0) -> int:
+    """Сколько лотов фонда купить, оставив залог минутной сделки и запас на комиссию."""
     lot_cost = price * max(lot, 1)
     if lot_cost <= 0 or free_rub <= 0:
         return 0
+    spendable = free_rub - max(keep, 0.0)
     reserve = max(10.0, lot_cost * 0.005)
-    return max(0, int((free_rub - reserve) // lot_cost))
+    return max(0, int((spendable - reserve) // lot_cost))
 
 
 def _sell_fund(broker, request: RunRequest, when: datetime, extra: float) -> tuple[dict[str, object] | None, str | None]:
@@ -135,17 +151,19 @@ def _sell_fund(broker, request: RunRequest, when: datetime, extra: float) -> tup
     }, None
 
 
-def _buy_fund(broker, request: RunRequest, when: datetime) -> dict[str, object] | None:
-    """Купить фонд на свободные рубли. Ошибка покупки не останавливает фьючерс."""
+def _buy_fund(broker, request: RunRequest, when: datetime, instrument_uid: str) -> dict[str, object] | None:
+    """Купить фонд на рубли сверх залога минутной сделки. Ошибка не останавливает фьючерс."""
     if not request.cash_ticker:
         return None
     try:
         free = float(broker.free_rub(request.account_id))
-        if free <= 10:
+        margin = float(broker.margin(instrument_uid))
+        keep = cash_to_keep(request.fill_per_minute, margin)
+        if margin <= 0 or free <= keep:
             return None
         fund = broker.cash_fund(request.cash_ticker)
         price = float(broker.last_price(fund.uid))
-        lots = fund_lots_to_buy(free, price, fund.lot)
+        lots = fund_lots_to_buy(free, price, fund.lot, keep)
         if lots <= 0:
             return None
         order_id = make_cash_order_id(request.strategy, when)
@@ -205,7 +223,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["bars"] = len(bars)
         result["goal"] = goal
         result["ready"] = bool(state.get("ready"))
-        result["cash_order"] = _buy_fund(broker, request, moment)
+        result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
 
     broker_lots = int(broker.futures_position(request.account_id, front.uid))
@@ -230,7 +248,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["phase"] = "catchup"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
-        result["cash_order"] = _buy_fund(broker, request, moment)
+        result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
     if not fresh:
         store.save(key, state)
@@ -238,7 +256,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
         result["target"] = book.target
-        result["cash_order"] = _buy_fund(broker, request, moment)
+        result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
 
     state["bars"] = _merge_bars(list(state.get("bars") or []), [_bar(candle) for candle in fresh])
@@ -311,11 +329,11 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["held"] = book.held
         result["target"] = book.target
         result["bars"] = len(state["bars"])
-        result["cash_order"] = _buy_fund(broker, request, last.time)
+        result["cash_order"] = _buy_fund(broker, request, last.time, front.uid)
         return result
 
-    needed = extra_margin(int(before["held"]), int(book.target), margin)
-    cash_order, cash_error = _sell_fund(broker, request, last.time, needed)
+    keep = cash_to_keep(request.fill_per_minute, margin) if minute_adds_margin(int(before["held"]), signed) else 0.0
+    cash_order, cash_error = _sell_fund(broker, request, last.time, keep)
     if cash_error:
         restore_book(book, before)
         state["last_bar"] = stamp

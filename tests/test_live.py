@@ -30,8 +30,10 @@ from cnyrub.live.indicators import bar_levels
 from cnyrub.live.service import (
     extra_margin,
     following_day,
+    cash_to_keep,
     fund_lots_to_buy,
     fund_lots_to_sell,
+    minute_adds_margin,
     history_goal,
     make_order_id,
     run_minute,
@@ -43,7 +45,7 @@ ACCOUNT = "acc-short"
 
 
 def test_presets_match_the_researched_windows():
-    short, long, thirty, fortyfive = WINDOWS
+    short, long, thirty, fortyfive, sixty = WINDOWS
     assert PRESETS["short"].channel == short.channel == 525
     assert PRESETS["short"].exit_channel == short.exit_channel
     assert PRESETS["short"].stop_mult is None and short.stop_mult is None
@@ -82,6 +84,17 @@ def test_presets_match_the_researched_windows():
     assert parse_event(
         {"strategy": "fortyfive", "account_id": "1", "token": "t"}
     ).cash_ticker == "LQDT"
+    assert PRESETS["sixty"].channel == sixty.channel == 60
+    assert PRESETS["sixty"].exit_channel == 0
+    assert PRESETS["sixty"].stop_mult == sixty.stop_mult == 8
+    assert PRESETS["sixty"].clock_cap == 5
+    assert PRESETS["sixty"].eff_low is None and sixty.eff_low is None
+    assert PRESETS["sixty"].surge_cap is None and sixty.surge_cap is None
+    assert PRESETS["sixty"].leverage == sixty.leverage == 5
+    assert sixty.cash == 100_000
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t"}
+    ).fill_per_minute == 10
 
 
 def test_levels_match_channel_view():
@@ -516,7 +529,8 @@ def test_smaller_pace_is_the_order_size():
 
 def test_free_cash_buys_the_money_fund_when_futures_stay_flat():
     broker = FakeBroker()
-    broker.free_value = 5_000.0
+    # 10 лотов × залог 5 000 × 1,5 = 75 000 остаются в рублях. Сверх них — фонд.
+    broker.free_value = 80_000.0
     broker.fund_price = 100.0
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
@@ -558,21 +572,48 @@ def test_fund_is_sold_before_the_futures_order_that_needs_margin():
     broker.fill_price = 10.8
     filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
     assert [item["uid"] for item in broker.orders] == ["fund-1", broker.instrument.uid]
-    assert broker.orders[0]["signed"] == -95_000
+    assert broker.orders[0]["signed"] == -75_000
     assert broker.orders[0]["order_id"] == "short-c-202609281006"
     assert filled["order"]["signed"] == 10
-    assert filled["cash_order"]["signed"] == -95_000
+    assert filled["cash_order"]["signed"] == -75_000
     assert broker.lots == 10
-    assert broker.fund_lots_value == 5_000
+    assert broker.fund_lots_value == 25_000
+
+
+def test_minute_margin_already_in_cash_skips_the_fund_sale():
+    broker = FakeBroker()
+    broker.fund_lots_value = 1_000
+    broker.free_value = 0.0
+    broker.fund_price = 1.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker.free_value = 80_000.0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["order"]["signed"] == 10
+    assert filled["cash_order"] is None
+    assert broker.fund_lots_value == 1_000
+    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid]
 
 
 def test_reducing_a_future_does_not_sell_the_fund():
     assert extra_margin(10, 0, 5_000) == 0
     assert extra_margin(0, 19, 5_000) == 95_000
-    assert fund_lots_to_sell(100_000, 0, 1, 1, 95_000) == 95_000
-    assert fund_lots_to_sell(10, 0, 1, 1, 95_000) == 10
-    assert fund_lots_to_sell(100, 95_000, 1, 1, 95_000) == 0
+    assert minute_adds_margin(10, -10) is False
+    assert minute_adds_margin(0, 10) is True
+    assert minute_adds_margin(2, -10) is True
+    assert cash_to_keep(10, 5_000) == 75_000
+    assert cash_to_keep(2, 5_000) == 15_000
+    assert fund_lots_to_sell(100_000, 0, 1, 1, 75_000) == 75_000
+    assert fund_lots_to_sell(10, 0, 1, 1, 75_000) == 10
+    assert fund_lots_to_sell(100, 75_000, 1, 1, 75_000) == 0
     assert fund_lots_to_buy(5_000, 100, 1) == 49
+    assert fund_lots_to_buy(80_000, 100, 1, 75_000) == 49
+    assert fund_lots_to_buy(75_000, 100, 1, 75_000) == 0
     assert fund_lots_to_buy(10, 100, 1) == 0
 
 
