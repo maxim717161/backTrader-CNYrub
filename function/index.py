@@ -1,8 +1,9 @@
 """Точка входа Yandex Cloud Functions.
 
-Архив — корень репозитория: каталоги function и src и файл requirements.txt.
-Туда не кладут .venv, data и tests. Точка входа: function.index.handler.
-Зависимости ставятся из requirements.txt (boto3). backtrader в функцию не входит.
+Готовый архив для Облака: yandex/cnyrub-function.zip.
+В нём точка входа function.index.handler, код живого счёта и requirements.txt.
+Исследования, минуток и тестов там нет. Зависимость одна: boto3.
+backtrader в функцию не входит. Пересобрать архив: python -m function.pack.
 
   yc serverless function version create \\
     --function-name cnyrub \\
@@ -10,7 +11,7 @@
     --entrypoint function.index.handler \\
     --memory 256m \\
     --execution-timeout 60s \\
-    --source-path . \\
+    --source-path yandex/cnyrub-function.zip \\
     --environment STATE_BUCKET=<бакет> \\
     --environment AWS_ACCESS_KEY_ID=<ключ> \\
     --environment AWS_SECRET_ACCESS_KEY=<секрет>

@@ -928,6 +928,32 @@ def test_order_id_is_stable_for_the_minute():
     assert make_order_id("long", moment) == "long-202609281006"
 
 
+def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
+    import zipfile
+
+    from function.pack import FILES, ZIP_PATH, build
+
+    fresh = tmp_path / "fresh.zip"
+    extract = tmp_path / "extract"
+    build(fresh)
+    with zipfile.ZipFile(fresh) as built, zipfile.ZipFile(ZIP_PATH) as stored:
+        assert built.namelist() == stored.namelist() == list(FILES)
+        for name in FILES:
+            assert built.read(name) == stored.read(name)
+            assert "backtest" not in name and "pandas" not in name
+        text = stored.read("requirements.txt").decode("utf-8")
+        assert "boto3" in text
+        assert "backtrader" not in text and "pandas" not in text
+        stored.extractall(extract)
+    code = (
+        "import function.index, sys; "
+        "assert callable(function.index.handler); "
+        "assert 'backtrader' not in sys.modules; "
+        "assert 'pandas' not in sys.modules"
+    )
+    subprocess.check_call([sys.executable, "-c", code], cwd=extract)
+
+
 def test_live_package_does_not_import_backtrader_or_pandas():
     code = (
         "import cnyrub.live.handler, cnyrub.live.service, cnyrub.engine; "
