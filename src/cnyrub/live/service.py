@@ -34,6 +34,8 @@ from cnyrub.live.state import StateStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
 FLATTEN_AT = time(23, 40)
+# В истории последняя вечерняя свеча — 23:49. Следующая минута уже другой день.
+SESSION_LAST = time(23, 49)
 # Сессия деривативов длиннее основной: утро с 06:50 и вечер до 23:50.
 SESSION_MINUTES = 18 * 60
 HISTORY_WALKS = 90
@@ -54,16 +56,28 @@ def history_goal(params) -> int:
     return goal
 
 
+def _next_weekday(day: date) -> date:
+    """Следующий день торгов. Субботу и воскресенье перешагиваем."""
+    nxt = day + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt
+
+
 def following_day(bar_time: datetime, last_day: date) -> date | None:
     """День следующей минуты для движка.
 
-    До последнего дня передаём дату самой свечи: вход до trade_from закрыт,
-    потому что эта дата раньше начала торговли. В последний день после 23:40
-    остаток можно снять целиком, раньше — по десять контрактов в минуту.
+    До 23:49 это дата самой свечи. С вечерней 23:49 следующая минута — уже
+    следующий торговый день, поэтому сигнал перед экспирацией не открывает
+    сделку утром последнего дня, а сигнал перед trade_from открывает.
+    В последний день после 23:40 остаток снимается целиком, раньше — по
+    десять контрактов в минуту.
     """
     local = bar_time.astimezone(MSK)
     if local.date() == last_day and local.time() >= FLATTEN_AT:
         return None
+    if local.time() >= SESSION_LAST:
+        return _next_weekday(local.date())
     return local.date()
 
 
@@ -106,7 +120,7 @@ def fund_lots_to_sell(held: int, free_rub: float, price: float, lot: int, extra:
         return 0
     lot_cost = price * max(lot, 1)
     if lot_cost <= 0:
-        return held
+        return 0
     need = math.ceil((extra - free_rub) / lot_cost)
     return max(0, min(held, need))
 
@@ -132,6 +146,8 @@ def _sell_fund(broker, request: RunRequest, when: datetime, extra: float) -> tup
         price = float(broker.last_price(fund.uid)) if held > 0 else 0.0
     except Exception:
         return None, "фонд не прочитан"
+    if held > 0 and price <= 0:
+        return None, "нет цены фонда"
     lots = fund_lots_to_sell(held, free, price, fund.lot, extra)
     if lots <= 0:
         return None, None
@@ -228,7 +244,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
 
     broker_lots = int(broker.futures_position(request.account_id, front.uid))
     if request.reconcile:
-        _adopt_position(book, broker, request.account_id, front, broker_lots)
+        _adopt_position(book, broker, request, front, broker_lots, list(state.get("bars") or []))
         state["halted"] = None
         state["book"] = export_book(book)
         store.save(key, state)
@@ -379,6 +395,12 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         "executed": report.executed,
         "price": price,
     }
+    # Продажу фонда в эту минуту не перекупаем. Свободные рубли сверх залога
+    # минутной сделки паркуем после сокращения позиции.
+    if cash_order is None:
+        parked = _buy_fund(broker, request, last.time, front.uid)
+        if parked is not None:
+            result["cash_order"] = parked
     return result
 
 
@@ -513,7 +535,16 @@ def _candle_from_bar(bar: dict[str, object], moment: datetime) -> Candle:
     )
 
 
-def _adopt_position(book: _FillBook, broker, account_id: str, front: Instrument, lots: int) -> None:
+def _adopt_position(
+    book: _FillBook,
+    broker,
+    request: RunRequest,
+    front: Instrument,
+    lots: int,
+    bars: list[dict[str, object]],
+) -> None:
+    """Принять позицию брокера и заново поставить стоп, если своего уже нет."""
+    same_side = lots == 0 or book.held == 0 or (book.held > 0) == (lots > 0)
     book.secid = front.secid
     book.held = lots
     book.target = lots
@@ -524,10 +555,42 @@ def _adopt_position(book: _FillBook, broker, account_id: str, front: Instrument,
         book.stop_dist = None
         book.target = 0
         book.base = 0
+        book.entry_i = None
+        book.peak = 0
+        book.opened = 0
         return
-    price = broker.position_price(account_id, front.uid)
+    price = broker.position_price(request.account_id, front.uid)
     if price is not None:
         book.avg = float(price)
+    if book.avg and (book.stop_px is None or not same_side):
+        _install_stop(book, request, bars)
+    if book.base == 0 or not same_side:
+        book.base = lots
+    if book.entry_i is None or not same_side:
+        book.entry_i = max(len(bars) - 1, 0)
+    if book.peak < abs(lots):
+        book.peak = abs(lots)
+    if book.opened < abs(lots):
+        book.opened = abs(lots)
+
+
+def _install_stop(book: _FillBook, request: RunRequest, bars: list[dict[str, object]]) -> None:
+    """Стоп от цены позиции: фиксированные рубли или медианы минутного диапазона."""
+    params = request.params
+    if params.stop_rub:
+        book.stop_dist = params.stop_rub / 1000.0
+    elif params.stop_mult:
+        window = bars[-params.channel :] if params.channel > 0 else bars
+        ranges = [float(bar["h"]) - float(bar["l"]) for bar in window if "h" in bar and "l" in bar]
+        if not ranges:
+            return
+        ordered = sorted(ranges)
+        mid = len(ordered) // 2
+        median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        book.stop_dist = params.stop_mult * median
+    else:
+        return
+    book._sync_stop()
 
 
 def _halt(

@@ -160,6 +160,20 @@ def test_thirty_window_skips_a_loud_or_crooked_breakout():
     assert _signal_book(surge_vol=float("nan")).target == 39
 
 
+def test_boundary_straightness_and_exact_surge_still_enter():
+    assert _signal_book(drift=0.15, path=1.0).target == 39
+    assert _signal_book(drift=0.5, path=1.0).target == 39
+    assert _signal_book(volume=150.0, surge_vol=50.0).target == 39
+    assert _signal_book(volume=150.01, surge_vol=50.0).target == 0
+
+
+def test_leverage_cannot_ask_for_more_contracts_than_margin_covers():
+    capped = _signal_book(leverage=5.0, margin=5_000.0, eff_low=None, eff_high=None, surge_cap=None)
+    assert capped.target == 20
+    blocked = _signal_book(close=0.0, prior_high=-1.0, prior_low=-2.0)
+    assert blocked.target == 0
+
+
 def test_thirty_rules_match_in_backtrader_and_the_simulator():
     frame = _stop_frame()
     kwargs = dict(

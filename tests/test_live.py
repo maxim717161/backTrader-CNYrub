@@ -380,11 +380,19 @@ class FakeBroker:
         if uid == self.fund.uid:
             if executed == abs(signed):
                 self.fund_lots_value += signed
+                self.free_value -= signed * self.fund_price * max(self.fund.lot, 1)
             return FillReport(order_id, abs(signed), executed, self.fund_price)
+        before = self.lots
         if executed == abs(signed):
             self.lots += signed
         elif executed:
             self.lots += int(signed / abs(signed) * executed)
+        if before * self.lots < 0:
+            self.free_value += abs(before) * self.margin_value
+            self.free_value -= abs(self.lots) * self.margin_value
+        else:
+            self.free_value += max(0, abs(before) - abs(self.lots)) * self.margin_value
+            self.free_value -= max(0, abs(self.lots) - abs(before)) * self.margin_value
         return FillReport(order_id, abs(signed), executed, self.fill_price)
 
 
@@ -615,6 +623,7 @@ def test_reducing_a_future_does_not_sell_the_fund():
     assert fund_lots_to_buy(80_000, 100, 1, 75_000) == 49
     assert fund_lots_to_buy(75_000, 100, 1, 75_000) == 0
     assert fund_lots_to_buy(10, 100, 1) == 0
+    assert fund_lots_to_sell(100, 0, 0, 1, 75_000) == 0
 
 
 def test_cash_fund_parser_keeps_lqdt_and_tmon():
@@ -656,6 +665,10 @@ def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
     assert book["held"] == 4
     assert book["target"] == 4
     assert book["avg"] == pytest.approx(11.5)
+    assert book["stop_dist"] == pytest.approx(0.285)
+    assert book["stop_px"] == pytest.approx(11.5 - 0.285)
+    assert book["entry_i"] == 4
+    assert book["base"] == 4
     assert broker.orders == []
 
 
@@ -723,11 +736,86 @@ def test_two_accounts_keep_separate_state():
     assert state_key("short", "one") != state_key("long", "two")
 
 
+def test_missing_fund_price_halts_without_selling_the_fund():
+    broker = FakeBroker()
+    broker.fund_lots_value = 1_000
+    broker.free_value = 0.0
+    broker.fund_price = 0.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert halted["phase"] == "halted"
+    assert halted["halted"] == "нет цены фонда"
+    assert broker.fund_lots_value == 1_000
+    assert broker.lots == 0
+    assert broker.orders == []
+
+
+def test_closing_a_future_parks_the_freed_rubles():
+    broker = FakeBroker()
+    broker.lots = 10
+    broker.free_value = 80_000.0
+    broker.fund_price = 100.0
+    broker.margin_value = 5_000.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = 10
+    book.target = 10
+    book.avg = 10.0
+    book.stop_dist = 0.2
+    book.stop_px = 9.8
+    book.base = 10
+    book.entry_i = 1
+    _ready(store, _quiet_bars(start, 5), export_book(book))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    assert result["order"]["signed"] == -10
+    assert result["cash_order"]["signed"] == 549
+    assert broker.lots == 0
+    assert broker.fund_lots_value == 549
+    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid, "fund-1"]
+
+
+def test_last_evening_bar_does_not_open_into_expiry():
+    broker = FakeBroker()
+    broker.instrument = Instrument("CRZ6", "uid-1", "FUT", date(2026, 6, 16), date(2026, 9, 29), 1000)
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 23, 40, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    broker._candles.append(_candle(datetime(2026, 9, 28, 23, 49, tzinfo=MSK), 10.4, high=10.45, low=10.3, volume=200))
+    result = run_minute(_request(), broker, store, now=datetime(2026, 9, 28, 23, 50, tzinfo=MSK))
+    assert result["order"] is None
+    assert result["target"] == 0
+    assert broker.orders == []
+
+    earlier = FakeBroker()
+    earlier.instrument = broker.instrument
+    earlier_store = MemoryStore()
+    _ready(earlier_store, _quiet_bars(start, 5))
+    earlier._candles.append(_candle(datetime(2026, 9, 28, 23, 48, tzinfo=MSK), 10.4, high=10.45, low=10.3, volume=200))
+    opened = run_minute(_request(), earlier, earlier_store, now=datetime(2026, 9, 28, 23, 49, tzinfo=MSK))
+    assert opened["phase"] == "signal"
+    assert opened["target"] != 0
+
+
 def test_following_day_flattens_only_at_the_end_of_expiry():
     last = date(2026, 12, 15)
     assert following_day(datetime(2026, 12, 15, 23, 39, tzinfo=MSK), last) == last
     assert following_day(datetime(2026, 12, 15, 23, 40, tzinfo=MSK), last) is None
-    assert following_day(datetime(2026, 12, 14, 23, 50, tzinfo=MSK), last) == date(2026, 12, 14)
+    assert following_day(datetime(2026, 12, 15, 23, 49, tzinfo=MSK), last) is None
+    assert following_day(datetime(2026, 12, 14, 23, 48, tzinfo=MSK), last) == date(2026, 12, 14)
+    # 23:49 — последняя свеча вечера, следующая минута уже день экспирации.
+    assert following_day(datetime(2026, 12, 14, 23, 49, tzinfo=MSK), last) == last
+    # Пятница 11 декабря: следующая сессия — понедельник 14-го, не суббота.
+    monday = date(2026, 12, 14)
+    assert following_day(datetime(2026, 12, 11, 23, 49, tzinfo=MSK), last) == monday
+    assert following_day(datetime(2026, 12, 11, 23, 49, tzinfo=MSK), monday) == monday
 
 
 def test_reprice_open_add_reduce_and_close():
