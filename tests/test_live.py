@@ -19,6 +19,7 @@ from cnyrub.live.broker import (
     Instrument,
     choose_front,
     margin_rub,
+    api_error_text,
     parse_candle,
     TinkoffClient,
     parse_cash_fund,
@@ -30,6 +31,7 @@ from cnyrub.live.config import PRESETS, parse_event
 from cnyrub.live.handler import handle, read_lockbox_token
 from cnyrub.live.indicators import bar_levels
 from cnyrub.live.service import (
+    _buy_fund,
     extra_margin,
     following_day,
     cash_to_keep,
@@ -387,6 +389,7 @@ class FakeBroker:
         self.executed: int | None = None
         self.fail = False
         self.futures_calls = 0
+        self.market_open = True
 
     def cny_futures(self):
         self.futures_calls += 1
@@ -421,6 +424,9 @@ class FakeBroker:
 
     def fund_lots(self, account_id, uid, lot):
         return self.fund_lots_value
+
+    def market_orders_open(self, uid):
+        return self.market_open
 
     def market_order(self, account_id, uid, signed, order_id):
         self.orders.append({"signed": signed, "order_id": order_id, "account": account_id, "uid": uid})
@@ -566,6 +572,28 @@ def test_a_quiet_repeat_does_not_rewrite_the_bucket():
     assert second["order"] is None
     assert store.saves == writes
     assert broker.futures_calls == 1
+
+
+def test_closed_fund_market_is_not_a_failed_buy():
+    assert api_error_text(400, '{"message":"instrument not available for trading"}') == (
+        "instrument not available for trading"
+    )
+    assert api_error_text(400, "") == "HTTP 400"
+    broker = FakeBroker()
+    broker.market_open = False
+    broker.free_value = 10_000
+    broker.fund_price = 100
+    broker.margin_value = 100
+    result = _buy_fund(
+        {},
+        broker,
+        _request(fill_per_minute=1),
+        datetime(2026, 10, 3, 0, 30, tzinfo=MSK),
+        "uid-1",
+        date(2026, 10, 3),
+    )
+    assert result is None
+    assert broker.orders == []
 
 
 def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():

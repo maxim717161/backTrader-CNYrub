@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from cnyrub.contracts import Contract, front_windows
@@ -361,6 +362,16 @@ class TinkoffClient:
         payload = self._call("OperationsService", "GetPortfolio", {"accountId": account_id, "currency": "RUB"})
         return quotation(payload.get("totalAmountPortfolio"))
 
+    def market_orders_open(self, uid: str) -> bool:
+        """Рыночная заявка сейчас принимается. Ночью и в выходные у фонда флаг ложный."""
+        payload = self._call("MarketDataService", "GetTradingStatus", {"instrumentId": uid})
+        if payload.get("apiTradeAvailableFlag") is False:
+            return False
+        flag = payload.get("marketOrderAvailableFlag")
+        if flag is None:
+            return True
+        return bool(flag)
+
     def market_order(self, account_id: str, uid: str, signed: int, order_id: str) -> FillReport:
         if signed == 0:
             raise ValueError("пустая заявка")
@@ -423,6 +434,22 @@ def _timestamp(value: object) -> datetime:
     return moment
 
 
+def api_error_text(status: int, body: str) -> str:
+    """Текст из тела ответа биржи. Голый код HTTP не объясняет отказ."""
+    raw = body.strip()
+    try:
+        payload = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("description")
+        if message:
+            return " ".join(str(message).split())
+    if raw:
+        return " ".join(raw.split())[:180]
+    return f"HTTP {status}"
+
+
 def _urllib_post(url: str, body: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
     data = json.dumps(body).encode("utf-8")
     request = Request(
@@ -431,5 +458,9 @@ def _urllib_post(url: str, body: dict[str, object], headers: dict[str, str]) -> 
         headers={**headers, "Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = api_error_text(exc.code, exc.read().decode("utf-8", errors="replace"))
+        raise RuntimeError(detail) from exc
