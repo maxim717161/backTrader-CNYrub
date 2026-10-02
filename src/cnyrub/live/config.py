@@ -290,7 +290,7 @@ def _cash_ticker(value: object) -> str | None:
     """Фонд денежного рынка на свободные рубли. Пустое значение выключает его."""
     if value is None:
         return None
-    text = str(value).strip().upper()
+    text = str(value).strip().upper().rstrip("@")
     if text in {"", "NONE", "OFF", "0"}:
         return None
     if text not in {"LQDT", "TMON"}:

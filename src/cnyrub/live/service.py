@@ -184,8 +184,9 @@ def _buy_fund(broker, request: RunRequest, when: datetime, instrument_uid: str) 
             return None
         order_id = make_cash_order_id(request.strategy, when)
         report = broker.market_order(request.account_id, fund.uid, lots, order_id)
-    except Exception:
-        return {"error": "фонд не куплен"}
+    except Exception as exc:
+        detail = " ".join(str(exc).split()) or "неизвестная ошибка"
+        return {"error": f"фонд не куплен: {detail[:180]}"}
     if report.executed != lots:
         return {"error": f"фонд куплен не целиком: {report.executed} из {lots}"}
     return {

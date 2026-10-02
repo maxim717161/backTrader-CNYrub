@@ -200,15 +200,26 @@ def parse_fill(payload: dict[str, object], fallback_id: str) -> FillReport:
     )
 
 
+_FUND_NAMES = {"LQDT", "TMON"}
+# TQTF — доска Мосбиржи. SPBRU — тот же пай в Т-Инвестициях, тикер с @ на конце.
+_FUND_CLASSES = {"TQTF", "SPBRU"}
+
+
+def fund_name(ticker: str) -> str:
+    """LQDT и TMON. Хвост @ в названии приложения не меняет фонд."""
+    return ticker.strip().upper().rstrip("@")
+
+
 def parse_cash_fund(row: dict[str, object], ticker: str) -> CashFund | None:
-    """Биржевой фонд LQDT или TMON с класса TQTF."""
-    if str(row.get("ticker") or "").upper() != ticker.upper():
+    """Биржевой фонд LQDT или TMON: доска TQTF либо режим Т-Инвестиций SPBRU."""
+    wanted = fund_name(ticker)
+    if wanted not in _FUND_NAMES or fund_name(str(row.get("ticker") or "")) != wanted:
         return None
     kind = str(row.get("instrumentType") or row.get("instrumentKind") or "").lower()
     if kind and "etf" not in kind:
         return None
-    class_code = str(row.get("classCode") or "")
-    if class_code and class_code != "TQTF":
+    class_code = str(row.get("classCode") or "").upper()
+    if class_code and class_code not in _FUND_CLASSES:
         return None
     uid = str(row.get("uid") or "")
     if not uid:
@@ -219,7 +230,7 @@ def parse_cash_fund(row: dict[str, object], ticker: str) -> CashFund | None:
         return None
     if lot < 1:
         return None
-    return CashFund(ticker=ticker.upper(), uid=uid, lot=lot)
+    return CashFund(ticker=wanted, uid=uid, lot=lot)
 
 
 def margin_rub(payload: dict[str, object]) -> float:
@@ -300,13 +311,22 @@ class TinkoffClient:
         return None
 
     def cash_fund(self, ticker: str) -> CashFund:
-        payload = self._call("InstrumentsService", "FindInstrument", {"query": ticker})
-        for row in payload.get("instruments") or []:
-            if isinstance(row, dict):
-                fund = parse_cash_fund(row, ticker)
-                if fund is not None:
-                    return fund
-        raise RuntimeError(f"нет фонда {ticker}")
+        wanted = fund_name(ticker)
+        for query in (f"{wanted}@", wanted):
+            payload = self._call("InstrumentsService", "FindInstrument", {"query": query})
+            found: list[tuple[int, CashFund]] = []
+            for row in payload.get("instruments") or []:
+                if not isinstance(row, dict):
+                    continue
+                fund = parse_cash_fund(row, wanted)
+                if fund is None:
+                    continue
+                class_code = str(row.get("classCode") or "").upper()
+                found.append((0 if class_code == "SPBRU" else 1, fund))
+            if found:
+                found.sort(key=lambda item: item[0])
+                return found[0][1]
+        raise RuntimeError(f"нет фонда {wanted}")
 
     def last_price(self, uid: str) -> float:
         payload = self._call("MarketDataService", "GetLastPrices", {"instrumentId": [uid]})

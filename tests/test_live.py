@@ -20,6 +20,7 @@ from cnyrub.live.broker import (
     choose_front,
     margin_rub,
     parse_candle,
+    TinkoffClient,
     parse_cash_fund,
     parse_fill,
     parse_instrument,
@@ -682,10 +683,31 @@ def test_cash_fund_parser_keeps_lqdt_and_tmon():
     }
     assert parse_cash_fund(lqdt, "LQDT") == CashFund("LQDT", "uid-lqdt", 1)
     assert parse_cash_fund({**lqdt, "ticker": "TMON", "uid": "uid-tmon"}, "TMON").uid == "uid-tmon"
+    tmon_at = {**lqdt, "ticker": "TMON@", "uid": "uid-tmon-at", "classCode": "SPBRU"}
+    assert parse_cash_fund(tmon_at, "TMON") == CashFund("TMON", "uid-tmon-at", 1)
+    assert parse_cash_fund(tmon_at, "TMON@") == CashFund("TMON", "uid-tmon-at", 1)
     assert parse_cash_fund({**lqdt, "ticker": "SBER"}, "LQDT") is None
     assert parse_cash_fund({**lqdt, "classCode": "TQBR"}, "LQDT") is None
     with pytest.raises(ValueError):
         parse_event({"strategy": "short", "account_id": "1", "token": "t", "cash_ticker": "SBER"})
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t", "cash_ticker": "TMON@"}
+    ).cash_ticker == "TMON"
+
+    queries: list[str] = []
+
+    def transport(url, body, headers):
+        queries.append(body["query"])
+        return {
+            "instruments": [
+                {**lqdt, "ticker": "TMON", "uid": "uid-moex"},
+                tmon_at,
+            ]
+        }
+
+    fund = TinkoffClient("token", transport).cash_fund("TMON")
+    assert queries == ["TMON@"]
+    assert fund.uid == "uid-tmon-at"
 
 
 def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
