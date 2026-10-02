@@ -302,7 +302,15 @@ def test_quotation_margin_candle_and_front_contract():
     )
     assert instrument is not None
     assert instrument.lsttrade == date(2026, 12, 15)
+    assert instrument.lot == 1000
+    broker_lot = parse_instrument(
+        {**_row(), "lot": 1, "basicAssetSize": {"units": "1000", "nano": 0}}
+    )
+    assert broker_lot is not None and broker_lot.lot == 1000 and broker_lot.secid == "CRZ6"
+    assert parse_instrument({**_row(), "lot": 1, "basicAsset": "CNYRUB"}) is not None
     assert parse_instrument({**_row(), "ticker": "CNYRUBF"}) is None
+    assert parse_instrument({**_row(), "lot": 1, "basicAsset": "UCNY"}) is None
+    assert parse_instrument({**_row(), "lot": 10}) is None
     previous = Instrument("CRU6", "uid-0", "", date(2026, 3, 17), date(2026, 6, 15), 1000)
     front, trade_from = choose_front([previous, instrument], date(2026, 9, 28))
     assert front.secid == "CRZ6"

@@ -83,21 +83,21 @@ def trading_date(value: object) -> date:
 
 
 def parse_instrument(row: dict[str, object]) -> Instrument | None:
-    """Квартальный фьючерс CNY/RUB, лот 1000, код CR и буква месяца."""
+    """Квартальный фьючерс CNY/RUB: код CR и буква месяца, контракт на 1000 юаней.
+
+    В ответе брокера lot чаще всего равен 1 — это один контракт в заявке.
+    Тысяча юаней приходит в basicAssetSize. Старые ответы писали 1000 прямо в lot.
+    """
     ticker = str(row.get("ticker") or "")
     if _TICKER.match(ticker) is None:
         return None
     class_code = row.get("classCode")
     if class_code not in (None, "SPBFUT"):
         return None
-    try:
-        lot = int(row.get("lot") or 0)
-    except (TypeError, ValueError):
-        return None
-    if lot != 1000:
-        return None
     asset = str(row.get("basicAsset") or "").upper()
-    if "CNY" not in asset or "UCNY" in asset or "MOEX" in asset:
+    if asset and ("CNY" not in asset or "UCNY" in asset or "MOEX" in asset):
+        return None
+    if not _cny_contract(row):
         return None
     uid = str(row.get("uid") or "")
     if not uid:
@@ -115,8 +115,20 @@ def parse_instrument(row: dict[str, object]) -> Instrument | None:
         figi=str(row.get("figi") or ""),
         frsttrade=frsttrade,
         lsttrade=lsttrade,
-        lot=lot,
+        lot=1000,
     )
+
+
+def _cny_contract(row: dict[str, object]) -> bool:
+    """Контракт на 1000 юаней: так пишет биржа либо в lot, либо в basicAssetSize."""
+    try:
+        api_lot = int(row.get("lot") or 0)
+    except (TypeError, ValueError):
+        return False
+    size = quotation(row.get("basicAssetSize"))
+    if api_lot == 1000 or size == 1000:
+        return True
+    return api_lot == 1 and size in (0, 1000)
 
 
 def choose_front(instruments: list[Instrument], today: date) -> tuple[Instrument, date]:
@@ -236,6 +248,8 @@ class TinkoffClient:
                 item = parse_instrument(row)
                 if item is not None:
                     found.append(item)
+        if not found:
+            raise RuntimeError("биржа не вернула фьючерсы CNY/RUB")
         return found
 
     def candles(self, uid: str, start: datetime, end: datetime) -> list[Candle]:
