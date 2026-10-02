@@ -234,6 +234,12 @@ def parse_cash_fund(row: dict[str, object], ticker: str) -> CashFund | None:
     return CashFund(ticker=wanted, uid=uid, lot=lot)
 
 
+def offers_in_book(payload: dict[str, object]) -> bool:
+    """Покупке есть о что удариться. Пустые заявки на продажу — стакан для нас пуст."""
+    asks = payload.get("asks") or []
+    return isinstance(asks, list) and len(asks) > 0
+
+
 def margin_rub(payload: dict[str, object]) -> float:
     """Большее из ГО на покупку и на продажу, чтобы хватало в обе стороны."""
     buy = quotation(payload.get("initialMarginOnBuy"))
@@ -362,15 +368,10 @@ class TinkoffClient:
         payload = self._call("OperationsService", "GetPortfolio", {"accountId": account_id, "currency": "RUB"})
         return quotation(payload.get("totalAmountPortfolio"))
 
-    def market_orders_open(self, uid: str) -> bool:
-        """Рыночная заявка сейчас принимается. Ночью и в выходные у фонда флаг ложный."""
-        payload = self._call("MarketDataService", "GetTradingStatus", {"instrumentId": uid})
-        if payload.get("apiTradeAvailableFlag") is False:
-            return False
-        flag = payload.get("marketOrderAvailableFlag")
-        if flag is None:
-            return True
-        return bool(flag)
+    def book_has_offers(self, uid: str) -> bool:
+        """В стакане есть продажа. Пустой стакан — торгов нет, заявку не ставим."""
+        payload = self._call("MarketDataService", "GetOrderBook", {"instrumentId": uid, "depth": 1})
+        return offers_in_book(payload)
 
     def market_order(self, account_id: str, uid: str, signed: int, order_id: str) -> FillReport:
         if signed == 0:

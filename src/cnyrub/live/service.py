@@ -205,7 +205,7 @@ def _buy_fund(
         lots = fund_lots_to_buy(free, price, fund.lot, keep)
         if lots <= 0:
             return None
-        if not broker.market_orders_open(fund.uid):
+        if not broker.book_has_offers(fund.uid):
             return None
         order_id = make_cash_order_id(request.strategy, when)
         report = broker.market_order(request.account_id, fund.uid, lots, order_id)

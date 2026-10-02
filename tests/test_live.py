@@ -20,6 +20,7 @@ from cnyrub.live.broker import (
     choose_front,
     margin_rub,
     api_error_text,
+    offers_in_book,
     parse_candle,
     TinkoffClient,
     parse_cash_fund,
@@ -425,7 +426,7 @@ class FakeBroker:
     def fund_lots(self, account_id, uid, lot):
         return self.fund_lots_value
 
-    def market_orders_open(self, uid):
+    def book_has_offers(self, uid):
         return self.market_open
 
     def market_order(self, account_id, uid, signed, order_id):
@@ -579,6 +580,9 @@ def test_closed_fund_market_is_not_a_failed_buy():
         "instrument not available for trading"
     )
     assert api_error_text(400, "") == "HTTP 400"
+    assert offers_in_book({"bids": [], "asks": []}) is False
+    assert offers_in_book({"bids": [{"price": {"units": "165"}}], "asks": []}) is False
+    assert offers_in_book({"bids": [], "asks": [{"price": {"units": "165"}}]}) is True
     broker = FakeBroker()
     broker.market_open = False
     broker.free_value = 10_000
