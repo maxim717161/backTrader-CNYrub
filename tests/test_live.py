@@ -386,8 +386,10 @@ class FakeBroker:
         self.fill_price: float | None = None
         self.executed: int | None = None
         self.fail = False
+        self.futures_calls = 0
 
     def cny_futures(self):
+        self.futures_calls += 1
         return [self.instrument]
 
     def candles(self, uid, start, end):
@@ -519,12 +521,19 @@ def test_history_loads_one_day_and_does_not_order_until_the_next_call():
     assert broker.orders == []
 
 
+def test_every_window_keeps_ten_sessions_past_its_own_goal():
+    extra = 10 * 18 * 60
+    for params in PRESETS.values():
+        assert bars_to_keep(params) == history_goal(params) + extra
+    assert bars_to_keep(PRESETS["long"]) > bars_to_keep(PRESETS["sixty"])
+    assert bars_to_keep(PRESETS["short"]) == bars_to_keep(PRESETS["sixty"])
+
+
 def test_stored_minutes_stop_at_the_window():
-    assert bars_to_keep(PRESETS["sixty"]) == 8 * 18 * 60
     broker = FakeBroker()
     store = MemoryStore()
     start = datetime(2026, 9, 1, 10, 0, tzinfo=MSK)
-    count = 3000
+    count = 11_000
     book = export_book(_FillBook("CRZ6", 100_000.0))
     book["entry_i"] = 100
     _ready(store, _quiet_bars(start, count), book)
@@ -532,14 +541,31 @@ def test_stored_minutes_stop_at_the_window():
     broker._candles.append(_candle(fresh, 10.0))
     result = run_minute(_request(), broker, store, now=fresh + timedelta(minutes=1))
     saved = store.load(state_key("short", ACCOUNT))
-    keep = 5 + 2 * 18 * 60
+    keep = 5 + 10 * 18 * 60
     assert result["bars"] == keep
     assert len(saved["bars"]) == keep
-    assert saved["bars"][-1]["t"] == fresh.isoformat()
-    assert saved["bars"][0]["t"] == (start + timedelta(minutes=count + 1 - keep)).isoformat()
+    assert saved["bars"][-1][0] == fresh.isoformat()
+    assert saved["bars"][0][0] == (start + timedelta(minutes=count + 1 - keep)).isoformat()
+    assert saved["bars"][-1][1:5] == [10.0, 10.0, 10.0, 10.0]
     dropped = count + 1 - keep
     assert saved["book"]["entry_i"] == 100 - dropped
     assert (keep - 1) - saved["book"]["entry_i"] == count - 100
+
+
+def test_a_quiet_repeat_does_not_rewrite_the_bucket():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    now = start + timedelta(minutes=6)
+    first = run_minute(_request(), broker, store, now=now)
+    assert first["phase"] == "idle"
+    writes = store.saves
+    second = run_minute(_request(), broker, store, now=now)
+    assert second["phase"] == "idle"
+    assert second["order"] is None
+    assert store.saves == writes
+    assert broker.futures_calls == 1
 
 
 def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():
@@ -561,7 +587,7 @@ def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():
     assert second["phase"] == "hold"
     assert second["order"] is None
     assert broker.orders == []
-    assert any(bar["t"].startswith("2026-09-25T12:00") for bar in store.load(state_key("short", ACCOUNT))["bars"])
+    assert any(bar[0].startswith("2026-09-25T12:00") for bar in store.load(state_key("short", ACCOUNT))["bars"])
 
 
 def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():

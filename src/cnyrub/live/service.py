@@ -5,7 +5,7 @@
 уже после того, как окно собрано. Пропущенные минуты дописываются в канал и
 проверяются на стоп, шаг считается только по последней закрытой свече, и на
 фьючерс уходит не больше одного рыночного ордера. В бакете остаётся окно
-индикаторов и две сессии сверху, более старые минутки стираются.
+индикаторов и десять сессий сверху, более старые минутки стираются.
 
 Свободные рубли всех окон покупают фонд денежного рынка. Залог на сделку
 этой минуты — fill_per_minute лотов — остаётся в рублях и с запасом в половину.
@@ -28,9 +28,9 @@ from cnyrub.engine import (
     restore_book,
     step_minute,
 )
-from cnyrub.live.broker import Candle, Instrument, choose_front
+from cnyrub.live.broker import Candle, CashFund, Instrument, choose_front
 from cnyrub.live.config import RunRequest
-from cnyrub.live.indicators import bar_levels
+from cnyrub.live.indicators import bar_get, bar_levels
 from cnyrub.live.state import StateStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -41,8 +41,9 @@ SESSION_LAST = time(23, 49)
 SESSION_MINUTES = 18 * 60
 HISTORY_WALKS = 90
 CATCHUP_DAYS = 3
-# Две лишние сессии сверх окна: длинные выходные не должны съедать пять объёмов той же минуты.
-KEEP_EXTRA_SESSIONS = 2
+# Десять сессий сверх окна. Новогодние и майские выходные длятся больше недели,
+# а день перед праздником часто короче обычной сессии.
+KEEP_EXTRA_SESSIONS = 10
 TRADE_KEEP = 30
 # Запас сверх залога на минутную сделку: в рублях лежит полтора таких залога.
 CASH_MARGIN_BUFFER = 1.5
@@ -144,12 +145,18 @@ def fund_lots_to_buy(free_rub: float, price: float, lot: int, keep: float = 0.0)
     return max(0, int((spendable - reserve) // lot_cost))
 
 
-def _sell_fund(broker, request: RunRequest, when: datetime, extra: float) -> tuple[dict[str, object] | None, str | None]:
+def _sell_fund(
+    state: dict[str, object],
+    broker,
+    request: RunRequest,
+    when: datetime,
+    extra: float,
+) -> tuple[dict[str, object] | None, str | None]:
     """Продать фонд перед заявкой. Второй элемент — причина остановиться."""
     if not request.cash_ticker or extra <= 0:
         return None, None
     try:
-        fund = broker.cash_fund(request.cash_ticker)
+        fund = _cash_instrument(state, broker, request.cash_ticker)
         held = int(broker.fund_lots(request.account_id, fund.uid, fund.lot))
         free = float(broker.free_rub(request.account_id))
         price = float(broker.last_price(fund.uid)) if held > 0 else 0.0
@@ -176,17 +183,24 @@ def _sell_fund(broker, request: RunRequest, when: datetime, extra: float) -> tup
     }, None
 
 
-def _buy_fund(broker, request: RunRequest, when: datetime, instrument_uid: str) -> dict[str, object] | None:
+def _buy_fund(
+    state: dict[str, object],
+    broker,
+    request: RunRequest,
+    when: datetime,
+    instrument_uid: str,
+    today: date,
+) -> dict[str, object] | None:
     """Купить фонд на рубли сверх залога минутной сделки. Ошибка не останавливает фьючерс."""
     if not request.cash_ticker:
         return None
     try:
         free = float(broker.free_rub(request.account_id))
-        margin = float(broker.margin(instrument_uid))
+        margin = _margin(state, broker, instrument_uid, today, refresh=False)
         keep = cash_to_keep(request.fill_per_minute, margin)
         if margin <= 0 or free <= keep:
             return None
-        fund = broker.cash_fund(request.cash_ticker)
+        fund = _cash_instrument(state, broker, request.cash_ticker)
         price = float(broker.last_price(fund.uid))
         lots = fund_lots_to_buy(free, price, fund.lot, keep)
         if lots <= 0:
@@ -222,7 +236,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["phase"] = "halted"
         return result
 
-    front, trade_from = choose_front_safe(broker.cny_futures(), moment.date())
+    front, trade_from = _resolve_front(state, broker, moment.date())
     result["secid"] = front.secid
     if _adopt_instrument(state, front, trade_from) == "halt":
         return _halt(state, store, key, result, "контракт сменился, пока позиция ещё открыта", None, request.params)
@@ -239,18 +253,18 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         if enough:
             state["ready"] = True
             if bars:
-                state["last_bar"] = bars[-1]["t"]
+                state["last_bar"] = str(bar_get(bars[-1], "t"))
         elif walked >= HISTORY_WALKS:
             state["book"] = export_book(book)
             return _halt(state, store, key, result, "не хватает минуток, чтобы собрать окно", book, request.params)
         _trim_bars(state, book, request.params)
+        result["cash_order"] = _buy_fund(state, broker, request, moment, front.uid, moment.date())
         state["book"] = export_book(book)
         store.save(key, state)
         result["phase"] = "history"
         result["bars"] = len(state.get("bars") or [])
         result["goal"] = goal
         result["ready"] = bool(state.get("ready"))
-        result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
 
     broker_lots = int(broker.futures_position(request.account_id, front.uid))
@@ -275,25 +289,32 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             request.params,
         )
 
-    if book.held == 0:
-        book.equity = float(broker.equity(request.account_id))
-
+    sync_before = state.get("sync_from")
+    bars_before = len(state.get("bars") or [])
     fresh = _fresh_candles(state, broker, front.uid, moment)
     if fresh is None:
+        result["cash_order"] = _buy_fund(state, broker, request, moment, front.uid, moment.date())
         _save_trimmed(state, store, key, book, request.params)
         result["phase"] = "catchup"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
-        result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
     if not fresh:
-        _save_trimmed(state, store, key, book, request.params)
+        book_changed = _trim_bars(state, book, request.params)
+        result["cash_order"] = _buy_fund(state, broker, request, moment, front.uid, moment.date())
+        moved = state.get("sync_from") != sync_before or len(state.get("bars") or []) != bars_before
+        if book_changed or moved:
+            if book_changed:
+                state["book"] = export_book(book)
+            store.save(key, state)
         result["phase"] = "idle"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
         result["target"] = book.target
-        result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
+
+    if book.held == 0:
+        book.equity = float(broker.equity(request.account_id))
 
     state["bars"] = _merge_bars(list(state.get("bars") or []), [_bar(candle) for candle in fresh])
     if len(fresh) > 1:
@@ -303,7 +324,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
                 book.reason = "stop"
                 break
 
-    margin = float(broker.margin(front.uid))
+    margin = _margin(state, broker, front.uid, moment.date(), refresh=True)
     if margin <= 0:
         return _halt(state, store, key, result, "биржа не вернула гарантийное обеспечение", book, request.params)
 
@@ -360,17 +381,17 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     if signed == 0:
         state["last_bar"] = stamp
         _trim_bars(state, book, request.params)
+        result["cash_order"] = _buy_fund(state, broker, request, last.time, front.uid, moment.date())
         state["book"] = export_book(book)
         store.save(key, state)
         result["phase"] = "signal" if book.target != book.held else "hold"
         result["held"] = book.held
         result["target"] = book.target
         result["bars"] = len(state["bars"])
-        result["cash_order"] = _buy_fund(broker, request, last.time, front.uid)
         return result
 
     keep = cash_to_keep(request.fill_per_minute, margin) if minute_adds_margin(int(before["held"]), signed) else 0.0
-    cash_order, cash_error = _sell_fund(broker, request, last.time, keep)
+    cash_order, cash_error = _sell_fund(state, broker, request, last.time, keep)
     if cash_error:
         restore_book(book, before)
         state["last_bar"] = stamp
@@ -406,8 +427,6 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             pass
     state["last_bar"] = stamp
     _trim_bars(state, book, request.params)
-    state["book"] = export_book(book)
-    store.save(key, state)
     result["phase"] = "order"
     result["held"] = book.held
     result["target"] = book.target
@@ -421,14 +440,69 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     # Продажу фонда в эту минуту не перекупаем. Свободные рубли сверх залога
     # минутной сделки паркуем после сокращения позиции.
     if cash_order is None:
-        parked = _buy_fund(broker, request, last.time, front.uid)
+        parked = _buy_fund(state, broker, request, last.time, front.uid, moment.date())
         if parked is not None:
             result["cash_order"] = parked
+    state["book"] = export_book(book)
+    store.save(key, state)
     return result
 
 
 def choose_front_safe(instruments: list[Instrument], today: date) -> tuple[Instrument, date]:
     return choose_front(instruments, today)
+
+
+def _resolve_front(state: dict[str, object], broker, today: date) -> tuple[Instrument, date]:
+    """Взять уже записанный контракт, пока он не истёк. Список фьючерсов тяжёлый."""
+    current = state.get("instrument")
+    if isinstance(current, dict):
+        try:
+            lsttrade = date.fromisoformat(str(current["lsttrade"]))
+            trade_from = date.fromisoformat(str(current["trade_from"]))
+            frsttrade = date.fromisoformat(str(current["frsttrade"]))
+        except (KeyError, TypeError, ValueError):
+            lsttrade = None
+        else:
+            uid = str(current.get("uid") or "")
+            secid = str(current.get("secid") or "")
+            checked = state.get("front_checked") == today.isoformat()
+            if uid and secid and checked and today <= lsttrade:
+                return (
+                    Instrument(secid, uid, str(current.get("figi") or ""), frsttrade, lsttrade, 1000),
+                    trade_from,
+                )
+    front, trade_from = choose_front_safe(broker.cny_futures(), today)
+    state["front_checked"] = today.isoformat()
+    return front, trade_from
+
+
+def _margin(state: dict[str, object], broker, uid: str, today: date, *, refresh: bool) -> float:
+    """ГО на сегодня. Перед заявкой на фьючерс читаем заново, иначе берём запись."""
+    raw = state.get("margin")
+    day = today.isoformat()
+    if not refresh and isinstance(raw, dict) and raw.get("uid") == uid and raw.get("day") == day:
+        value = float(raw.get("value") or 0)
+        if value > 0:
+            return value
+    value = float(broker.margin(uid))
+    if value > 0:
+        state["margin"] = {"uid": uid, "value": value, "day": day}
+    return value
+
+
+def _cash_instrument(state: dict[str, object], broker, ticker: str) -> CashFund:
+    """Uid фонда не меняется. Повторный поиск по тикеру не нужен."""
+    raw = state.get("cash_fund")
+    if isinstance(raw, dict) and str(raw.get("ticker") or "") == ticker and raw.get("uid"):
+        try:
+            lot = int(raw.get("lot") or 1)
+        except (TypeError, ValueError):
+            lot = 1
+        if lot >= 1:
+            return CashFund(ticker, str(raw["uid"]), lot)
+    fund = broker.cash_fund(ticker)
+    state["cash_fund"] = {"ticker": fund.ticker, "uid": fund.uid, "lot": fund.lot}
+    return fund
 
 
 def _empty_state(request: RunRequest) -> dict[str, object]:
@@ -503,6 +577,7 @@ def _fresh_candles(state: dict[str, object], broker, uid: str, now: datetime) ->
     """
     bars = list(state.get("bars") or [])
     cursor = _sync_cursor(state, bars, now) - timedelta(minutes=2)
+    added = False
     for _ in range(CATCHUP_DAYS):
         if cursor >= now - timedelta(minutes=1):
             break
@@ -517,10 +592,13 @@ def _fresh_candles(state: dict[str, object], broker, uid: str, now: datetime) ->
             for candle in downloaded
             if cursor <= candle.time.astimezone(MSK) < end
         ]
+        before = len(bars)
         bars = _merge_bars(bars, extra)
+        added = added or len(bars) != before
         cursor = end
     state["bars"] = bars
-    state["sync_from"] = cursor.isoformat()
+    if added or _sync_is_stale(state, cursor, now):
+        state["sync_from"] = cursor.isoformat()
     if cursor < now - timedelta(minutes=2):
         return None
     last_raw = state.get("last_bar")
@@ -528,33 +606,45 @@ def _fresh_candles(state: dict[str, object], broker, uid: str, now: datetime) ->
         return []
     last_dt = datetime.fromisoformat(last_raw)
     pending: list[Candle] = []
-    for bar in bars:
-        moment = datetime.fromisoformat(str(bar["t"]))
-        if moment > last_dt:
-            pending.append(_candle_from_bar(bar, moment))
+    for bar in reversed(bars):
+        moment = datetime.fromisoformat(str(bar_get(bar, "t")))
+        if moment <= last_dt:
+            break
+        pending.append(_candle_from_bar(bar, moment))
+    pending.reverse()
     return pending
 
 
-def _sync_cursor(state: dict[str, object], bars: list[dict[str, object]], now: datetime) -> datetime:
+def _sync_is_stale(state: dict[str, object], cursor: datetime, now: datetime) -> bool:
+    """Тихая минута не двигает курсор. Иначе файл переписывается каждые шестьдесят секунд."""
+    previous = state.get("sync_from")
+    if not isinstance(previous, str):
+        return True
+    if cursor < now - timedelta(minutes=2):
+        return True
+    return cursor - datetime.fromisoformat(previous) > timedelta(hours=1)
+
+
+def _sync_cursor(state: dict[str, object], bars: list[object], now: datetime) -> datetime:
     raw = state.get("sync_from")
     if isinstance(raw, str):
         return datetime.fromisoformat(raw)
     if bars:
-        return datetime.fromisoformat(str(bars[-1]["t"]))
+        return datetime.fromisoformat(str(bar_get(bars[-1], "t")))
     last = state.get("last_bar")
     if isinstance(last, str):
         return datetime.fromisoformat(last)
     return now - timedelta(days=1)
 
 
-def _candle_from_bar(bar: dict[str, object], moment: datetime) -> Candle:
+def _candle_from_bar(bar: object, moment: datetime) -> Candle:
     return Candle(
         time=moment,
-        open=float(bar["o"]),
-        high=float(bar["h"]),
-        low=float(bar["l"]),
-        close=float(bar["c"]),
-        volume=float(bar["v"]),
+        open=float(bar_get(bar, "o")),
+        high=float(bar_get(bar, "h")),
+        low=float(bar_get(bar, "l")),
+        close=float(bar_get(bar, "c")),
+        volume=float(bar_get(bar, "v")),
     )
 
 
@@ -604,7 +694,7 @@ def _install_stop(book: _FillBook, request: RunRequest, bars: list[dict[str, obj
         book.stop_dist = params.stop_rub / 1000.0
     elif params.stop_mult:
         window = bars[-params.channel :] if params.channel > 0 else bars
-        ranges = [float(bar["h"]) - float(bar["l"]) for bar in window if "h" in bar and "l" in bar]
+        ranges = [float(bar_get(bar, "h")) - float(bar_get(bar, "l")) for bar in window]
         if not ranges:
             return
         ordered = sorted(ranges)
@@ -674,10 +764,23 @@ def _bar(candle: Candle) -> dict[str, object]:
     }
 
 
-def _merge_bars(existing: list[dict[str, object]], extra: list[dict[str, object]]) -> list[dict[str, object]]:
-    by_time = {str(bar["t"]): bar for bar in existing}
+def _merge_bars(existing: list[object], extra: list[object]) -> list[object]:
+    if not extra:
+        return existing
+    if existing and all(str(bar_get(bar, "t")) > str(bar_get(existing[-1], "t")) for bar in extra):
+        merged = list(existing)
+        previous = str(bar_get(merged[-1], "t"))
+        for bar in sorted(extra, key=lambda item: str(bar_get(item, "t"))):
+            stamp = str(bar_get(bar, "t"))
+            if stamp == previous:
+                merged[-1] = bar
+            else:
+                merged.append(bar)
+            previous = stamp
+        return merged
+    by_time = {str(bar_get(bar, "t")): bar for bar in existing}
     for bar in extra:
-        by_time[str(bar["t"])] = bar
+        by_time[str(bar_get(bar, "t"))] = bar
     return [by_time[key] for key in sorted(by_time)]
 
 
