@@ -14,7 +14,17 @@ from cnyrub.engine import CLOCK_DAYS, SURGE_BARS, SURGE_MIN_PERIODS
 from cnyrub.live.config import StrategyParams
 
 
-def bar_levels(bars: list[dict[str, object]], params: StrategyParams, clock_days: int = CLOCK_DAYS) -> dict[str, float]:
+_BAR_INDEX = {"t": 0, "o": 1, "h": 2, "l": 3, "c": 4, "v": 5}
+
+
+def bar_get(bar: object, name: str) -> object:
+    """Поле свечи. В памяти это словарь, в бакете — список из шести чисел."""
+    if isinstance(bar, dict):
+        return bar[name]
+    return bar[_BAR_INDEX[name]]
+
+
+def bar_levels(bars: list[object], params: StrategyParams, clock_days: int = CLOCK_DAYS) -> dict[str, float]:
     """Уровни для последнего бара. Неполное окно даёт NaN и entry_ready 0."""
     nan = float("nan")
     levels = {
@@ -52,9 +62,9 @@ def _window(bars: list[dict[str, object]], length: int) -> tuple[float, float, f
     if length <= 0 or len(bars) < length + 1:
         return nan, nan, nan, nan, False
     window = bars[-(length + 1) : -1]
-    highs = [float(bar["h"]) for bar in window]
-    lows = [float(bar["l"]) for bar in window]
-    volumes = [float(bar["v"]) for bar in window]
+    highs = [float(bar_get(bar, "h")) for bar in window]
+    lows = [float(bar_get(bar, "l")) for bar in window]
+    volumes = [float(bar_get(bar, "v")) for bar in window]
     ranges = [high - low for high, low in zip(highs, lows)]
     return max(highs), min(lows), statistics.median(volumes), statistics.median(ranges), True
 
@@ -63,15 +73,17 @@ def _clock_volume(bars: list[dict[str, object]], lookback: int) -> float:
     """Медиана объёма той же минуты суток по предыдущим lookback наблюдениям."""
     if lookback <= 0 or len(bars) < 2:
         return float("nan")
-    minute = _minute_of_day(str(bars[-1]["t"]))
-    seen = [
-        float(bar["v"])
-        for bar in bars[:-1]
-        if _minute_of_day(str(bar["t"])) == minute
-    ]
+    minute = _minute_of_day(str(bar_get(bars[-1], "t")))
+    seen: list[float] = []
+    for bar in reversed(bars[:-1]):
+        if _minute_of_day(str(bar_get(bar, "t"))) != minute:
+            continue
+        seen.append(float(bar_get(bar, "v")))
+        if len(seen) == lookback:
+            break
     if len(seen) < lookback:
         return float("nan")
-    return float(statistics.median(seen[-lookback:]))
+    return float(statistics.median(seen))
 
 
 def _surge_volume(bars: list[dict[str, object]]) -> float:
@@ -81,7 +93,7 @@ def _surge_volume(bars: list[dict[str, object]]) -> float:
     window = bars[-(SURGE_BARS + 1) : -1] if len(bars) > SURGE_BARS else bars[:-1]
     if len(window) < SURGE_MIN_PERIODS:
         return float("nan")
-    return float(statistics.median(float(bar["v"]) for bar in window))
+    return float(statistics.median(float(bar_get(bar, "v")) for bar in window))
 
 
 def _straight_path(bars: list[dict[str, object]], channel: int) -> tuple[float, float]:
@@ -89,7 +101,7 @@ def _straight_path(bars: list[dict[str, object]], channel: int) -> tuple[float, 
     nan = float("nan")
     if channel <= 0 or len(bars) <= channel:
         return nan, nan
-    closes = [float(bar["c"]) for bar in bars[-(channel + 1) :]]
+    closes = [float(bar_get(bar, "c")) for bar in bars[-(channel + 1) :]]
     drift = closes[-1] - closes[0]
     path = sum(abs(closes[index + 1] - closes[index]) for index in range(channel))
     return drift, path

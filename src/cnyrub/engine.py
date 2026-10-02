@@ -309,20 +309,25 @@ def step_minute(
         if not path > 0 or drift != drift:
             return
         efficiency = side * drift / path
-        if not eff_low <= efficiency < eff_high:
+        if not eff_low <= efficiency <= eff_high:
             return
     if (
         surge_cap is not None
         and surge_vol == surge_vol
         and surge_vol > 0
         and surge_vol != float("inf")
-        and volume >= surge_cap * surge_vol
+        and volume > surge_cap * surge_vol
     ):
+        return
+    if close <= 0:
         return
     if leverage is not None and leverage > 0:
         if book.equity is None:
             raise ValueError("Для плеча нужен текущий счёт")
         lots = int(leverage * book.equity // (close * MULTIPLIER))
+        # Плечо считает контракты от цены. Залог не даёт взять больше, чем покрывает счёт.
+        if margin > 0:
+            lots = min(lots, int(book.equity // margin))
         if lots < 1:
             return
         book.stop_dist = None if stop_mult is None else stop_mult * prior_range

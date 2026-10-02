@@ -7,6 +7,22 @@ import os
 from typing import Protocol
 
 
+def compact_document(document: dict[str, object]) -> dict[str, object]:
+    """Свечи в бакете — списки из шести полей, без повторения имён на каждой минуте."""
+    bars = document.get("bars")
+    if not isinstance(bars, list) or not any(isinstance(bar, dict) for bar in bars):
+        return document
+    slim = dict(document)
+    slim["bars"] = [_compact_bar(bar) for bar in bars]
+    return slim
+
+
+def _compact_bar(bar: object) -> list[object]:
+    if isinstance(bar, dict):
+        return [bar["t"], bar["o"], bar["h"], bar["l"], bar["c"], bar["v"]]
+    return list(bar)
+
+
 def state_key(strategy: str, account_id: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in account_id)
     return f"state/{strategy}-{safe}.json"
@@ -23,6 +39,7 @@ class MemoryStore:
 
     def __init__(self) -> None:
         self.data: dict[str, dict[str, object]] = {}
+        self.saves = 0
 
     def load(self, key: str) -> dict[str, object] | None:
         document = self.data.get(key)
@@ -31,7 +48,8 @@ class MemoryStore:
         return json.loads(json.dumps(document))
 
     def save(self, key: str, document: dict[str, object]) -> None:
-        self.data[key] = json.loads(json.dumps(document))
+        self.saves += 1
+        self.data[key] = json.loads(json.dumps(compact_document(document), separators=(",", ":")))
 
 
 class ObjectStore:
@@ -59,7 +77,11 @@ class ObjectStore:
         return document
 
     def save(self, key: str, document: dict[str, object]) -> None:
-        body = json.dumps(document, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(
+            compact_document(document),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
         self._s3().put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="application/json")
 
     def _s3(self):

@@ -160,6 +160,20 @@ def test_thirty_window_skips_a_loud_or_crooked_breakout():
     assert _signal_book(surge_vol=float("nan")).target == 39
 
 
+def test_boundary_straightness_and_exact_surge_still_enter():
+    assert _signal_book(drift=0.15, path=1.0).target == 39
+    assert _signal_book(drift=0.5, path=1.0).target == 39
+    assert _signal_book(volume=150.0, surge_vol=50.0).target == 39
+    assert _signal_book(volume=150.01, surge_vol=50.0).target == 0
+
+
+def test_leverage_cannot_ask_for_more_contracts_than_margin_covers():
+    capped = _signal_book(leverage=5.0, margin=5_000.0, eff_low=None, eff_high=None, surge_cap=None)
+    assert capped.target == 20
+    blocked = _signal_book(close=0.0, prior_high=-1.0, prior_low=-2.0)
+    assert blocked.target == 0
+
+
 def test_thirty_rules_match_in_backtrader_and_the_simulator():
     frame = _stop_frame()
     kwargs = dict(
@@ -556,6 +570,10 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert WINDOWS[3].stop_mult == 8 and WINDOWS[3].clock_cap == 5
     assert WINDOWS[3].eff_low is None and WINDOWS[3].surge_cap is None
     assert WINDOWS[3].leverage == 4 and WINDOWS[3].cash == 100_000
+    assert WINDOWS[4].channel == 60 and WINDOWS[4].exit_channel == 0
+    assert WINDOWS[4].stop_mult == 8 and WINDOWS[4].clock_cap == 5
+    assert WINDOWS[4].eff_low is None and WINDOWS[4].surge_cap is None
+    assert WINDOWS[4].leverage == 5 and WINDOWS[4].cash == 100_000
 
 
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():

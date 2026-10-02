@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from cnyrub.contracts import Contract, front_windows
@@ -83,21 +84,21 @@ def trading_date(value: object) -> date:
 
 
 def parse_instrument(row: dict[str, object]) -> Instrument | None:
-    """Квартальный фьючерс CNY/RUB, лот 1000, код CR и буква месяца."""
+    """Квартальный фьючерс CNY/RUB: код CR и буква месяца, контракт на 1000 юаней.
+
+    В ответе брокера lot чаще всего равен 1 — это один контракт в заявке.
+    Тысяча юаней приходит в basicAssetSize. Старые ответы писали 1000 прямо в lot.
+    """
     ticker = str(row.get("ticker") or "")
     if _TICKER.match(ticker) is None:
         return None
     class_code = row.get("classCode")
     if class_code not in (None, "SPBFUT"):
         return None
-    try:
-        lot = int(row.get("lot") or 0)
-    except (TypeError, ValueError):
-        return None
-    if lot != 1000:
-        return None
     asset = str(row.get("basicAsset") or "").upper()
-    if "CNY" not in asset or "UCNY" in asset or "MOEX" in asset:
+    if asset and ("CNY" not in asset or "UCNY" in asset or "MOEX" in asset):
+        return None
+    if not _cny_contract(row):
         return None
     uid = str(row.get("uid") or "")
     if not uid:
@@ -115,8 +116,20 @@ def parse_instrument(row: dict[str, object]) -> Instrument | None:
         figi=str(row.get("figi") or ""),
         frsttrade=frsttrade,
         lsttrade=lsttrade,
-        lot=lot,
+        lot=1000,
     )
+
+
+def _cny_contract(row: dict[str, object]) -> bool:
+    """Контракт на 1000 юаней: так пишет биржа либо в lot, либо в basicAssetSize."""
+    try:
+        api_lot = int(row.get("lot") or 0)
+    except (TypeError, ValueError):
+        return False
+    size = quotation(row.get("basicAssetSize"))
+    if api_lot == 1000 or size == 1000:
+        return True
+    return api_lot == 1 and size in (0, 1000)
 
 
 def choose_front(instruments: list[Instrument], today: date) -> tuple[Instrument, date]:
@@ -188,15 +201,26 @@ def parse_fill(payload: dict[str, object], fallback_id: str) -> FillReport:
     )
 
 
+_FUND_NAMES = {"LQDT", "TMON"}
+# TQTF — доска Мосбиржи. SPBRU — тот же пай в Т-Инвестициях, тикер с @ на конце.
+_FUND_CLASSES = {"TQTF", "SPBRU"}
+
+
+def fund_name(ticker: str) -> str:
+    """LQDT и TMON. Хвост @ в названии приложения не меняет фонд."""
+    return ticker.strip().upper().rstrip("@")
+
+
 def parse_cash_fund(row: dict[str, object], ticker: str) -> CashFund | None:
-    """Биржевой фонд LQDT или TMON с класса TQTF."""
-    if str(row.get("ticker") or "").upper() != ticker.upper():
+    """Биржевой фонд LQDT или TMON: доска TQTF либо режим Т-Инвестиций SPBRU."""
+    wanted = fund_name(ticker)
+    if wanted not in _FUND_NAMES or fund_name(str(row.get("ticker") or "")) != wanted:
         return None
     kind = str(row.get("instrumentType") or row.get("instrumentKind") or "").lower()
     if kind and "etf" not in kind:
         return None
-    class_code = str(row.get("classCode") or "")
-    if class_code and class_code != "TQTF":
+    class_code = str(row.get("classCode") or "").upper()
+    if class_code and class_code not in _FUND_CLASSES:
         return None
     uid = str(row.get("uid") or "")
     if not uid:
@@ -207,7 +231,13 @@ def parse_cash_fund(row: dict[str, object], ticker: str) -> CashFund | None:
         return None
     if lot < 1:
         return None
-    return CashFund(ticker=ticker.upper(), uid=uid, lot=lot)
+    return CashFund(ticker=wanted, uid=uid, lot=lot)
+
+
+def offers_in_book(payload: dict[str, object]) -> bool:
+    """Покупке есть о что удариться. Пустые заявки на продажу — стакан для нас пуст."""
+    asks = payload.get("asks") or []
+    return isinstance(asks, list) and len(asks) > 0
 
 
 def margin_rub(payload: dict[str, object]) -> float:
@@ -236,6 +266,8 @@ class TinkoffClient:
                 item = parse_instrument(row)
                 if item is not None:
                     found.append(item)
+        if not found:
+            raise RuntimeError("биржа не вернула фьючерсы CNY/RUB")
         return found
 
     def candles(self, uid: str, start: datetime, end: datetime) -> list[Candle]:
@@ -286,13 +318,22 @@ class TinkoffClient:
         return None
 
     def cash_fund(self, ticker: str) -> CashFund:
-        payload = self._call("InstrumentsService", "FindInstrument", {"query": ticker})
-        for row in payload.get("instruments") or []:
-            if isinstance(row, dict):
-                fund = parse_cash_fund(row, ticker)
-                if fund is not None:
-                    return fund
-        raise RuntimeError(f"нет фонда {ticker}")
+        wanted = fund_name(ticker)
+        for query in (f"{wanted}@", wanted):
+            payload = self._call("InstrumentsService", "FindInstrument", {"query": query})
+            found: list[tuple[int, CashFund]] = []
+            for row in payload.get("instruments") or []:
+                if not isinstance(row, dict):
+                    continue
+                fund = parse_cash_fund(row, wanted)
+                if fund is None:
+                    continue
+                class_code = str(row.get("classCode") or "").upper()
+                found.append((0 if class_code == "SPBRU" else 1, fund))
+            if found:
+                found.sort(key=lambda item: item[0])
+                return found[0][1]
+        raise RuntimeError(f"нет фонда {wanted}")
 
     def last_price(self, uid: str) -> float:
         payload = self._call("MarketDataService", "GetLastPrices", {"instrumentId": [uid]})
@@ -326,6 +367,11 @@ class TinkoffClient:
     def equity(self, account_id: str) -> float:
         payload = self._call("OperationsService", "GetPortfolio", {"accountId": account_id, "currency": "RUB"})
         return quotation(payload.get("totalAmountPortfolio"))
+
+    def book_has_offers(self, uid: str) -> bool:
+        """В стакане есть продажа. Пустой стакан — торгов нет, заявку не ставим."""
+        payload = self._call("MarketDataService", "GetOrderBook", {"instrumentId": uid, "depth": 1})
+        return offers_in_book(payload)
 
     def market_order(self, account_id: str, uid: str, signed: int, order_id: str) -> FillReport:
         if signed == 0:
@@ -389,6 +435,22 @@ def _timestamp(value: object) -> datetime:
     return moment
 
 
+def api_error_text(status: int, body: str) -> str:
+    """Текст из тела ответа биржи. Голый код HTTP не объясняет отказ."""
+    raw = body.strip()
+    try:
+        payload = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("description")
+        if message:
+            return " ".join(str(message).split())
+    if raw:
+        return " ".join(raw.split())[:180]
+    return f"HTTP {status}"
+
+
 def _urllib_post(url: str, body: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
     data = json.dumps(body).encode("utf-8")
     request = Request(
@@ -397,5 +459,9 @@ def _urllib_post(url: str, body: dict[str, object], headers: dict[str, str]) -> 
         headers={**headers, "Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = api_error_text(exc.code, exc.read().decode("utf-8", errors="replace"))
+        raise RuntimeError(detail) from exc

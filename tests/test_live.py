@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -18,7 +19,10 @@ from cnyrub.live.broker import (
     Instrument,
     choose_front,
     margin_rub,
+    api_error_text,
+    offers_in_book,
     parse_candle,
+    TinkoffClient,
     parse_cash_fund,
     parse_fill,
     parse_instrument,
@@ -28,10 +32,14 @@ from cnyrub.live.config import PRESETS, parse_event
 from cnyrub.live.handler import handle, read_lockbox_token
 from cnyrub.live.indicators import bar_levels
 from cnyrub.live.service import (
+    _buy_fund,
     extra_margin,
     following_day,
+    cash_to_keep,
     fund_lots_to_buy,
     fund_lots_to_sell,
+    minute_adds_margin,
+    bars_to_keep,
     history_goal,
     make_order_id,
     run_minute,
@@ -43,7 +51,7 @@ ACCOUNT = "acc-short"
 
 
 def test_presets_match_the_researched_windows():
-    short, long, thirty, fortyfive = WINDOWS
+    short, long, thirty, fortyfive, sixty = WINDOWS
     assert PRESETS["short"].channel == short.channel == 525
     assert PRESETS["short"].exit_channel == short.exit_channel
     assert PRESETS["short"].stop_mult is None and short.stop_mult is None
@@ -82,6 +90,17 @@ def test_presets_match_the_researched_windows():
     assert parse_event(
         {"strategy": "fortyfive", "account_id": "1", "token": "t"}
     ).cash_ticker == "LQDT"
+    assert PRESETS["sixty"].channel == sixty.channel == 60
+    assert PRESETS["sixty"].exit_channel == 0
+    assert PRESETS["sixty"].stop_mult == sixty.stop_mult == 8
+    assert PRESETS["sixty"].clock_cap == 5
+    assert PRESETS["sixty"].eff_low is None and sixty.eff_low is None
+    assert PRESETS["sixty"].surge_cap is None and sixty.surge_cap is None
+    assert PRESETS["sixty"].leverage == sixty.leverage == 5
+    assert sixty.cash == 100_000
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t"}
+    ).fill_per_minute == 10
 
 
 def test_levels_match_channel_view():
@@ -227,6 +246,43 @@ def test_parse_timer_envelope_and_direct_json():
     assert timer.params.channel == 525
 
 
+def test_parse_raw_string_bom_and_empty_body():
+    raw = '{"strategy":"sixty","account_id":"9","token":"t"}'
+    parsed = parse_event(raw)
+    assert parsed.strategy == "sixty"
+    assert parsed.account_id == "9"
+    assert parse_event("\ufeff" + raw).strategy == "sixty"
+    assert parse_event(raw.encode("utf-8")).strategy == "sixty"
+
+    with pytest.raises(ValueError, match="пустое"):
+        parse_event("")
+    with pytest.raises(ValueError, match="пустое"):
+        parse_event("   \n")
+    with pytest.raises(ValueError, match="не JSON"):
+        parse_event("not-json")
+
+
+def test_parse_https_invoke_envelope():
+    body = '{"strategy":"fortyfive","account_id":"3","secret_id":"box"}'
+    parsed = parse_event(
+        {
+            "httpMethod": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+            "isBase64Encoded": False,
+        }
+    )
+    assert parsed.strategy == "fortyfive"
+    assert parsed.secret_id == "box"
+
+    encoded = base64.b64encode(body.encode()).decode()
+    parsed_b64 = parse_event({"httpMethod": "POST", "headers": {}, "body": encoded, "isBase64Encoded": True})
+    assert parsed_b64.account_id == "3"
+
+    with pytest.raises(ValueError, match="пустое"):
+        parse_event({"httpMethod": "POST", "headers": {}, "body": "", "isBase64Encoded": False})
+
+
 def test_parse_requires_account_and_a_secret():
     with pytest.raises(ValueError):
         parse_event({"strategy": "short", "token": "t"})
@@ -289,7 +345,15 @@ def test_quotation_margin_candle_and_front_contract():
     )
     assert instrument is not None
     assert instrument.lsttrade == date(2026, 12, 15)
+    assert instrument.lot == 1000
+    broker_lot = parse_instrument(
+        {**_row(), "lot": 1, "basicAssetSize": {"units": "1000", "nano": 0}}
+    )
+    assert broker_lot is not None and broker_lot.lot == 1000 and broker_lot.secid == "CRZ6"
+    assert parse_instrument({**_row(), "lot": 1, "basicAsset": "CNYRUB"}) is not None
     assert parse_instrument({**_row(), "ticker": "CNYRUBF"}) is None
+    assert parse_instrument({**_row(), "lot": 1, "basicAsset": "UCNY"}) is None
+    assert parse_instrument({**_row(), "lot": 10}) is None
     previous = Instrument("CRU6", "uid-0", "", date(2026, 3, 17), date(2026, 6, 15), 1000)
     front, trade_from = choose_front([previous, instrument], date(2026, 9, 28))
     assert front.secid == "CRZ6"
@@ -325,8 +389,11 @@ class FakeBroker:
         self.fill_price: float | None = None
         self.executed: int | None = None
         self.fail = False
+        self.futures_calls = 0
+        self.market_open = True
 
     def cny_futures(self):
+        self.futures_calls += 1
         return [self.instrument]
 
     def candles(self, uid, start, end):
@@ -359,6 +426,9 @@ class FakeBroker:
     def fund_lots(self, account_id, uid, lot):
         return self.fund_lots_value
 
+    def book_has_offers(self, uid):
+        return self.market_open
+
     def market_order(self, account_id, uid, signed, order_id):
         self.orders.append({"signed": signed, "order_id": order_id, "account": account_id, "uid": uid})
         if self.fail:
@@ -367,11 +437,19 @@ class FakeBroker:
         if uid == self.fund.uid:
             if executed == abs(signed):
                 self.fund_lots_value += signed
+                self.free_value -= signed * self.fund_price * max(self.fund.lot, 1)
             return FillReport(order_id, abs(signed), executed, self.fund_price)
+        before = self.lots
         if executed == abs(signed):
             self.lots += signed
         elif executed:
             self.lots += int(signed / abs(signed) * executed)
+        if before * self.lots < 0:
+            self.free_value += abs(before) * self.margin_value
+            self.free_value -= abs(self.lots) * self.margin_value
+        else:
+            self.free_value += max(0, abs(before) - abs(self.lots)) * self.margin_value
+            self.free_value -= max(0, abs(self.lots) - abs(before)) * self.margin_value
         return FillReport(order_id, abs(signed), executed, self.fill_price)
 
 
@@ -450,6 +528,78 @@ def test_history_loads_one_day_and_does_not_order_until_the_next_call():
     assert broker.orders == []
 
 
+def test_every_window_keeps_ten_sessions_past_its_own_goal():
+    extra = 10 * 18 * 60
+    for params in PRESETS.values():
+        assert bars_to_keep(params) == history_goal(params) + extra
+    assert bars_to_keep(PRESETS["long"]) > bars_to_keep(PRESETS["sixty"])
+    assert bars_to_keep(PRESETS["short"]) == bars_to_keep(PRESETS["sixty"])
+
+
+def test_stored_minutes_stop_at_the_window():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 1, 10, 0, tzinfo=MSK)
+    count = 11_000
+    book = export_book(_FillBook("CRZ6", 100_000.0))
+    book["entry_i"] = 100
+    _ready(store, _quiet_bars(start, count), book)
+    fresh = start + timedelta(minutes=count)
+    broker._candles.append(_candle(fresh, 10.0))
+    result = run_minute(_request(), broker, store, now=fresh + timedelta(minutes=1))
+    saved = store.load(state_key("short", ACCOUNT))
+    keep = 5 + 10 * 18 * 60
+    assert result["bars"] == keep
+    assert len(saved["bars"]) == keep
+    assert saved["bars"][-1][0] == fresh.isoformat()
+    assert saved["bars"][0][0] == (start + timedelta(minutes=count + 1 - keep)).isoformat()
+    assert saved["bars"][-1][1:5] == [10.0, 10.0, 10.0, 10.0]
+    dropped = count + 1 - keep
+    assert saved["book"]["entry_i"] == 100 - dropped
+    assert (keep - 1) - saved["book"]["entry_i"] == count - 100
+
+
+def test_a_quiet_repeat_does_not_rewrite_the_bucket():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    now = start + timedelta(minutes=6)
+    first = run_minute(_request(), broker, store, now=now)
+    assert first["phase"] == "idle"
+    writes = store.saves
+    second = run_minute(_request(), broker, store, now=now)
+    assert second["phase"] == "idle"
+    assert second["order"] is None
+    assert store.saves == writes
+    assert broker.futures_calls == 1
+
+
+def test_closed_fund_market_is_not_a_failed_buy():
+    assert api_error_text(400, '{"message":"instrument not available for trading"}') == (
+        "instrument not available for trading"
+    )
+    assert api_error_text(400, "") == "HTTP 400"
+    assert offers_in_book({"bids": [], "asks": []}) is False
+    assert offers_in_book({"bids": [{"price": {"units": "165"}}], "asks": []}) is False
+    assert offers_in_book({"bids": [], "asks": [{"price": {"units": "165"}}]}) is True
+    broker = FakeBroker()
+    broker.market_open = False
+    broker.free_value = 10_000
+    broker.fund_price = 100
+    broker.margin_value = 100
+    result = _buy_fund(
+        {},
+        broker,
+        _request(fill_per_minute=1),
+        datetime(2026, 10, 3, 0, 30, tzinfo=MSK),
+        "uid-1",
+        date(2026, 10, 3),
+    )
+    assert result is None
+    assert broker.orders == []
+
+
 def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():
     broker = FakeBroker()
     store = MemoryStore()
@@ -469,7 +619,7 @@ def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():
     assert second["phase"] == "hold"
     assert second["order"] is None
     assert broker.orders == []
-    assert any(bar["t"].startswith("2026-09-25T12:00") for bar in store.load(state_key("short", ACCOUNT))["bars"])
+    assert any(bar[0].startswith("2026-09-25T12:00") for bar in store.load(state_key("short", ACCOUNT))["bars"])
 
 
 def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
@@ -516,7 +666,8 @@ def test_smaller_pace_is_the_order_size():
 
 def test_free_cash_buys_the_money_fund_when_futures_stay_flat():
     broker = FakeBroker()
-    broker.free_value = 5_000.0
+    # 10 лотов × залог 5 000 × 1,5 = 75 000 остаются в рублях. Сверх них — фонд.
+    broker.free_value = 80_000.0
     broker.fund_price = 100.0
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
@@ -558,22 +709,50 @@ def test_fund_is_sold_before_the_futures_order_that_needs_margin():
     broker.fill_price = 10.8
     filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
     assert [item["uid"] for item in broker.orders] == ["fund-1", broker.instrument.uid]
-    assert broker.orders[0]["signed"] == -95_000
+    assert broker.orders[0]["signed"] == -75_000
     assert broker.orders[0]["order_id"] == "short-c-202609281006"
     assert filled["order"]["signed"] == 10
-    assert filled["cash_order"]["signed"] == -95_000
+    assert filled["cash_order"]["signed"] == -75_000
     assert broker.lots == 10
-    assert broker.fund_lots_value == 5_000
+    assert broker.fund_lots_value == 25_000
+
+
+def test_minute_margin_already_in_cash_skips_the_fund_sale():
+    broker = FakeBroker()
+    broker.fund_lots_value = 1_000
+    broker.free_value = 0.0
+    broker.fund_price = 1.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker.free_value = 80_000.0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["order"]["signed"] == 10
+    assert filled["cash_order"] is None
+    assert broker.fund_lots_value == 1_000
+    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid]
 
 
 def test_reducing_a_future_does_not_sell_the_fund():
     assert extra_margin(10, 0, 5_000) == 0
     assert extra_margin(0, 19, 5_000) == 95_000
-    assert fund_lots_to_sell(100_000, 0, 1, 1, 95_000) == 95_000
-    assert fund_lots_to_sell(10, 0, 1, 1, 95_000) == 10
-    assert fund_lots_to_sell(100, 95_000, 1, 1, 95_000) == 0
+    assert minute_adds_margin(10, -10) is False
+    assert minute_adds_margin(0, 10) is True
+    assert minute_adds_margin(2, -10) is True
+    assert cash_to_keep(10, 5_000) == 75_000
+    assert cash_to_keep(2, 5_000) == 15_000
+    assert fund_lots_to_sell(100_000, 0, 1, 1, 75_000) == 75_000
+    assert fund_lots_to_sell(10, 0, 1, 1, 75_000) == 10
+    assert fund_lots_to_sell(100, 75_000, 1, 1, 75_000) == 0
     assert fund_lots_to_buy(5_000, 100, 1) == 49
+    assert fund_lots_to_buy(80_000, 100, 1, 75_000) == 49
+    assert fund_lots_to_buy(75_000, 100, 1, 75_000) == 0
     assert fund_lots_to_buy(10, 100, 1) == 0
+    assert fund_lots_to_sell(100, 0, 0, 1, 75_000) == 0
 
 
 def test_cash_fund_parser_keeps_lqdt_and_tmon():
@@ -586,10 +765,31 @@ def test_cash_fund_parser_keeps_lqdt_and_tmon():
     }
     assert parse_cash_fund(lqdt, "LQDT") == CashFund("LQDT", "uid-lqdt", 1)
     assert parse_cash_fund({**lqdt, "ticker": "TMON", "uid": "uid-tmon"}, "TMON").uid == "uid-tmon"
+    tmon_at = {**lqdt, "ticker": "TMON@", "uid": "uid-tmon-at", "classCode": "SPBRU"}
+    assert parse_cash_fund(tmon_at, "TMON") == CashFund("TMON", "uid-tmon-at", 1)
+    assert parse_cash_fund(tmon_at, "TMON@") == CashFund("TMON", "uid-tmon-at", 1)
     assert parse_cash_fund({**lqdt, "ticker": "SBER"}, "LQDT") is None
     assert parse_cash_fund({**lqdt, "classCode": "TQBR"}, "LQDT") is None
     with pytest.raises(ValueError):
         parse_event({"strategy": "short", "account_id": "1", "token": "t", "cash_ticker": "SBER"})
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t", "cash_ticker": "TMON@"}
+    ).cash_ticker == "TMON"
+
+    queries: list[str] = []
+
+    def transport(url, body, headers):
+        queries.append(body["query"])
+        return {
+            "instruments": [
+                {**lqdt, "ticker": "TMON", "uid": "uid-moex"},
+                tmon_at,
+            ]
+        }
+
+    fund = TinkoffClient("token", transport).cash_fund("TMON")
+    assert queries == ["TMON@"]
+    assert fund.uid == "uid-tmon-at"
 
 
 def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
@@ -615,6 +815,10 @@ def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
     assert book["held"] == 4
     assert book["target"] == 4
     assert book["avg"] == pytest.approx(11.5)
+    assert book["stop_dist"] == pytest.approx(0.285)
+    assert book["stop_px"] == pytest.approx(11.5 - 0.285)
+    assert book["entry_i"] == 4
+    assert book["base"] == 4
     assert broker.orders == []
 
 
@@ -682,11 +886,86 @@ def test_two_accounts_keep_separate_state():
     assert state_key("short", "one") != state_key("long", "two")
 
 
+def test_missing_fund_price_halts_without_selling_the_fund():
+    broker = FakeBroker()
+    broker.fund_lots_value = 1_000
+    broker.free_value = 0.0
+    broker.fund_price = 0.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert halted["phase"] == "halted"
+    assert halted["halted"] == "нет цены фонда"
+    assert broker.fund_lots_value == 1_000
+    assert broker.lots == 0
+    assert broker.orders == []
+
+
+def test_closing_a_future_parks_the_freed_rubles():
+    broker = FakeBroker()
+    broker.lots = 10
+    broker.free_value = 80_000.0
+    broker.fund_price = 100.0
+    broker.margin_value = 5_000.0
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = 10
+    book.target = 10
+    book.avg = 10.0
+    book.stop_dist = 0.2
+    book.stop_px = 9.8
+    book.base = 10
+    book.entry_i = 1
+    _ready(store, _quiet_bars(start, 5), export_book(book))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    assert result["order"]["signed"] == -10
+    assert result["cash_order"]["signed"] == 549
+    assert broker.lots == 0
+    assert broker.fund_lots_value == 549
+    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid, "fund-1"]
+
+
+def test_last_evening_bar_does_not_open_into_expiry():
+    broker = FakeBroker()
+    broker.instrument = Instrument("CRZ6", "uid-1", "FUT", date(2026, 6, 16), date(2026, 9, 29), 1000)
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 23, 40, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    broker._candles.append(_candle(datetime(2026, 9, 28, 23, 49, tzinfo=MSK), 10.4, high=10.45, low=10.3, volume=200))
+    result = run_minute(_request(), broker, store, now=datetime(2026, 9, 28, 23, 50, tzinfo=MSK))
+    assert result["order"] is None
+    assert result["target"] == 0
+    assert broker.orders == []
+
+    earlier = FakeBroker()
+    earlier.instrument = broker.instrument
+    earlier_store = MemoryStore()
+    _ready(earlier_store, _quiet_bars(start, 5))
+    earlier._candles.append(_candle(datetime(2026, 9, 28, 23, 48, tzinfo=MSK), 10.4, high=10.45, low=10.3, volume=200))
+    opened = run_minute(_request(), earlier, earlier_store, now=datetime(2026, 9, 28, 23, 49, tzinfo=MSK))
+    assert opened["phase"] == "signal"
+    assert opened["target"] != 0
+
+
 def test_following_day_flattens_only_at_the_end_of_expiry():
     last = date(2026, 12, 15)
     assert following_day(datetime(2026, 12, 15, 23, 39, tzinfo=MSK), last) == last
     assert following_day(datetime(2026, 12, 15, 23, 40, tzinfo=MSK), last) is None
-    assert following_day(datetime(2026, 12, 14, 23, 50, tzinfo=MSK), last) == date(2026, 12, 14)
+    assert following_day(datetime(2026, 12, 15, 23, 49, tzinfo=MSK), last) is None
+    assert following_day(datetime(2026, 12, 14, 23, 48, tzinfo=MSK), last) == date(2026, 12, 14)
+    # 23:49 — последняя свеча вечера, следующая минута уже день экспирации.
+    assert following_day(datetime(2026, 12, 14, 23, 49, tzinfo=MSK), last) == last
+    # Пятница 11 декабря: следующая сессия — понедельник 14-го, не суббота.
+    monday = date(2026, 12, 14)
+    assert following_day(datetime(2026, 12, 11, 23, 49, tzinfo=MSK), last) == monday
+    assert following_day(datetime(2026, 12, 11, 23, 49, tzinfo=MSK), monday) == monday
 
 
 def test_reprice_open_add_reduce_and_close():
@@ -797,6 +1076,32 @@ def test_order_id_is_stable_for_the_minute():
     moment = datetime(2026, 9, 28, 10, 6, tzinfo=MSK)
     assert make_order_id("long", moment) == make_order_id("long", moment)
     assert make_order_id("long", moment) == "long-202609281006"
+
+
+def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
+    import zipfile
+
+    from function.pack import FILES, ZIP_PATH, build
+
+    fresh = tmp_path / "fresh.zip"
+    extract = tmp_path / "extract"
+    build(fresh)
+    with zipfile.ZipFile(fresh) as built, zipfile.ZipFile(ZIP_PATH) as stored:
+        assert built.namelist() == stored.namelist() == list(FILES)
+        for name in FILES:
+            assert built.read(name) == stored.read(name)
+            assert "backtest" not in name and "pandas" not in name
+        text = stored.read("requirements.txt").decode("utf-8")
+        assert "boto3" in text
+        assert "backtrader" not in text and "pandas" not in text
+        stored.extractall(extract)
+    code = (
+        "import function.index, sys; "
+        "assert callable(function.index.handler); "
+        "assert 'backtrader' not in sys.modules; "
+        "assert 'pandas' not in sys.modules"
+    )
+    subprocess.check_call([sys.executable, "-c", code], cwd=extract)
 
 
 def test_live_package_does_not_import_backtrader_or_pandas():
