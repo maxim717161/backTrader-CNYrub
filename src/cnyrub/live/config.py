@@ -7,6 +7,7 @@ JSON либо как идентификатор секрета Lockbox в тай
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, replace
 
@@ -155,7 +156,7 @@ def preset(strategy: str) -> StrategyParams:
 
 
 def parse_event(event: object) -> RunRequest:
-    """Принять конверт таймера или сам JSON параметров."""
+    """Принять JSON параметров, конверт таймера или конверт HTTPS-вызова."""
     data = _payload(event)
     strategy = str(data.get("strategy") or "")
     params = preset(strategy)
@@ -204,25 +205,85 @@ def _apply_overrides(params: StrategyParams, data: dict[str, object]) -> Strateg
     return replace(params, **changes)
 
 
+_EMPTY_BODY = (
+    "тело запроса пустое: в тесте выберите шаблон «Без шаблона» и вставьте JSON "
+    "с полями strategy, account_id и token или secret_id"
+)
+_NOT_JSON = "тело запроса не JSON"
+_NOT_OBJECT = "событие должно быть JSON-объектом"
+_TIMER_PAYLOAD = "payload таймера должен быть JSON-объектом"
+
+
 def _payload(event: object) -> dict[str, object]:
-    if isinstance(event, str):
-        loaded = json.loads(event)
-    else:
+    loaded = _json_object(event)
+    if _is_http_event(loaded):
+        loaded = _json_object(_http_body(loaded))
+    return _unwrap_timer(loaded)
+
+
+def _json_object(event: object, *, empty: str = _EMPTY_BODY) -> dict[str, object]:
+    if isinstance(event, (str, bytes)):
+        text = _text_of(event)
+        if not text:
+            raise ValueError(empty)
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(_NOT_JSON) from exc
+    elif isinstance(event, dict):
         loaded = event
+    else:
+        raise ValueError(_NOT_OBJECT)
     if not isinstance(loaded, dict):
-        raise ValueError("событие должно быть JSON-объектом")
-    messages = loaded.get("messages")
-    if isinstance(messages, list) and messages:
-        details = messages[0].get("details") or {}
-        payload = details.get("payload")
-        if isinstance(payload, str):
-            parsed = json.loads(payload)
-        else:
-            parsed = payload
-        if not isinstance(parsed, dict):
-            raise ValueError("payload таймера должен быть JSON-объектом")
-        return parsed
+        raise ValueError(_NOT_OBJECT)
     return loaded
+
+
+def _text_of(value: str | bytes) -> str:
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError(_NOT_JSON) from exc
+    else:
+        text = value
+    return text.lstrip("\ufeff").strip()
+
+
+def _is_http_event(data: dict[str, object]) -> bool:
+    if "httpMethod" in data or "isBase64Encoded" in data:
+        return True
+    return "body" in data and "headers" in data
+
+
+def _http_body(data: dict[str, object]) -> object:
+    body = data.get("body")
+    if isinstance(body, str) and data.get("isBase64Encoded"):
+        if not body.strip():
+            raise ValueError(_EMPTY_BODY)
+        try:
+            body = base64.b64decode(body, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(_NOT_JSON) from exc
+    if body is None or (isinstance(body, (str, bytes)) and not _text_of(body)):
+        raise ValueError(_EMPTY_BODY)
+    return body
+
+
+def _unwrap_timer(loaded: dict[str, object]) -> dict[str, object]:
+    messages = loaded.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return loaded
+    first = messages[0]
+    details = first.get("details") if isinstance(first, dict) else None
+    if not isinstance(details, dict):
+        raise ValueError(_TIMER_PAYLOAD)
+    payload = details.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, (str, bytes)):
+        return _json_object(payload, empty=_TIMER_PAYLOAD)
+    raise ValueError(_TIMER_PAYLOAD)
 
 
 def _cash_ticker(value: object) -> str | None:

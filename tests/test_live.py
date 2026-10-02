@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -238,6 +239,43 @@ def test_parse_timer_envelope_and_direct_json():
     assert timer.token is None
     assert timer.fill_per_minute == 2
     assert timer.params.channel == 525
+
+
+def test_parse_raw_string_bom_and_empty_body():
+    raw = '{"strategy":"sixty","account_id":"9","token":"t"}'
+    parsed = parse_event(raw)
+    assert parsed.strategy == "sixty"
+    assert parsed.account_id == "9"
+    assert parse_event("\ufeff" + raw).strategy == "sixty"
+    assert parse_event(raw.encode("utf-8")).strategy == "sixty"
+
+    with pytest.raises(ValueError, match="пустое"):
+        parse_event("")
+    with pytest.raises(ValueError, match="пустое"):
+        parse_event("   \n")
+    with pytest.raises(ValueError, match="не JSON"):
+        parse_event("not-json")
+
+
+def test_parse_https_invoke_envelope():
+    body = '{"strategy":"fortyfive","account_id":"3","secret_id":"box"}'
+    parsed = parse_event(
+        {
+            "httpMethod": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "body": body,
+            "isBase64Encoded": False,
+        }
+    )
+    assert parsed.strategy == "fortyfive"
+    assert parsed.secret_id == "box"
+
+    encoded = base64.b64encode(body.encode()).decode()
+    parsed_b64 = parse_event({"httpMethod": "POST", "headers": {}, "body": encoded, "isBase64Encoded": True})
+    assert parsed_b64.account_id == "3"
+
+    with pytest.raises(ValueError, match="пустое"):
+        parse_event({"httpMethod": "POST", "headers": {}, "body": "", "isBase64Encoded": False})
 
 
 def test_parse_requires_account_and_a_secret():
