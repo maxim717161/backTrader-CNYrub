@@ -36,6 +36,7 @@ from cnyrub.live.service import (
     fund_lots_to_buy,
     fund_lots_to_sell,
     minute_adds_margin,
+    bars_to_keep,
     history_goal,
     make_order_id,
     run_minute,
@@ -516,6 +517,29 @@ def test_history_loads_one_day_and_does_not_order_until_the_next_call():
     assert third["phase"] == "signal"
     assert third["target"] != 0
     assert broker.orders == []
+
+
+def test_stored_minutes_stop_at_the_window():
+    assert bars_to_keep(PRESETS["sixty"]) == 8 * 18 * 60
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 1, 10, 0, tzinfo=MSK)
+    count = 3000
+    book = export_book(_FillBook("CRZ6", 100_000.0))
+    book["entry_i"] = 100
+    _ready(store, _quiet_bars(start, count), book)
+    fresh = start + timedelta(minutes=count)
+    broker._candles.append(_candle(fresh, 10.0))
+    result = run_minute(_request(), broker, store, now=fresh + timedelta(minutes=1))
+    saved = store.load(state_key("short", ACCOUNT))
+    keep = 5 + 2 * 18 * 60
+    assert result["bars"] == keep
+    assert len(saved["bars"]) == keep
+    assert saved["bars"][-1]["t"] == fresh.isoformat()
+    assert saved["bars"][0]["t"] == (start + timedelta(minutes=count + 1 - keep)).isoformat()
+    dropped = count + 1 - keep
+    assert saved["book"]["entry_i"] == 100 - dropped
+    assert (keep - 1) - saved["book"]["entry_i"] == count - 100
 
 
 def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():

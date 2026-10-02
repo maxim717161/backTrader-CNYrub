@@ -4,7 +4,8 @@
 фьючерс не ставится. Первый ордер на фьючерс — на минуте, которая закрылась
 уже после того, как окно собрано. Пропущенные минуты дописываются в канал и
 проверяются на стоп, шаг считается только по последней закрытой свече, и на
-фьючерс уходит не больше одного рыночного ордера.
+фьючерс уходит не больше одного рыночного ордера. В бакете остаётся окно
+индикаторов и две сессии сверху, более старые минутки стираются.
 
 Свободные рубли всех окон покупают фонд денежного рынка. Залог на сделку
 этой минуты — fill_per_minute лотов — остаётся в рублях и с запасом в половину.
@@ -40,6 +41,9 @@ SESSION_LAST = time(23, 49)
 SESSION_MINUTES = 18 * 60
 HISTORY_WALKS = 90
 CATCHUP_DAYS = 3
+# Две лишние сессии сверх окна: длинные выходные не должны съедать пять объёмов той же минуты.
+KEEP_EXTRA_SESSIONS = 2
+TRADE_KEEP = 30
 # Запас сверх залога на минутную сделку: в рублях лежит полтора таких залога.
 CASH_MARGIN_BUFFER = 1.5
 
@@ -54,6 +58,11 @@ def history_goal(params) -> int:
     if params.surge_cap is not None:
         goal = max(goal, SURGE_BARS)
     return goal
+
+
+def bars_to_keep(params) -> int:
+    """Сколько последних минуток хранить. Старше этого окно уже не смотрит."""
+    return history_goal(params) + KEEP_EXTRA_SESSIONS * SESSION_MINUTES
 
 
 def _next_weekday(day: date) -> date:
@@ -216,7 +225,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     front, trade_from = choose_front_safe(broker.cny_futures(), moment.date())
     result["secid"] = front.secid
     if _adopt_instrument(state, front, trade_from) == "halt":
-        return _halt(state, store, key, result, "контракт сменился, пока позиция ещё открыта", None)
+        return _halt(state, store, key, result, "контракт сменился, пока позиция ещё открыта", None, request.params)
 
     book = load_book(state.get("book") if isinstance(state.get("book"), dict) else None, front.secid, None)
     if not state.get("ready"):
@@ -233,11 +242,12 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
                 state["last_bar"] = bars[-1]["t"]
         elif walked >= HISTORY_WALKS:
             state["book"] = export_book(book)
-            return _halt(state, store, key, result, "не хватает минуток, чтобы собрать окно", book)
+            return _halt(state, store, key, result, "не хватает минуток, чтобы собрать окно", book, request.params)
+        _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
         result["phase"] = "history"
-        result["bars"] = len(bars)
+        result["bars"] = len(state.get("bars") or [])
         result["goal"] = goal
         result["ready"] = bool(state.get("ready"))
         result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
@@ -247,6 +257,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     if request.reconcile:
         _adopt_position(book, broker, request, front, broker_lots, list(state.get("bars") or []))
         state["halted"] = None
+        _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
         result["phase"] = "reconciled"
@@ -254,21 +265,29 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["halted"] = None
         return result
     if broker_lots != book.held:
-        return _halt(state, store, key, result, f"позиция на счёте {broker_lots}, в книге {book.held}", book)
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            f"позиция на счёте {broker_lots}, в книге {book.held}",
+            book,
+            request.params,
+        )
 
     if book.held == 0:
         book.equity = float(broker.equity(request.account_id))
 
     fresh = _fresh_candles(state, broker, front.uid, moment)
     if fresh is None:
-        store.save(key, state)
+        _save_trimmed(state, store, key, book, request.params)
         result["phase"] = "catchup"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
         result["cash_order"] = _buy_fund(broker, request, moment, front.uid)
         return result
     if not fresh:
-        store.save(key, state)
+        _save_trimmed(state, store, key, book, request.params)
         result["phase"] = "idle"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
@@ -286,7 +305,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
 
     margin = float(broker.margin(front.uid))
     if margin <= 0:
-        return _halt(state, store, key, result, "биржа не вернула гарантийное обеспечение", book)
+        return _halt(state, store, key, result, "биржа не вернула гарантийное обеспечение", book, request.params)
 
     last = fresh[-1]
     before = export_book(book)
@@ -340,6 +359,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     signed = int(book.last_signed)
     if signed == 0:
         state["last_bar"] = stamp
+        _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
         result["phase"] = "signal" if book.target != book.held else "hold"
@@ -354,7 +374,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     if cash_error:
         restore_book(book, before)
         state["last_bar"] = stamp
-        return _halt(state, store, key, result, cash_error, book)
+        return _halt(state, store, key, result, cash_error, book, request.params)
     result["cash_order"] = cash_order
 
     order_id = make_order_id(request.strategy, last.time)
@@ -363,7 +383,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     except Exception:
         restore_book(book, before)
         state["last_bar"] = stamp
-        return _halt(state, store, key, result, "заявка не подтверждена", book)
+        return _halt(state, store, key, result, "заявка не подтверждена", book, request.params)
     if report.executed != abs(signed):
         restore_book(book, before)
         state["last_bar"] = stamp
@@ -374,6 +394,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             result,
             f"заявка исполнена не целиком: {report.executed} из {abs(signed)}",
             book,
+            request.params,
         )
 
     price = last.close if report.price is None or report.price <= 0 else float(report.price)
@@ -384,6 +405,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         except Exception:
             pass
     state["last_bar"] = stamp
+    _trim_bars(state, book, request.params)
     state["book"] = export_book(book)
     store.save(key, state)
     result["phase"] = "order"
@@ -594,6 +616,34 @@ def _install_stop(book: _FillBook, request: RunRequest, bars: list[dict[str, obj
     book._sync_stop()
 
 
+def _trim_bars(state: dict[str, object], book: _FillBook | None, params) -> bool:
+    """Отрезать минутки старше окна. Индекс входа сдвигается, возраст сделки тот же."""
+    if not state.get("ready"):
+        return False
+    changed = False
+    if book is not None and len(book.trades) > TRADE_KEEP:
+        book.trades = book.trades[-TRADE_KEEP:]
+        changed = True
+    bars = list(state.get("bars") or [])
+    extra = len(bars) - bars_to_keep(params)
+    if extra <= 0:
+        return changed
+    state["bars"] = bars[extra:]
+    if book is None:
+        return True
+    if book.entry_i is not None:
+        book.entry_i -= extra
+    if book.cooldown_until:
+        book.cooldown_until -= extra
+    return True
+
+
+def _save_trimmed(state: dict[str, object], store: StateStore, key: str, book: _FillBook, params) -> None:
+    if _trim_bars(state, book, params):
+        state["book"] = export_book(book)
+    store.save(key, state)
+
+
 def _halt(
     state: dict[str, object],
     store: StateStore,
@@ -601,8 +651,10 @@ def _halt(
     result: dict[str, object],
     reason: str,
     book: _FillBook | None,
+    params,
 ) -> dict[str, object]:
     state["halted"] = reason
+    _trim_bars(state, book, params)
     if book is not None:
         state["book"] = export_book(book)
     store.save(key, state)
