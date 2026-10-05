@@ -14,7 +14,9 @@ backtrader в функцию не входит. Пересобрать архи�
     --source-path yandex/cnyrub-function.zip \\
     --environment STATE_BUCKET=<бакет> \\
     --environment AWS_ACCESS_KEY_ID=<ключ> \\
-    --environment AWS_SECRET_ACCESS_KEY=<секрет>
+    --environment AWS_SECRET_ACCESS_KEY=<секрет> \\
+    --environment TELEGRAM_BOT_TOKEN=<токен бота> \\
+    --environment TELEGRAM_CHAT_ID=<чат>
 
 Пять таймеров на минуту, пока идёт сессия деривативов, повторы выключены.
 В payload таймера JSON: strategy (short, long, thirty, fortyfive или sixty),
@@ -26,6 +28,9 @@ fill_per_minute лотов, по умолчанию 10, и ещё половин
 Тестовый вызов шлёт тот же JSON, но с полем token вместо secret_id.
 Оба пути торгуют реальный счёт. Залог читается из API, история окна
 догружается сама по одному дню и в этот вызов заявка не ставится.
+Исполненная заявка на фьючерс уходит в Telegram, если заданы
+TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID. Покупка и продажа фонда в чат
+не пишутся. Сбой Telegram сделку не отменяет.
 """
 
 from __future__ import annotations

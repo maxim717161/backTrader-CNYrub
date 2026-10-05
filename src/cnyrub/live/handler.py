@@ -8,6 +8,8 @@ secret_id: тогда он читается из Lockbox, ключ записи 
 Окружение функции:
   STATE_BUCKET — бакет Object Storage, один JSON на стратегию и счёт
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — статический ключ бакета
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — куда писать исполненную заявку
+    на фьючерс. Если обоих нет, сделка просто сохраняется.
 
 Сервисный аккаунт функции должен читать Lockbox. Повторы таймера лучше
 выключить: следующая минута подхватит пропуск сама.
@@ -24,6 +26,7 @@ from cnyrub.live.broker import TinkoffClient
 from cnyrub.live.config import parse_event
 from cnyrub.live.service import run_minute
 from cnyrub.live.state import StateStore, object_store_from_env
+from cnyrub.live.telegram import notify_trade
 
 _METADATA = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 _LOCKBOX = "https://payload.lockbox.api.cloud.yandex.net/lockbox/v1/secrets/{secret_id}/payload"
@@ -37,6 +40,7 @@ def handle(
     store: StateStore | None = None,
     now: datetime | None = None,
     secret_reader: Callable[[str], str] | None = None,
+    notifier: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Разобрать событие, достать токен и прогнать одну минуту."""
     request = parse_event(event)
@@ -51,7 +55,13 @@ def handle(
         broker = broker_factory(token)
     if store is None:
         store = object_store_from_env()
-    return run_minute(request, broker, store, now=now)
+    result = run_minute(request, broker, store, now=now)
+    sender = notify_trade if notifier is None else notifier
+    try:
+        sender(result)
+    except Exception:
+        result["telegram"] = "не отправлено"
+    return result
 
 
 def read_lockbox_token(secret_id: str, get: Callable[[str, dict[str, str]], dict] | None = None) -> str:

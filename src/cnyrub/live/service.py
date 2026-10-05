@@ -119,6 +119,21 @@ def cash_to_keep(fill_per_minute: int, margin: float) -> float:
     return fill_per_minute * margin * CASH_MARGIN_BUFFER
 
 
+def order_reason(book: _FillBook, before_held: int, signed: int) -> str:
+    """Почему этот кусок сокращает позицию. Набор причины не пишет."""
+    if signed == 0 or before_held == 0 or signed * before_held > 0:
+        return ""
+    if book.held == 0 and book.trades:
+        reason = str(book.trades[-1].get("reason") or "")
+    else:
+        reason = str(book.reason or "")
+    if reason:
+        return reason
+    if book.scaled:
+        return "scale"
+    return ""
+
+
 def minute_adds_margin(before_held: int, signed: int) -> bool:
     """Эта минута увеличивает позицию, а не только сокращает её."""
     return abs(before_held + signed) > abs(before_held)
@@ -438,6 +453,8 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         "signed": signed,
         "executed": report.executed,
         "price": price,
+        "time": local.strftime("%Y-%m-%d %H:%M"),
+        "reason": order_reason(book, int(before["held"]), signed),
     }
     # Продажу фонда в эту минуту не перекупаем. Свободные рубли сверх залога
     # минутной сделки паркуем после сокращения позиции.

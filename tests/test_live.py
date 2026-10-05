@@ -44,6 +44,7 @@ from cnyrub.live.service import (
     make_order_id,
     run_minute,
 )
+from cnyrub.live.telegram import notify_trade, trade_text
 from cnyrub.live.state import MemoryStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -643,6 +644,8 @@ def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
     assert order["id"] == "short-202609281006"
     assert len(order["id"]) <= 36
     assert order["price"] == 10.8
+    assert order["time"] == "2026-09-28 10:06"
+    assert order["reason"] == ""
     saved = store.load(state_key("short", ACCOUNT))
     assert saved["book"]["held"] == 10
     assert saved["book"]["avg"] == pytest.approx(10.8)
@@ -861,6 +864,7 @@ def test_missed_bar_stop_sends_one_reduce_and_keeps_open_equity():
     result = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
     assert result["phase"] == "order"
     assert result["order"]["signed"] == -10
+    assert result["order"]["reason"] == "stop"
     assert len(broker.orders) == 1
     saved = store.load(state_key("short", ACCOUNT))["book"]
     assert saved["held"] == 2
@@ -926,6 +930,7 @@ def test_closing_a_future_parks_the_freed_rubles():
     broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
     result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
     assert result["order"]["signed"] == -10
+    assert result["order"]["reason"] == "stop"
     assert result["cash_order"]["signed"] == 549
     assert broker.lots == 0
     assert broker.fund_lots_value == 549
@@ -1070,6 +1075,52 @@ def test_handler_uses_the_token_only_to_build_the_broker():
     assert "token" not in result
     assert "from-lockbox" not in str(result)
     assert result["phase"] == "history"
+
+
+def test_handler_tells_telegram_about_the_fill_and_survives_a_notifier_error():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    event = {
+        "strategy": "short",
+        "account_id": ACCOUNT,
+        "token": "t",
+        "channel": 5,
+        "exit_channel": 5,
+        "clock_cap": None,
+    }
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    signal = handle(event, store=store, now=start + timedelta(minutes=6), broker_factory=lambda token: broker)
+    assert signal["order"] is None
+    assert "telegram" not in signal
+    sent: list[dict[str, object]] = []
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    broker.fill_price = 10.8
+    filled = handle(
+        event,
+        store=store,
+        now=start + timedelta(minutes=7),
+        broker_factory=lambda token: broker,
+        notifier=sent.append,
+    )
+    assert filled["phase"] == "order"
+    assert sent == [filled]
+    assert trade_text(filled) == "short CRZ6\n2026-09-28 10:06\nпокупка 10 по 10.8\nпозиция 10, цель 19"
+
+    def broken(result: dict[str, object]) -> None:
+        raise RuntimeError("bot 123456:secret https://api.telegram.org/bot123456:secret/sendMessage")
+
+    again = handle(
+        event,
+        store=store,
+        now=start + timedelta(minutes=7),
+        broker_factory=lambda token: broker,
+        notifier=broken,
+    )
+    assert again["telegram"] == "не отправлено"
+    assert "secret" not in str(again)
+    assert "api.telegram.org" not in str(again)
 
 
 def test_order_id_is_stable_for_the_minute():
