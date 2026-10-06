@@ -252,8 +252,16 @@ def step_minute(
         if cooldown:
             book.cooldown_until = index + cooldown
 
-    pace = FILL_PER_MINUTE if fill_per_minute is None else fill_per_minute
-    limit = abs(book.target - book.held) if next_day is None else pace
+    # None — исследование: 10 контрактов, а в последнюю минуту ряда остаток целиком.
+    # Живой счёт передаёт число. 0 — пауза, позиция не двигается даже в последний день.
+    # Положительное число — потолок и в обычную минуту, и в последнюю.
+    if fill_per_minute is None:
+        pace = FILL_PER_MINUTE
+        limit = abs(book.target - book.held) if next_day is None else pace
+    elif fill_per_minute <= 0:
+        limit = 0
+    else:
+        limit = fill_per_minute
     book.move(close, index, limit)
     if trail and book.held != 0 and book.stop_dist is not None and book.stop_px is not None:
         if book.held > 0:

@@ -40,15 +40,6 @@ class Candle:
 
 
 @dataclass(frozen=True)
-class CashFund:
-    """Фонд денежного рынка: свободные рубли лежат в нём и дают ставку каждую ночь."""
-
-    ticker: str
-    uid: str
-    lot: int
-
-
-@dataclass(frozen=True)
 class FillReport:
     order_id: str
     requested: int
@@ -201,43 +192,29 @@ def parse_fill(payload: dict[str, object], fallback_id: str) -> FillReport:
     )
 
 
-_FUND_NAMES = {"LQDT", "TMON"}
-# TQTF — доска Мосбиржи. SPBRU — тот же пай в Т-Инвестициях, тикер с @ на конце.
-_FUND_CLASSES = {"TQTF", "SPBRU"}
+# Глубина, которую отдаёт API Т-Инвестиций. Половина считается по всему этому срезу.
+BOOK_DEPTH = 50
 
 
-def fund_name(ticker: str) -> str:
-    """LQDT и TMON. Хвост @ в названии приложения не меняет фонд."""
-    return ticker.strip().upper().rstrip("@")
+def book_lots(payload: dict[str, object], side: str) -> int:
+    """Сумма контрактов на одной стороне стакана. bids — покупка, asks — продажа."""
+    rows = payload.get(side) or []
+    if not isinstance(rows, list):
+        return 0
+    total = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            total += int(row.get("quantity") or 0)
+        except (TypeError, ValueError):
+            continue
+    return max(total, 0)
 
 
-def parse_cash_fund(row: dict[str, object], ticker: str) -> CashFund | None:
-    """Биржевой фонд LQDT или TMON: доска TQTF либо режим Т-Инвестиций SPBRU."""
-    wanted = fund_name(ticker)
-    if wanted not in _FUND_NAMES or fund_name(str(row.get("ticker") or "")) != wanted:
-        return None
-    kind = str(row.get("instrumentType") or row.get("instrumentKind") or "").lower()
-    if kind and "etf" not in kind:
-        return None
-    class_code = str(row.get("classCode") or "").upper()
-    if class_code and class_code not in _FUND_CLASSES:
-        return None
-    uid = str(row.get("uid") or "")
-    if not uid:
-        return None
-    try:
-        lot = int(row.get("lot") or 1)
-    except (TypeError, ValueError):
-        return None
-    if lot < 1:
-        return None
-    return CashFund(ticker=wanted, uid=uid, lot=lot)
-
-
-def offers_in_book(payload: dict[str, object]) -> bool:
-    """Покупке есть о что удариться. Пустые заявки на продажу — стакан для нас пуст."""
-    asks = payload.get("asks") or []
-    return isinstance(asks, list) and len(asks) > 0
+def half_book(lots: int) -> int:
+    """Не больше половины видимых контрактов. Один контракт половину не даёт."""
+    return max(lots, 0) // 2
 
 
 def margin_rub(payload: dict[str, object]) -> float:
@@ -317,61 +294,18 @@ class TinkoffClient:
                 return quotation(price)
         return None
 
-    def cash_fund(self, ticker: str) -> CashFund:
-        wanted = fund_name(ticker)
-        for query in (f"{wanted}@", wanted):
-            payload = self._call("InstrumentsService", "FindInstrument", {"query": query})
-            found: list[tuple[int, CashFund]] = []
-            for row in payload.get("instruments") or []:
-                if not isinstance(row, dict):
-                    continue
-                fund = parse_cash_fund(row, wanted)
-                if fund is None:
-                    continue
-                class_code = str(row.get("classCode") or "").upper()
-                found.append((0 if class_code == "SPBRU" else 1, fund))
-            if found:
-                found.sort(key=lambda item: item[0])
-                return found[0][1]
-        raise RuntimeError(f"нет фонда {wanted}")
-
-    def last_price(self, uid: str) -> float:
-        payload = self._call("MarketDataService", "GetLastPrices", {"instrumentId": [uid]})
-        for row in payload.get("lastPrices") or []:
-            if not isinstance(row, dict):
-                continue
-            if row.get("instrumentUid") in (None, uid):
-                return quotation(row.get("price"))
-        return 0.0
-
-    def free_rub(self, account_id: str) -> float:
-        """Рубли, которые можно забрать: обеспечение фьючерса уже вычтено."""
-        payload = self._call("OperationsService", "GetWithdrawLimits", {"accountId": account_id})
-        total = 0.0
-        for row in payload.get("money") or []:
-            if isinstance(row, dict) and str(row.get("currency") or "").lower() == "rub":
-                total += quotation(row)
-        return total
-
-    def fund_lots(self, account_id: str, uid: str, lot: int) -> int:
-        payload = self._call("OperationsService", "GetPositions", {"accountId": account_id})
-        shares = 0
-        for row in payload.get("securities") or []:
-            if not isinstance(row, dict):
-                continue
-            if row.get("instrumentUid") == uid or row.get("figi") == uid:
-                shares += int(row.get("balance") or 0)
-        size = lot if lot > 0 else 1
-        return shares // size
-
     def equity(self, account_id: str) -> float:
         payload = self._call("OperationsService", "GetPortfolio", {"accountId": account_id, "currency": "RUB"})
         return quotation(payload.get("totalAmountPortfolio"))
 
-    def book_has_offers(self, uid: str) -> bool:
-        """В стакане есть продажа. Пустой стакан — торгов нет, заявку не ставим."""
-        payload = self._call("MarketDataService", "GetOrderBook", {"instrumentId": uid, "depth": 1})
-        return offers_in_book(payload)
+    def order_book(self, uid: str) -> dict[str, object]:
+        """Видимый стакан фьючерса. Глубина — максимум, который отдаёт API."""
+        payload = self._call(
+            "MarketDataService",
+            "GetOrderBook",
+            {"instrumentId": uid, "depth": BOOK_DEPTH},
+        )
+        return payload
 
     def market_order(self, account_id: str, uid: str, signed: int, order_id: str) -> FillReport:
         if signed == 0:
@@ -410,6 +344,8 @@ def _looks_like_error(payload: dict[str, object]) -> bool:
         "totalAmountPortfolio",
         "lastPrices",
         "money",
+        "bids",
+        "asks",
     }
     return not any(key in payload for key in useful)
 
