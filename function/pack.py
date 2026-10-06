@@ -27,6 +27,7 @@ FILES = (
     "src/cnyrub/live/indicators.py",
     "src/cnyrub/live/service.py",
     "src/cnyrub/live/state.py",
+    "src/cnyrub/live/telegram.py",
 )
 
 

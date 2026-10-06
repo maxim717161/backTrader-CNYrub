@@ -14,16 +14,14 @@ import pytest
 from backtest import WINDOWS, channel_view
 from cnyrub.engine import _FillBook, export_book, reprice_fill, step_minute
 from cnyrub.live.broker import (
-    CashFund,
     FillReport,
     Instrument,
+    book_lots,
     choose_front,
+    half_book,
     margin_rub,
     api_error_text,
-    offers_in_book,
     parse_candle,
-    TinkoffClient,
-    parse_cash_fund,
     parse_fill,
     parse_instrument,
     quotation,
@@ -32,18 +30,15 @@ from cnyrub.live.config import PRESETS, parse_event
 from cnyrub.live.handler import handle, read_lockbox_token
 from cnyrub.live.indicators import bar_levels
 from cnyrub.live.service import (
-    _buy_fund,
-    extra_margin,
     following_day,
-    cash_to_keep,
-    fund_lots_to_buy,
-    fund_lots_to_sell,
-    minute_adds_margin,
     bars_to_keep,
     history_goal,
+    close_pnl,
     make_order_id,
+    order_reason,
     run_minute,
 )
+from cnyrub.live.telegram import notify_trade, trade_text
 from cnyrub.live.state import MemoryStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -87,9 +82,6 @@ def test_presets_match_the_researched_windows():
     assert PRESETS["fortyfive"].surge_cap is None and fortyfive.surge_cap is None
     assert PRESETS["fortyfive"].leverage == fortyfive.leverage == 4
     assert fortyfive.cash == 100_000
-    assert parse_event(
-        {"strategy": "fortyfive", "account_id": "1", "token": "t"}
-    ).cash_ticker == "LQDT"
     assert PRESETS["sixty"].channel == sixty.channel == 60
     assert PRESETS["sixty"].exit_channel == 0
     assert PRESETS["sixty"].stop_mult == sixty.stop_mult == 8
@@ -100,7 +92,16 @@ def test_presets_match_the_researched_windows():
     assert sixty.cash == 100_000
     assert parse_event(
         {"strategy": "sixty", "account_id": "1", "token": "t"}
-    ).fill_per_minute == 10
+    ).fill_per_minute is None
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t", "fill_per_minute": "авто"}
+    ).fill_per_minute is None
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t", "fill_per_minute": 0}
+    ).fill_per_minute == 0
+    assert parse_event(
+        {"strategy": "sixty", "account_id": "1", "token": "t", "fill_per_minute": 25}
+    ).fill_per_minute == 25
 
 
 def test_levels_match_channel_view():
@@ -226,7 +227,7 @@ def test_parse_timer_envelope_and_direct_json():
     assert direct.token == "secret-token"
     assert direct.reconcile is False
     assert direct.params.channel == 12420
-    assert direct.fill_per_minute == 10
+    assert direct.fill_per_minute is None
 
     timer = parse_event(
         {
@@ -289,7 +290,9 @@ def test_parse_requires_account_and_a_secret():
     with pytest.raises(ValueError):
         parse_event({"strategy": "short", "account_id": "1"})
     with pytest.raises(ValueError):
-        parse_event({"strategy": "short", "account_id": "1", "token": "t", "fill_per_minute": 11})
+        parse_event({"strategy": "short", "account_id": "1", "token": "t", "fill_per_minute": -1})
+    with pytest.raises(ValueError):
+        parse_event({"strategy": "short", "account_id": "1", "token": "t", "fill_per_minute": "много"})
 
 
 def test_lockbox_reads_token_entry_without_returning_it_in_the_url():
@@ -381,16 +384,16 @@ class FakeBroker:
         self.lots = 0
         self.avg_price: float | None = None
         self.equity_value = 100_000.0
-        self.fund = CashFund("LQDT", "fund-1", 1)
-        self.fund_lots_value = 0
-        self.free_value = 0.0
-        self.fund_price = 1.0
         self.orders: list[dict] = []
         self.fill_price: float | None = None
         self.executed: int | None = None
         self.fail = False
         self.futures_calls = 0
-        self.market_open = True
+        self.book_calls = 0
+        self.book_error = False
+        # 20 контрактов на стороне: авто берёт половину, то есть 10.
+        self.bids = 20
+        self.asks = 20
 
     def cny_futures(self):
         self.futures_calls += 1
@@ -414,42 +417,25 @@ class FakeBroker:
     def equity(self, account_id):
         return self.equity_value
 
-    def cash_fund(self, ticker):
-        return self.fund
-
-    def last_price(self, uid):
-        return self.fund_price
-
-    def free_rub(self, account_id):
-        return self.free_value
-
-    def fund_lots(self, account_id, uid, lot):
-        return self.fund_lots_value
-
-    def book_has_offers(self, uid):
-        return self.market_open
+    def order_book(self, uid):
+        self.book_calls += 1
+        if self.book_error:
+            raise RuntimeError("стакан недоступен")
+        assert uid == self.instrument.uid
+        return {
+            "bids": [{"quantity": str(self.bids)}],
+            "asks": [{"quantity": str(self.asks)}],
+        }
 
     def market_order(self, account_id, uid, signed, order_id):
         self.orders.append({"signed": signed, "order_id": order_id, "account": account_id, "uid": uid})
         if self.fail:
             raise RuntimeError("timeout")
         executed = abs(signed) if self.executed is None else self.executed
-        if uid == self.fund.uid:
-            if executed == abs(signed):
-                self.fund_lots_value += signed
-                self.free_value -= signed * self.fund_price * max(self.fund.lot, 1)
-            return FillReport(order_id, abs(signed), executed, self.fund_price)
-        before = self.lots
         if executed == abs(signed):
             self.lots += signed
         elif executed:
             self.lots += int(signed / abs(signed) * executed)
-        if before * self.lots < 0:
-            self.free_value += abs(before) * self.margin_value
-            self.free_value -= abs(self.lots) * self.margin_value
-        else:
-            self.free_value += max(0, abs(before) - abs(self.lots)) * self.margin_value
-            self.free_value -= max(0, abs(self.lots) - abs(before)) * self.margin_value
         return FillReport(order_id, abs(signed), executed, self.fill_price)
 
 
@@ -575,29 +561,16 @@ def test_a_quiet_repeat_does_not_rewrite_the_bucket():
     assert broker.futures_calls == 1
 
 
-def test_closed_fund_market_is_not_a_failed_buy():
+def test_api_error_text_prefers_the_exchange_message():
     assert api_error_text(400, '{"message":"instrument not available for trading"}') == (
         "instrument not available for trading"
     )
     assert api_error_text(400, "") == "HTTP 400"
-    assert offers_in_book({"bids": [], "asks": []}) is False
-    assert offers_in_book({"bids": [{"price": {"units": "165"}}], "asks": []}) is False
-    assert offers_in_book({"bids": [], "asks": [{"price": {"units": "165"}}]}) is True
-    broker = FakeBroker()
-    broker.market_open = False
-    broker.free_value = 10_000
-    broker.fund_price = 100
-    broker.margin_value = 100
-    result = _buy_fund(
-        {},
-        broker,
-        _request(fill_per_minute=1),
-        datetime(2026, 10, 3, 0, 30, tzinfo=MSK),
-        "uid-1",
-        date(2026, 10, 3),
-    )
-    assert result is None
-    assert broker.orders == []
+    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 10
+    assert book_lots({"asks": []}, "bids") == 0
+    assert half_book(10) == 5
+    assert half_book(1) == 0
+    assert half_book(0) == 0
 
 
 def test_a_multi_day_gap_continues_on_the_next_call_and_does_not_order():
@@ -643,6 +616,9 @@ def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
     assert order["id"] == "short-202609281006"
     assert len(order["id"]) <= 36
     assert order["price"] == 10.8
+    assert order["time"] == "2026-09-28 10:06"
+    assert order["reason"] == "up"
+    assert "pnl" not in order
     saved = store.load(state_key("short", ACCOUNT))
     assert saved["book"]["held"] == 10
     assert saved["book"]["avg"] == pytest.approx(10.8)
@@ -664,132 +640,79 @@ def test_smaller_pace_is_the_order_size():
     assert store.load(state_key("short", ACCOUNT))["book"]["held"] == 2
 
 
-def test_free_cash_buys_the_money_fund_when_futures_stay_flat():
+def test_auto_takes_half_the_book_and_a_number_is_a_ceiling():
     broker = FakeBroker()
-    # 10 лотов × залог 5 000 × 1,5 = 75 000 остаются в рублях. Сверх них — фонд.
-    broker.free_value = 80_000.0
-    broker.fund_price = 100.0
+    broker.asks = 5
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
     _ready(store, _quiet_bars(start, 5))
-    broker._candles.append(_candle(start + timedelta(minutes=5), 10.0))
-    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
-    assert result["order"] is None
-    assert result["cash_order"]["ticker"] == "LQDT"
-    assert result["cash_order"]["signed"] == 49
-    assert broker.fund_lots_value == 49
-    assert broker.orders[0]["order_id"] == "short-c-202609281005"
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    thin = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert thin["order"]["signed"] == 2
+    assert broker.book_calls == 1
+
+    wide = FakeBroker()
+    wide.asks = 100
+    wide_store = MemoryStore()
+    _ready(wide_store, _quiet_bars(start, 5))
+    wide._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(_request(), wide, wide_store, now=start + timedelta(minutes=6))
+    wide._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    filled = run_minute(_request(), wide, wide_store, now=start + timedelta(minutes=7))
+    assert filled["order"]["signed"] == 19
+
+    capped = FakeBroker()
+    capped.asks = 100
+    capped.book_error = True
+    cap_store = MemoryStore()
+    _ready(cap_store, _quiet_bars(start, 5))
+    capped._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    run_minute(_request(fill_per_minute=4), capped, cap_store, now=start + timedelta(minutes=6))
+    capped._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    limited = run_minute(_request(fill_per_minute=4), capped, cap_store, now=start + timedelta(minutes=7))
+    assert limited["order"]["signed"] == 4
+    assert capped.book_calls == 0
 
 
-def test_cash_ticker_off_leaves_rubles_alone():
+def test_pause_keeps_the_signal_and_sends_no_order():
     broker = FakeBroker()
-    broker.free_value = 5_000.0
-    broker.fund_price = 100.0
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
     _ready(store, _quiet_bars(start, 5))
-    broker._candles.append(_candle(start + timedelta(minutes=5), 10.0))
-    result = run_minute(_request(cash_ticker="off"), broker, store, now=start + timedelta(minutes=6))
-    assert result["cash_order"] is None
+    request = _request(fill_per_minute=0)
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    signal = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert signal["phase"] == "paused"
+    assert signal["target"] != 0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    paused = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert paused["phase"] == "paused"
+    assert paused["order"] is None
+    assert paused["held"] == 0
     assert broker.orders == []
+    assert broker.book_calls == 0
 
 
-def test_fund_is_sold_before_the_futures_order_that_needs_margin():
+def test_unread_book_does_not_trade_and_does_not_halt():
     broker = FakeBroker()
-    broker.fund_lots_value = 100_000
-    broker.free_value = 0.0
-    broker.fund_price = 1.0
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
     _ready(store, _quiet_bars(start, 5))
-    request = _request()
     broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
-    run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    broker.book_error = True
     broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
-    broker.fill_price = 10.8
-    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
-    assert [item["uid"] for item in broker.orders] == ["fund-1", broker.instrument.uid]
-    assert broker.orders[0]["signed"] == -75_000
-    assert broker.orders[0]["order_id"] == "short-c-202609281006"
-    assert filled["order"]["signed"] == 10
-    assert filled["cash_order"]["signed"] == -75_000
-    assert broker.lots == 10
-    assert broker.fund_lots_value == 25_000
-
-
-def test_minute_margin_already_in_cash_skips_the_fund_sale():
-    broker = FakeBroker()
-    broker.fund_lots_value = 1_000
-    broker.free_value = 0.0
-    broker.fund_price = 1.0
-    store = MemoryStore()
-    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
-    _ready(store, _quiet_bars(start, 5))
-    request = _request()
-    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
-    run_minute(request, broker, store, now=start + timedelta(minutes=6))
-    broker.free_value = 80_000.0
-    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
-    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
-    assert filled["order"]["signed"] == 10
-    assert filled["cash_order"] is None
-    assert broker.fund_lots_value == 1_000
-    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid]
-
-
-def test_reducing_a_future_does_not_sell_the_fund():
-    assert extra_margin(10, 0, 5_000) == 0
-    assert extra_margin(0, 19, 5_000) == 95_000
-    assert minute_adds_margin(10, -10) is False
-    assert minute_adds_margin(0, 10) is True
-    assert minute_adds_margin(2, -10) is True
-    assert cash_to_keep(10, 5_000) == 75_000
-    assert cash_to_keep(2, 5_000) == 15_000
-    assert fund_lots_to_sell(100_000, 0, 1, 1, 75_000) == 75_000
-    assert fund_lots_to_sell(10, 0, 1, 1, 75_000) == 10
-    assert fund_lots_to_sell(100, 75_000, 1, 1, 75_000) == 0
-    assert fund_lots_to_buy(5_000, 100, 1) == 49
-    assert fund_lots_to_buy(80_000, 100, 1, 75_000) == 49
-    assert fund_lots_to_buy(75_000, 100, 1, 75_000) == 0
-    assert fund_lots_to_buy(10, 100, 1) == 0
-    assert fund_lots_to_sell(100, 0, 0, 1, 75_000) == 0
-
-
-def test_cash_fund_parser_keeps_lqdt_and_tmon():
-    lqdt = {
-        "ticker": "LQDT",
-        "uid": "uid-lqdt",
-        "lot": 1,
-        "classCode": "TQTF",
-        "instrumentType": "etf",
-    }
-    assert parse_cash_fund(lqdt, "LQDT") == CashFund("LQDT", "uid-lqdt", 1)
-    assert parse_cash_fund({**lqdt, "ticker": "TMON", "uid": "uid-tmon"}, "TMON").uid == "uid-tmon"
-    tmon_at = {**lqdt, "ticker": "TMON@", "uid": "uid-tmon-at", "classCode": "SPBRU"}
-    assert parse_cash_fund(tmon_at, "TMON") == CashFund("TMON", "uid-tmon-at", 1)
-    assert parse_cash_fund(tmon_at, "TMON@") == CashFund("TMON", "uid-tmon-at", 1)
-    assert parse_cash_fund({**lqdt, "ticker": "SBER"}, "LQDT") is None
-    assert parse_cash_fund({**lqdt, "classCode": "TQBR"}, "LQDT") is None
-    with pytest.raises(ValueError):
-        parse_event({"strategy": "short", "account_id": "1", "token": "t", "cash_ticker": "SBER"})
-    assert parse_event(
-        {"strategy": "sixty", "account_id": "1", "token": "t", "cash_ticker": "TMON@"}
-    ).cash_ticker == "TMON"
-
-    queries: list[str] = []
-
-    def transport(url, body, headers):
-        queries.append(body["query"])
-        return {
-            "instruments": [
-                {**lqdt, "ticker": "TMON", "uid": "uid-moex"},
-                tmon_at,
-            ]
-        }
-
-    fund = TinkoffClient("token", transport).cash_fund("TMON")
-    assert queries == ["TMON@"]
-    assert fund.uid == "uid-tmon-at"
+    missed = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert missed["phase"] == "book"
+    assert missed["halted"] is None
+    assert missed["order"] is None
+    assert broker.orders == []
+    assert store.load(state_key("short", ACCOUNT))["book"]["held"] == 0
+    broker.book_error = False
+    retried = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert retried["order"]["signed"] == 10
 
 
 def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
@@ -861,6 +784,8 @@ def test_missed_bar_stop_sends_one_reduce_and_keeps_open_equity():
     result = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
     assert result["phase"] == "order"
     assert result["order"]["signed"] == -10
+    assert result["order"]["reason"] == "stop"
+    assert result["order"]["pnl"] == pytest.approx(-10)
     assert len(broker.orders) == 1
     saved = store.load(state_key("short", ACCOUNT))["book"]
     assert saved["held"] == 2
@@ -886,31 +811,9 @@ def test_two_accounts_keep_separate_state():
     assert state_key("short", "one") != state_key("long", "two")
 
 
-def test_missing_fund_price_halts_without_selling_the_fund():
-    broker = FakeBroker()
-    broker.fund_lots_value = 1_000
-    broker.free_value = 0.0
-    broker.fund_price = 0.0
-    store = MemoryStore()
-    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
-    _ready(store, _quiet_bars(start, 5))
-    request = _request()
-    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
-    run_minute(request, broker, store, now=start + timedelta(minutes=6))
-    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
-    halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
-    assert halted["phase"] == "halted"
-    assert halted["halted"] == "нет цены фонда"
-    assert broker.fund_lots_value == 1_000
-    assert broker.lots == 0
-    assert broker.orders == []
-
-
-def test_closing_a_future_parks_the_freed_rubles():
+def test_closing_a_future_reports_the_trade_result():
     broker = FakeBroker()
     broker.lots = 10
-    broker.free_value = 80_000.0
-    broker.fund_price = 100.0
     broker.margin_value = 5_000.0
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
@@ -926,10 +829,10 @@ def test_closing_a_future_parks_the_freed_rubles():
     broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
     result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
     assert result["order"]["signed"] == -10
-    assert result["cash_order"]["signed"] == 549
+    assert result["order"]["reason"] == "stop"
+    assert result["order"]["pnl"] == pytest.approx(-6010)
     assert broker.lots == 0
-    assert broker.fund_lots_value == 549
-    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid, "fund-1"]
+    assert [item["uid"] for item in broker.orders] == [broker.instrument.uid]
 
 
 def test_last_evening_bar_does_not_open_into_expiry():
@@ -1045,6 +948,52 @@ def test_step_minute_pace_override_does_not_change_the_default():
 
     assert run(None) == 10
     assert run(2) == 2
+    assert run(0) == 0
+
+    def run_last(pace):
+        book = _FillBook("CRZ6", 100_000.0)
+        book.held = 25
+        book.target = 25
+        book.entry_i = 0
+        step_minute(
+            book,
+            1,
+            opened=10,
+            high=10,
+            low=10,
+            close=10,
+            volume=100,
+            day=date(2026, 12, 15),
+            next_day=None,
+            last_day=date(2026, 12, 15),
+            prior_high=float("nan"),
+            prior_low=float("nan"),
+            prior_vol=float("nan"),
+            prior_range=float("nan"),
+            exit_high=float("nan"),
+            exit_low=float("nan"),
+            clock_vol=float("nan"),
+            entry_ready=0,
+            clearance=0,
+            cooldown=0,
+            clock_volume=False,
+            clock_cap=None,
+            size_mode="flat",
+            stop_mult=None,
+            loss_bars=None,
+            risk_fraction=None,
+            margin=1000,
+            stop_rub=None,
+            breakout_span=None,
+            trade_from=date(2026, 6, 16),
+            trail=False,
+            fill_per_minute=pace,
+        )
+        return book.held
+
+    assert run_last(None) == 0
+    assert run_last(4) == 21
+    assert run_last(0) == 25
 
 
 def test_handler_uses_the_token_only_to_build_the_broker():
@@ -1070,6 +1019,92 @@ def test_handler_uses_the_token_only_to_build_the_broker():
     assert "token" not in result
     assert "from-lockbox" not in str(result)
     assert result["phase"] == "history"
+
+
+def test_handler_tells_telegram_about_the_fill_and_survives_a_notifier_error():
+    broker = FakeBroker()
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 5))
+    event = {
+        "strategy": "short",
+        "account_id": ACCOUNT,
+        "token": "t",
+        "channel": 5,
+        "exit_channel": 5,
+        "clock_cap": None,
+    }
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    signal = handle(event, store=store, now=start + timedelta(minutes=6), broker_factory=lambda token: broker)
+    assert signal["order"] is None
+    assert "telegram" not in signal
+    sent: list[dict[str, object]] = []
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    broker.fill_price = 10.8
+    filled = handle(
+        event,
+        store=store,
+        now=start + timedelta(minutes=7),
+        broker_factory=lambda token: broker,
+        notifier=sent.append,
+    )
+    assert filled["phase"] == "order"
+    assert sent == [filled]
+    assert trade_text(filled) == (
+        "стратегия short\nCRZ6 2026-09-28 10:06\nпокупка 10 по 10.8, пробой вверх\nпозиция 10, цель 19"
+    )
+
+    def broken(result: dict[str, object]) -> None:
+        raise RuntimeError("bot 123456:secret https://api.telegram.org/bot123456:secret/sendMessage")
+
+    again = handle(
+        event,
+        store=store,
+        now=start + timedelta(minutes=7),
+        broker_factory=lambda token: broker,
+        notifier=broken,
+    )
+    assert again["telegram"] == "не отправлено"
+    assert "secret" not in str(again)
+    assert "api.telegram.org" not in str(again)
+
+
+def test_order_reason_separates_the_breakout_from_the_next_chunk_and_the_return():
+    book = _FillBook("CRZ6", 100_000.0)
+    book.entry = "up"
+    book.target = 20
+    opened = export_book(book)
+    assert order_reason(book, opened, 10) == "up"
+    book.held = 10
+    adding = export_book(book)
+    assert order_reason(book, adding, 10) == "add"
+    book.scaled = True
+    book.scale_level = 0
+    book.held = 10
+    book.target = 20
+    restored = export_book(book)
+    assert order_reason(book, restored, 10) == "scale_back"
+    book.held = 0
+    book.trades = [{"reason": "stop"}]
+    cover = export_book(book)
+    cover["held"] = -10
+    assert order_reason(book, cover, 10) == "stop"
+
+
+def test_close_pnl_is_the_chunk_until_the_position_is_flat():
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = 10
+    book.avg = 10.0
+    book.commission = 10.0
+    before = export_book(book)
+    book.held = 6
+    book.gross = 4_000.0
+    book.commission = 14.0
+    assert close_pnl(book, before, -4) == pytest.approx(3_996)
+    flat = _FillBook("CRZ6", 100_000.0)
+    flat.trades = [{"pnlcomm": -6_010.0}]
+    assert close_pnl(flat, before, -10) == pytest.approx(-6_010)
+    assert close_pnl(book, before, 4) is None
 
 
 def test_order_id_is_stable_for_the_minute():

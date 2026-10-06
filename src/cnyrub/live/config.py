@@ -11,7 +11,7 @@ import base64
 import json
 from dataclasses import dataclass, replace
 
-FILL_PER_MINUTE_LIMIT = 10
+_FILL_ERROR = "fill_per_minute: авто, 0 или целое положительное"
 
 
 @dataclass(frozen=True)
@@ -143,10 +143,9 @@ class RunRequest:
     account_id: str
     token: str | None
     secret_id: str | None
-    fill_per_minute: int
+    fill_per_minute: int | None
     reconcile: bool
     params: StrategyParams
-    cash_ticker: str | None
 
 
 def preset(strategy: str) -> StrategyParams:
@@ -168,19 +167,14 @@ def parse_event(event: object) -> RunRequest:
     if token is None and secret_id is None:
         raise ValueError("нужен token или secret_id")
     params = _apply_overrides(params, data)
-    fill = data.get("fill_per_minute", FILL_PER_MINUTE_LIMIT)
-    fill_per_minute = int(fill)
-    if not 1 <= fill_per_minute <= FILL_PER_MINUTE_LIMIT:
-        raise ValueError("fill_per_minute от 1 до 10")
     return RunRequest(
         strategy=strategy,
         account_id=account_id,
         token=token,
         secret_id=secret_id,
-        fill_per_minute=fill_per_minute,
+        fill_per_minute=_fill_per_minute(data.get("fill_per_minute")),
         reconcile=_flag(data.get("reconcile")),
         params=params,
-        cash_ticker=_cash_ticker(data.get("cash_ticker", "LQDT")),
     )
 
 
@@ -286,16 +280,27 @@ def _unwrap_timer(loaded: dict[str, object]) -> dict[str, object]:
     raise ValueError(_TIMER_PAYLOAD)
 
 
-def _cash_ticker(value: object) -> str | None:
-    """Фонд денежного рынка на свободные рубли. Пустое значение выключает его."""
+def _fill_per_minute(value: object) -> int | None:
+    """Пусто и «авто» — половина стакана. 0 — пауза. Положительное — потолок минуты."""
     if value is None:
         return None
-    text = str(value).strip().upper().rstrip("@")
-    if text in {"", "NONE", "OFF", "0"}:
-        return None
-    if text not in {"LQDT", "TMON"}:
-        raise ValueError("cash_ticker должен быть LQDT или TMON")
-    return text
+    if isinstance(value, bool):
+        raise ValueError(_FILL_ERROR)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"auto", "авто"}:
+            return None
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(_FILL_ERROR) from exc
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(_FILL_ERROR)
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(_FILL_ERROR)
+    return value
 
 
 def _text(value: object) -> str | None:

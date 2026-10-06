@@ -7,14 +7,14 @@
 фьючерс уходит не больше одного рыночного ордера. В бакете остаётся окно
 индикаторов и десять сессий сверху, более старые минутки стираются.
 
-Свободные рубли всех окон покупают фонд денежного рынка. Залог на сделку
-этой минуты — fill_per_minute лотов — остаётся в рублях и с запасом в половину.
-Фонд продаётся только если этих рублей не хватает, чтобы увеличить позицию.
+Сколько контрактов менять за минуту решает fill_per_minute. Пустое значение —
+авто: не больше половины видимого стакана с той стороны, которую съест заявка.
+0 ставит паузу: цель может смениться, но заявка не уходит. Положительное число —
+потолок контрактов в минуту, стакан при этом не смотрим.
 """
 
 from __future__ import annotations
 
-import math
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -28,7 +28,7 @@ from cnyrub.engine import (
     restore_book,
     step_minute,
 )
-from cnyrub.live.broker import Candle, CashFund, Instrument, choose_front
+from cnyrub.live.broker import Candle, Instrument, book_lots, choose_front, half_book
 from cnyrub.live.config import RunRequest
 from cnyrub.live.indicators import bar_get, bar_levels
 from cnyrub.live.state import StateStore, state_key
@@ -45,8 +45,6 @@ CATCHUP_DAYS = 3
 # а день перед праздником часто короче обычной сессии.
 KEEP_EXTRA_SESSIONS = 10
 TRADE_KEEP = 30
-# Запас сверх залога на минутную сделку: в рублях лежит полтора таких залога.
-CASH_MARGIN_BUFFER = 1.5
 
 
 def history_goal(params) -> int:
@@ -80,8 +78,8 @@ def following_day(bar_time: datetime, last_day: date) -> date | None:
     До 23:49 это дата самой свечи. С вечерней 23:49 следующая минута — уже
     следующий торговый день, поэтому сигнал перед экспирацией не открывает
     сделку утром последнего дня, а сигнал перед trade_from открывает.
-    В последний день после 23:40 остаток снимается целиком, раньше — по
-    десять контрактов в минуту.
+    В последний день после 23:40 следующая минута для движка уже не наступает:
+    новую позицию он не открывает.
     """
     local = bar_time.astimezone(MSK)
     if local.date() == last_day and local.time() >= FLATTEN_AT:
@@ -97,130 +95,93 @@ def make_order_id(strategy: str, when: datetime) -> str:
     return f"{strategy}-{stamp}"[:36]
 
 
-def make_cash_order_id(strategy: str, when: datetime) -> str:
-    """Id заявки на фонд в ту же минуту, отдельно от заявки на фьючерс."""
-    stamp = when.astimezone(MSK).strftime("%Y%m%d%H%M")
-    return f"{strategy}-c-{stamp}"[:36]
+def move_side(
+    book: _FillBook,
+    *,
+    day: date,
+    last_day: date,
+    opened: float,
+    high: float,
+    low: float,
+) -> int:
+    """Куда шагнет эта минута до нового решения: 1 покупка, −1 продажа, 0 стоит.
+
+    Последний день и стоп обнуляют цель так же, как шаг движка перед сделкой.
+    """
+    held = book.held
+    target = book.target
+    if day == last_day and (held != 0 or target != 0):
+        target = 0
+    elif book.stop_hit(opened, high, low):
+        target = 0
+    delta = target - held
+    if held > 0:
+        delta = max(delta, -held)
+    elif held < 0:
+        delta = min(delta, -held)
+    if delta > 0:
+        return 1
+    if delta < 0:
+        return -1
+    return 0
 
 
-def extra_margin(before_held: int, target: int, margin: float) -> float:
-    """Сколько ещё обеспечения нужно, чтобы добрать цель, а не сократить её."""
-    if margin <= 0 or abs(target) <= abs(before_held):
-        return 0.0
-    if before_held != 0 and target * before_held < 0:
-        return 0.0
-    return (abs(target) - abs(before_held)) * margin
-
-
-def cash_to_keep(fill_per_minute: int, margin: float) -> float:
-    """Рубли, которые не уходят в фонд: залог на минутную сделку и запас."""
-    if margin <= 0 or fill_per_minute <= 0:
-        return 0.0
-    return fill_per_minute * margin * CASH_MARGIN_BUFFER
-
-
-def minute_adds_margin(before_held: int, signed: int) -> bool:
-    """Эта минута увеличивает позицию, а не только сокращает её."""
-    return abs(before_held + signed) > abs(before_held)
-
-
-def fund_lots_to_sell(held: int, free_rub: float, price: float, lot: int, extra: float) -> int:
-    """Сколько лотов фонда продать, чтобы свободных рублей хватило на обеспечение."""
-    if held <= 0 or extra <= free_rub:
+def pace_for(request: RunRequest, broker, uid: str, side: int) -> int:
+    """Контрактов за эту минуту. Авто читает сторону стакана, которую съест заявка."""
+    if request.fill_per_minute is not None:
+        return request.fill_per_minute
+    if side == 0:
         return 0
-    lot_cost = price * max(lot, 1)
-    if lot_cost <= 0:
-        return 0
-    need = math.ceil((extra - free_rub) / lot_cost)
-    return max(0, min(held, need))
+    payload = broker.order_book(uid)
+    if not isinstance(payload, dict):
+        raise RuntimeError("стакан пустой")
+    return half_book(book_lots(payload, "asks" if side > 0 else "bids"))
 
 
-def fund_lots_to_buy(free_rub: float, price: float, lot: int, keep: float = 0.0) -> int:
-    """Сколько лотов фонда купить, оставив залог минутной сделки и запас на комиссию."""
-    lot_cost = price * max(lot, 1)
-    if lot_cost <= 0 or free_rub <= 0:
-        return 0
-    spendable = free_rub - max(keep, 0.0)
-    reserve = max(10.0, lot_cost * 0.005)
-    return max(0, int((spendable - reserve) // lot_cost))
+def order_reason(book: _FillBook, before: dict[str, object], signed: int) -> str:
+    """Короткая причина этого куска: пробой, добор, возврат или выход.
+
+    before — книга до шага этой минуты. Первый кусок новой позиции берёт
+    пробой, который записан там. Выход, назначенный уже после куска, сюда не входит.
+    """
+    before_held = int(before.get("held") or 0)
+    if signed == 0:
+        return ""
+    if before_held == 0 or signed * before_held > 0:
+        if before_held == 0:
+            entry = str(before.get("entry") or "")
+            if entry in {"up", "down"}:
+                return entry
+            return "up" if signed > 0 else "down"
+        target = int(before.get("target") or 0)
+        if before.get("scaled") and int(before.get("scale_level") or 0) == 0 and abs(target) > abs(before_held):
+            return "scale_back"
+        return "add"
+    if book.held == 0 and book.trades:
+        reason = str(book.trades[-1].get("reason") or "")
+    else:
+        reason = str(book.reason or "")
+    if reason:
+        return reason
+    if book.scaled or before.get("scaled"):
+        return "scale"
+    return ""
 
 
-def _sell_fund(
-    state: dict[str, object],
-    broker,
-    request: RunRequest,
-    when: datetime,
-    extra: float,
-) -> tuple[dict[str, object] | None, str | None]:
-    """Продать фонд перед заявкой. Второй элемент — причина остановиться."""
-    if not request.cash_ticker or extra <= 0:
-        return None, None
-    try:
-        fund = _cash_instrument(state, broker, request.cash_ticker)
-        held = int(broker.fund_lots(request.account_id, fund.uid, fund.lot))
-        free = float(broker.free_rub(request.account_id))
-        price = float(broker.last_price(fund.uid)) if held > 0 else 0.0
-    except Exception:
-        return None, "фонд не прочитан"
-    if held > 0 and price <= 0:
-        return None, "нет цены фонда"
-    lots = fund_lots_to_sell(held, free, price, fund.lot, extra)
-    if lots <= 0:
-        return None, None
-    order_id = make_cash_order_id(request.strategy, when)
-    try:
-        report = broker.market_order(request.account_id, fund.uid, -lots, order_id)
-    except Exception:
-        return None, "фонд не продан"
-    if report.executed != lots:
-        return None, f"фонд продан не целиком: {report.executed} из {lots}"
-    return {
-        "id": order_id,
-        "ticker": fund.ticker,
-        "signed": -lots,
-        "executed": report.executed,
-        "price": None if report.price is None else float(report.price),
-    }, None
+def close_pnl(book: _FillBook, before: dict[str, object], signed: int) -> float | None:
+    """Результат сокращения. На полном закрытии — вся сделка после комиссии.
 
-
-def _buy_fund(
-    state: dict[str, object],
-    broker,
-    request: RunRequest,
-    when: datetime,
-    instrument_uid: str,
-    today: date,
-) -> dict[str, object] | None:
-    """Купить фонд на рубли сверх залога минутной сделки. Ошибка не останавливает фьючерс."""
-    if not request.cash_ticker:
+    Пока позиция ещё открыта, это только контракты этой минуты: разница цены
+    и комиссия их выхода. Комиссия входа остаётся в итоге, когда позиция дойдёт до нуля.
+    """
+    before_held = int(before.get("held") or 0)
+    if signed == 0 or before_held == 0 or signed * before_held > 0:
         return None
-    try:
-        free = float(broker.free_rub(request.account_id))
-        margin = _margin(state, broker, instrument_uid, today, refresh=False)
-        keep = cash_to_keep(request.fill_per_minute, margin)
-        if margin <= 0 or free <= keep:
-            return None
-        fund = _cash_instrument(state, broker, request.cash_ticker)
-        price = float(broker.last_price(fund.uid))
-        lots = fund_lots_to_buy(free, price, fund.lot, keep)
-        if lots <= 0:
-            return None
-        if not broker.book_has_offers(fund.uid):
-            return None
-        order_id = make_cash_order_id(request.strategy, when)
-        report = broker.market_order(request.account_id, fund.uid, lots, order_id)
-    except Exception as exc:
-        detail = " ".join(str(exc).split()) or "неизвестная ошибка"
-        return {"error": f"фонд не куплен: {detail[:180]}"}
-    if report.executed != lots:
-        return {"error": f"фонд куплен не целиком: {report.executed} из {lots}"}
-    return {
-        "id": order_id,
-        "ticker": fund.ticker,
-        "signed": lots,
-        "executed": report.executed,
-        "price": None if report.price is None else float(report.price),
-    }
+    if book.held == 0 and book.trades:
+        return float(book.trades[-1]["pnlcomm"])
+    gross = float(book.gross) - float(before.get("gross") or 0)
+    commission = float(book.commission) - float(before.get("commission") or 0)
+    return gross - commission
 
 
 def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | None = None) -> dict[str, object]:
@@ -260,7 +221,6 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             state["book"] = export_book(book)
             return _halt(state, store, key, result, "не хватает минуток, чтобы собрать окно", book, request.params)
         _trim_bars(state, book, request.params)
-        result["cash_order"] = _buy_fund(state, broker, request, moment, front.uid, moment.date())
         state["book"] = export_book(book)
         store.save(key, state)
         result["phase"] = "history"
@@ -295,7 +255,6 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     bars_before = len(state.get("bars") or [])
     fresh = _fresh_candles(state, broker, front.uid, moment)
     if fresh is None:
-        result["cash_order"] = _buy_fund(state, broker, request, moment, front.uid, moment.date())
         _save_trimmed(state, store, key, book, request.params)
         result["phase"] = "catchup"
         result["bars"] = len(state.get("bars") or [])
@@ -303,7 +262,6 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         return result
     if not fresh:
         book_changed = _trim_bars(state, book, request.params)
-        result["cash_order"] = _buy_fund(state, broker, request, moment, front.uid, moment.date())
         moved = state.get("sync_from") != sync_before or len(state.get("bars") or []) != bars_before
         if book_changed or moved:
             if book_changed:
@@ -334,6 +292,21 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     before = export_book(book)
     levels = bar_levels(list(state["bars"]), request.params)
     local = last.time.astimezone(MSK)
+    side = move_side(
+        book,
+        day=local.date(),
+        last_day=front.lsttrade,
+        opened=last.open,
+        high=last.high,
+        low=last.low,
+    )
+    try:
+        pace = pace_for(request, broker, front.uid, side)
+    except Exception:
+        result["phase"] = "book"
+        result["held"] = book.held
+        result["target"] = book.target
+        return result
     step_minute(
         book,
         len(state["bars"]) - 1,
@@ -369,7 +342,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         scale_step=request.params.scale_step,
         scale_floor=request.params.scale_floor,
         scale_back=request.params.scale_back,
-        fill_per_minute=request.fill_per_minute,
+        fill_per_minute=pace,
         drift=levels["drift"],
         path=levels["path"],
         surge_vol=levels["surge_vol"],
@@ -383,22 +356,16 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     if signed == 0:
         state["last_bar"] = stamp
         _trim_bars(state, book, request.params)
-        result["cash_order"] = _buy_fund(state, broker, request, last.time, front.uid, moment.date())
         state["book"] = export_book(book)
         store.save(key, state)
-        result["phase"] = "signal" if book.target != book.held else "hold"
+        if request.fill_per_minute == 0:
+            result["phase"] = "paused"
+        else:
+            result["phase"] = "signal" if book.target != book.held else "hold"
         result["held"] = book.held
         result["target"] = book.target
         result["bars"] = len(state["bars"])
         return result
-
-    keep = cash_to_keep(request.fill_per_minute, margin) if minute_adds_margin(int(before["held"]), signed) else 0.0
-    cash_order, cash_error = _sell_fund(state, broker, request, last.time, keep)
-    if cash_error:
-        restore_book(book, before)
-        state["last_bar"] = stamp
-        return _halt(state, store, key, result, cash_error, book, request.params)
-    result["cash_order"] = cash_order
 
     order_id = make_order_id(request.strategy, last.time)
     try:
@@ -438,13 +405,12 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         "signed": signed,
         "executed": report.executed,
         "price": price,
+        "time": local.strftime("%Y-%m-%d %H:%M"),
+        "reason": order_reason(book, before, signed),
     }
-    # Продажу фонда в эту минуту не перекупаем. Свободные рубли сверх залога
-    # минутной сделки паркуем после сокращения позиции.
-    if cash_order is None:
-        parked = _buy_fund(state, broker, request, last.time, front.uid, moment.date())
-        if parked is not None:
-            result["cash_order"] = parked
+    pnl = close_pnl(book, before, signed)
+    if pnl is not None:
+        result["order"]["pnl"] = pnl
     state["book"] = export_book(book)
     store.save(key, state)
     return result
@@ -490,21 +456,6 @@ def _margin(state: dict[str, object], broker, uid: str, today: date, *, refresh:
     if value > 0:
         state["margin"] = {"uid": uid, "value": value, "day": day}
     return value
-
-
-def _cash_instrument(state: dict[str, object], broker, ticker: str) -> CashFund:
-    """Uid фонда не меняется. Повторный поиск по тикеру не нужен."""
-    raw = state.get("cash_fund")
-    if isinstance(raw, dict) and str(raw.get("ticker") or "") == ticker and raw.get("uid"):
-        try:
-            lot = int(raw.get("lot") or 1)
-        except (TypeError, ValueError):
-            lot = 1
-        if lot >= 1:
-            return CashFund(ticker, str(raw["uid"]), lot)
-    fund = broker.cash_fund(ticker)
-    state["cash_fund"] = {"ticker": fund.ticker, "uid": fund.uid, "lot": fund.lot}
-    return fund
 
 
 def _empty_state(request: RunRequest) -> dict[str, object]:
