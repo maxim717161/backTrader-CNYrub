@@ -38,6 +38,8 @@ class _FillBook:
         self.trail = False
         self.entry_i: int | None = None
         self.reason = ""
+        # Пробой, из-за которого открыта цель. Живёт, пока позиция не закрыта.
+        self.entry = ""
         self.opened = 0
         self.gross = 0.0
         self.commission = 0.0
@@ -136,6 +138,7 @@ class _FillBook:
         self.stop_px = None
         self.entry_i = None
         self.reason = ""
+        self.entry = ""
         self.opened = 0
         self.gross = 0.0
         self.commission = 0.0
@@ -359,6 +362,7 @@ def step_minute(
         book.stop_dist = None if stop_mult is None else stop_mult * prior_range
         lots = entry_lots(size_mode, side, close, prior_high, prior_low, prior_range)
     book.reason = ""
+    book.entry = "up" if side > 0 else "down"
     book.base = side * lots
     book.unit = float(prior_range) if prior_range == prior_range and prior_range > 0 else 0.0
     book.best = None
@@ -453,6 +457,7 @@ _BOOK_FIELDS = (
     "trail",
     "entry_i",
     "reason",
+    "entry",
     "opened",
     "gross",
     "commission",

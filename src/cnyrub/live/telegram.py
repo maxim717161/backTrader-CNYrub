@@ -16,11 +16,15 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 _REASONS = {
+    "up": "пробой вверх",
+    "down": "пробой вниз",
+    "add": "добор",
+    "scale_back": "возврат",
+    "scale": "откат",
     "stop": "стоп",
     "channel": "канал",
     "time": "время",
     "expiry": "экспирация",
-    "scale": "откат",
 }
 
 
@@ -35,15 +39,21 @@ def trade_text(result: Mapping[str, object]) -> str | None:
     executed = order.get("executed")
     lots = abs(signed if not isinstance(executed, int) else executed)
     side = "покупка" if signed > 0 else "продажа"
-    head = " ".join(part for part in (str(result.get("strategy") or ""), str(result.get("secid") or "")) if part)
-    lines = [head] if head else []
+    strategy = str(result.get("strategy") or "").strip()
+    secid = str(result.get("secid") or "").strip()
     when = order.get("time")
-    if isinstance(when, str) and when:
-        lines.append(when)
-    lines.append(f"{side} {lots} по {_price(order.get('price'))}")
+    when_text = when if isinstance(when, str) else ""
+    lines: list[str] = []
+    if strategy:
+        lines.append(f"стратегия {strategy}")
+    place = " ".join(part for part in (secid, when_text) if part)
+    if place:
+        lines.append(place)
+    deal = f"{side} {lots} по {_price(order.get('price'))}"
     reason = _REASONS.get(str(order.get("reason") or ""))
     if reason:
-        lines.append(reason)
+        deal = f"{deal}, {reason}"
+    lines.append(deal)
     held = result.get("held")
     target = result.get("target")
     if isinstance(held, int) and not isinstance(held, bool):

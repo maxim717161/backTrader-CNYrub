@@ -16,7 +16,7 @@ def _fill(**overrides) -> dict[str, object]:
         "executed": 10,
         "price": 10.8,
         "time": "2026-09-28 10:06",
-        "reason": "",
+        "reason": "up",
     }
     order.update(overrides.pop("order", {}))
     result = {
@@ -30,10 +30,15 @@ def _fill(**overrides) -> dict[str, object]:
     return result
 
 
-def test_trade_text_names_the_side_and_skips_an_idle_minute():
-    assert trade_text(_fill()) == "short CRZ6\n2026-09-28 10:06\nпокупка 10 по 10.8\nпозиция 10, цель 19"
+def test_trade_text_names_the_strategy_and_the_reason():
+    assert trade_text(_fill()) == (
+        "стратегия short\nCRZ6 2026-09-28 10:06\nпокупка 10 по 10.8, пробой вверх\nпозиция 10, цель 19"
+    )
+    assert trade_text(_fill(strategy="sixty")).startswith("стратегия sixty\n")
     closing = _fill(held=0, target=0, order={"signed": -10, "executed": 10, "price": 9.4, "reason": "stop"})
-    assert trade_text(closing) == "short CRZ6\n2026-09-28 10:06\nпродажа 10 по 9.4\nстоп\nпозиция 0, цель 0"
+    assert trade_text(closing) == (
+        "стратегия short\nCRZ6 2026-09-28 10:06\nпродажа 10 по 9.4, стоп\nпозиция 0, цель 0"
+    )
     assert trade_text({"order": None, "phase": "idle"}) is None
     assert trade_text({"phase": "halted"}) is None
 
@@ -63,7 +68,7 @@ def test_notify_posts_the_fill_once():
         (
             "123:abc",
             "-1001",
-            "short CRZ6\n2026-09-28 10:06\nпродажа 4 по 11.25\nоткат\nпозиция 6, цель 6",
+            "стратегия short\nCRZ6 2026-09-28 10:06\nпродажа 4 по 11.25, откат\nпозиция 6, цель 6",
         )
     ]
 

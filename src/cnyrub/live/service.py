@@ -119,17 +119,32 @@ def cash_to_keep(fill_per_minute: int, margin: float) -> float:
     return fill_per_minute * margin * CASH_MARGIN_BUFFER
 
 
-def order_reason(book: _FillBook, before_held: int, signed: int) -> str:
-    """Почему этот кусок сокращает позицию. Набор причины не пишет."""
-    if signed == 0 or before_held == 0 or signed * before_held > 0:
+def order_reason(book: _FillBook, before: dict[str, object], signed: int) -> str:
+    """Короткая причина этого куска: пробой, добор, возврат или выход.
+
+    before — книга до шага этой минуты. Первый кусок новой позиции берёт
+    пробой, который записан там. Выход, назначенный уже после куска, сюда не входит.
+    """
+    before_held = int(before.get("held") or 0)
+    if signed == 0:
         return ""
+    if before_held == 0 or signed * before_held > 0:
+        if before_held == 0:
+            entry = str(before.get("entry") or "")
+            if entry in {"up", "down"}:
+                return entry
+            return "up" if signed > 0 else "down"
+        target = int(before.get("target") or 0)
+        if before.get("scaled") and int(before.get("scale_level") or 0) == 0 and abs(target) > abs(before_held):
+            return "scale_back"
+        return "add"
     if book.held == 0 and book.trades:
         reason = str(book.trades[-1].get("reason") or "")
     else:
         reason = str(book.reason or "")
     if reason:
         return reason
-    if book.scaled:
+    if book.scaled or before.get("scaled"):
         return "scale"
     return ""
 
@@ -454,7 +469,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         "executed": report.executed,
         "price": price,
         "time": local.strftime("%Y-%m-%d %H:%M"),
-        "reason": order_reason(book, int(before["held"]), signed),
+        "reason": order_reason(book, before, signed),
     }
     # Продажу фонда в эту минуту не перекупаем. Свободные рубли сверх залога
     # минутной сделки паркуем после сокращения позиции.

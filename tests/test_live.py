@@ -42,6 +42,7 @@ from cnyrub.live.service import (
     bars_to_keep,
     history_goal,
     make_order_id,
+    order_reason,
     run_minute,
 )
 from cnyrub.live.telegram import notify_trade, trade_text
@@ -645,7 +646,7 @@ def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
     assert len(order["id"]) <= 36
     assert order["price"] == 10.8
     assert order["time"] == "2026-09-28 10:06"
-    assert order["reason"] == ""
+    assert order["reason"] == "up"
     saved = store.load(state_key("short", ACCOUNT))
     assert saved["book"]["held"] == 10
     assert saved["book"]["avg"] == pytest.approx(10.8)
@@ -1106,7 +1107,9 @@ def test_handler_tells_telegram_about_the_fill_and_survives_a_notifier_error():
     )
     assert filled["phase"] == "order"
     assert sent == [filled]
-    assert trade_text(filled) == "short CRZ6\n2026-09-28 10:06\nпокупка 10 по 10.8\nпозиция 10, цель 19"
+    assert trade_text(filled) == (
+        "стратегия short\nCRZ6 2026-09-28 10:06\nпокупка 10 по 10.8, пробой вверх\nпозиция 10, цель 19"
+    )
 
     def broken(result: dict[str, object]) -> None:
         raise RuntimeError("bot 123456:secret https://api.telegram.org/bot123456:secret/sendMessage")
@@ -1121,6 +1124,28 @@ def test_handler_tells_telegram_about_the_fill_and_survives_a_notifier_error():
     assert again["telegram"] == "не отправлено"
     assert "secret" not in str(again)
     assert "api.telegram.org" not in str(again)
+
+
+def test_order_reason_separates_the_breakout_from_the_next_chunk_and_the_return():
+    book = _FillBook("CRZ6", 100_000.0)
+    book.entry = "up"
+    book.target = 20
+    opened = export_book(book)
+    assert order_reason(book, opened, 10) == "up"
+    book.held = 10
+    adding = export_book(book)
+    assert order_reason(book, adding, 10) == "add"
+    book.scaled = True
+    book.scale_level = 0
+    book.held = 10
+    book.target = 20
+    restored = export_book(book)
+    assert order_reason(book, restored, 10) == "scale_back"
+    book.held = 0
+    book.trades = [{"reason": "stop"}]
+    cover = export_book(book)
+    cover["held"] = -10
+    assert order_reason(book, cover, 10) == "stop"
 
 
 def test_order_id_is_stable_for_the_minute():
