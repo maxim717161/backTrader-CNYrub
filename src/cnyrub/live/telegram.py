@@ -54,6 +54,9 @@ def trade_text(result: Mapping[str, object]) -> str | None:
     if reason:
         deal = f"{deal}, {reason}"
     lines.append(deal)
+    pnl = order.get("pnl")
+    if isinstance(pnl, (int, float)) and not isinstance(pnl, bool):
+        lines.append(f"результат {_money(float(pnl))}")
     held = result.get("held")
     target = result.get("target")
     if isinstance(held, int) and not isinstance(held, bool):
@@ -93,6 +96,21 @@ def notify_trade(
         result["telegram"] = "не отправлено"
         return
     result["telegram"] = "отправлено"
+
+
+def _money(value: float) -> str:
+    """Рубли со знаком. Дробная часть остаётся, пока она не нулевая."""
+    amount = round(value, 2)
+    sign = "-" if amount < 0 else "+" if amount > 0 else ""
+    whole, frac = f"{abs(amount):.2f}".split(".")
+    groups: list[str] = []
+    while whole:
+        groups.append(whole[-3:])
+        whole = whole[:-3]
+    body = " ".join(reversed(groups)) or "0"
+    if frac != "00":
+        body = f"{body}.{frac.rstrip('0')}"
+    return f"{sign}{body} руб."
 
 
 def _price(value: object) -> str:

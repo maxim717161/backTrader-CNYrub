@@ -41,6 +41,7 @@ from cnyrub.live.service import (
     minute_adds_margin,
     bars_to_keep,
     history_goal,
+    close_pnl,
     make_order_id,
     order_reason,
     run_minute,
@@ -647,6 +648,7 @@ def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
     assert order["price"] == 10.8
     assert order["time"] == "2026-09-28 10:06"
     assert order["reason"] == "up"
+    assert "pnl" not in order
     saved = store.load(state_key("short", ACCOUNT))
     assert saved["book"]["held"] == 10
     assert saved["book"]["avg"] == pytest.approx(10.8)
@@ -866,6 +868,7 @@ def test_missed_bar_stop_sends_one_reduce_and_keeps_open_equity():
     assert result["phase"] == "order"
     assert result["order"]["signed"] == -10
     assert result["order"]["reason"] == "stop"
+    assert result["order"]["pnl"] == pytest.approx(-10)
     assert len(broker.orders) == 1
     saved = store.load(state_key("short", ACCOUNT))["book"]
     assert saved["held"] == 2
@@ -932,6 +935,7 @@ def test_closing_a_future_parks_the_freed_rubles():
     result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
     assert result["order"]["signed"] == -10
     assert result["order"]["reason"] == "stop"
+    assert result["order"]["pnl"] == pytest.approx(-6010)
     assert result["cash_order"]["signed"] == 549
     assert broker.lots == 0
     assert broker.fund_lots_value == 549
@@ -1146,6 +1150,22 @@ def test_order_reason_separates_the_breakout_from_the_next_chunk_and_the_return(
     cover = export_book(book)
     cover["held"] = -10
     assert order_reason(book, cover, 10) == "stop"
+
+
+def test_close_pnl_is_the_chunk_until_the_position_is_flat():
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = 10
+    book.avg = 10.0
+    book.commission = 10.0
+    before = export_book(book)
+    book.held = 6
+    book.gross = 4_000.0
+    book.commission = 14.0
+    assert close_pnl(book, before, -4) == pytest.approx(3_996)
+    flat = _FillBook("CRZ6", 100_000.0)
+    flat.trades = [{"pnlcomm": -6_010.0}]
+    assert close_pnl(flat, before, -10) == pytest.approx(-6_010)
+    assert close_pnl(book, before, 4) is None
 
 
 def test_order_id_is_stable_for_the_minute():

@@ -35,10 +35,20 @@ def test_trade_text_names_the_strategy_and_the_reason():
         "стратегия short\nCRZ6 2026-09-28 10:06\nпокупка 10 по 10.8, пробой вверх\nпозиция 10, цель 19"
     )
     assert trade_text(_fill(strategy="sixty")).startswith("стратегия sixty\n")
-    closing = _fill(held=0, target=0, order={"signed": -10, "executed": 10, "price": 9.4, "reason": "stop"})
-    assert trade_text(closing) == (
-        "стратегия short\nCRZ6 2026-09-28 10:06\nпродажа 10 по 9.4, стоп\nпозиция 0, цель 0"
+    closing = _fill(
+        held=0,
+        target=0,
+        order={"signed": -10, "executed": 10, "price": 9.4, "reason": "stop", "pnl": -6010},
     )
+    assert trade_text(closing) == (
+        "стратегия short\n"
+        "CRZ6 2026-09-28 10:06\n"
+        "продажа 10 по 9.4, стоп\n"
+        "результат -6 010 руб.\n"
+        "позиция 0, цель 0"
+    )
+    partial = _fill(held=6, target=6, order={"signed": -4, "executed": 4, "price": 11.25, "reason": "scale", "pnl": 3996.5})
+    assert "результат +3 996.5 руб." in trade_text(partial)
     assert trade_text({"order": None, "phase": "idle"}) is None
     assert trade_text({"phase": "halted"}) is None
 

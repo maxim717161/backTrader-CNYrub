@@ -149,6 +149,22 @@ def order_reason(book: _FillBook, before: dict[str, object], signed: int) -> str
     return ""
 
 
+def close_pnl(book: _FillBook, before: dict[str, object], signed: int) -> float | None:
+    """Результат сокращения. На полном закрытии — вся сделка после комиссии.
+
+    Пока позиция ещё открыта, это только контракты этой минуты: разница цены
+    и комиссия их выхода. Комиссия входа остаётся в итоге, когда позиция дойдёт до нуля.
+    """
+    before_held = int(before.get("held") or 0)
+    if signed == 0 or before_held == 0 or signed * before_held > 0:
+        return None
+    if book.held == 0 and book.trades:
+        return float(book.trades[-1]["pnlcomm"])
+    gross = float(book.gross) - float(before.get("gross") or 0)
+    commission = float(book.commission) - float(before.get("commission") or 0)
+    return gross - commission
+
+
 def minute_adds_margin(before_held: int, signed: int) -> bool:
     """Эта минута увеличивает позицию, а не только сокращает её."""
     return abs(before_held + signed) > abs(before_held)
@@ -471,6 +487,9 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         "time": local.strftime("%Y-%m-%d %H:%M"),
         "reason": order_reason(book, before, signed),
     }
+    pnl = close_pnl(book, before, signed)
+    if pnl is not None:
+        result["order"]["pnl"] = pnl
     # Продажу фонда в эту минуту не перекупаем. Свободные рубли сверх залога
     # минутной сделки паркуем после сокращения позиции.
     if cash_order is None:
