@@ -3,7 +3,9 @@
 Каждый запуск, и таймер и тестовый вызов, ставит заявки на реальный счёт
 Т-Инвестиций. Токен передаётся полем token в тестовом JSON либо полем
 secret_id: тогда он читается из Lockbox, ключ записи token или TOKEN.
-В лог и в ответ функции токен не попадает.
+В лог и в ответ функции токен не попадает. После каждого запуска
+в лог пишется одна строка JSON — тот же ответ: фаза, остановка,
+заявка, контракт, число минуток, позиция и цель.
 
 Окружение функции:
   STATE_BUCKET — бакет Object Storage, один JSON на стратегию и счёт
@@ -61,7 +63,13 @@ def handle(
         sender(result)
     except Exception:
         result["telegram"] = "не отправлено"
+    _log_run(result)
     return result
+
+
+def _log_run(result: dict[str, object]) -> None:
+    """Одна строка JSON в stdout. Облако забирает её в лог функции."""
+    print(json.dumps(result, ensure_ascii=False), flush=True)
 
 
 def read_lockbox_token(secret_id: str, get: Callable[[str, dict[str, str]], dict] | None = None) -> str:

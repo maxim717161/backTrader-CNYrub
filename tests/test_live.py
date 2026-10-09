@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -994,6 +995,18 @@ def test_step_minute_pace_override_does_not_change_the_default():
     assert run_last(None) == 0
     assert run_last(4) == 21
     assert run_last(0) == 25
+
+
+def test_handler_logs_the_same_json_it_returns(capsys):
+    result = handle(
+        {"strategy": "short", "account_id": ACCOUNT, "token": "secret-token", "channel": 3, "exit_channel": 0, "clock_cap": None},
+        store=MemoryStore(),
+        now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+        broker_factory=lambda token: FakeBroker(),
+    )
+    logged = capsys.readouterr().out
+    assert "secret-token" not in logged
+    assert json.loads(logged) == result
 
 
 def test_handler_uses_the_token_only_to_build_the_broker():
