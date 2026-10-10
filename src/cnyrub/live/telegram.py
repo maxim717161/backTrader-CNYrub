@@ -15,6 +15,8 @@ from collections.abc import Callable, Mapping
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from cnyrub.live.maxbot import notify_max
+
 _REASONS = {
     "up": "пробой вверх",
     "down": "пробой вниз",
@@ -113,6 +115,7 @@ def notify_trade(
     if text is None:
         return
     _send(result, text, environ=environ, post=post)
+    notify_max(result, text, environ=environ)
 
 
 def notify_status(
@@ -122,9 +125,11 @@ def notify_status(
     post: Callable[[str, str, str], None] | None = None,
 ) -> None:
     """Отправить пробу. Заявку не описывает и сделку не меняет."""
-    _send(result, status_text(result), environ=environ, post=post)
+    text = status_text(result)
+    _send(result, text, environ=environ, post=post)
     if "telegram" not in result:
         result["telegram"] = "не настроено"
+    notify_max(result, text, environ=environ)
 
 
 def _send(

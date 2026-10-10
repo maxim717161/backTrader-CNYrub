@@ -25,6 +25,7 @@ FILES = (
     "src/cnyrub/live/config.py",
     "src/cnyrub/live/handler.py",
     "src/cnyrub/live/indicators.py",
+    "src/cnyrub/live/maxbot.py",
     "src/cnyrub/live/service.py",
     "src/cnyrub/live/state.py",
     "src/cnyrub/live/telegram.py",

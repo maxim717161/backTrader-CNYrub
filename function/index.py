@@ -16,7 +16,9 @@ backtrader в функцию не входит. Пересобрать архи�
     --environment AWS_ACCESS_KEY_ID=<ключ> \\
     --environment AWS_SECRET_ACCESS_KEY=<секрет> \\
     --environment TELEGRAM_BOT_TOKEN=<токен бота> \\
-    --environment TELEGRAM_CHAT_ID=<чат>
+    --environment TELEGRAM_CHAT_ID=<чат> \\
+    --environment MAX_BOT_TOKEN=<токен бота MAX> \\
+    --environment MAX_USER_ID=<личный диалог>
 
 Пять таймеров на минуту, пока идёт сессия деривативов, повторы выключены.
 В payload таймера JSON: strategy (short, long, thirty, fortyfive или sixty),
@@ -30,7 +32,9 @@ account_id, secret_id. fill_per_minute по умолчанию авто: за м
 В таймер его не кладут. Обычный вызов торгует реальный счёт. Залог читается из API, история окна
 догружается сама по одному дню и в этот вызов заявка не ставится.
 Исполненная заявка на фьючерс уходит в Telegram, если заданы
-TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID. Первая строка — имя стратегии,
+TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID, и в MAX, если заданы
+MAX_BOT_TOKEN и MAX_CHAT_ID (чат или канал) либо MAX_USER_ID (личный диалог).
+Первая строка — имя стратегии,
 дальше контракт, время, сторона, цена и короткая причина: пробой вверх,
 пробой вниз, добор, возврат, откат, стоп, канал, время или экспирация.
 У сокращения есть финансовый результат: пока позиция открыта — по контрактам
