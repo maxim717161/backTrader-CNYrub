@@ -145,6 +145,7 @@ class RunRequest:
     secret_id: str | None
     fill_per_minute: int | None
     reconcile: bool
+    probe: bool
     params: StrategyParams
 
 
@@ -174,6 +175,7 @@ def parse_event(event: object) -> RunRequest:
         secret_id=secret_id,
         fill_per_minute=_fill_per_minute(data.get("fill_per_minute")),
         reconcile=_flag(data.get("reconcile")),
+        probe=_flag(data.get("probe")),
         params=params,
     )
 

@@ -227,6 +227,9 @@ def test_parse_timer_envelope_and_direct_json():
     assert direct.account_id == "42"
     assert direct.token == "secret-token"
     assert direct.reconcile is False
+    assert direct.probe is False
+    probed = parse_event({"strategy": "thirty", "account_id": "42", "secret_id": "box", "probe": True})
+    assert probed.probe is True
     assert direct.params.channel == 12420
     assert direct.fill_per_minute is None
 
@@ -995,6 +998,36 @@ def test_step_minute_pace_override_does_not_change_the_default():
     assert run_last(None) == 0
     assert run_last(4) == 21
     assert run_last(0) == 25
+
+
+def test_probe_sends_the_saved_status_and_does_not_trade(capsys):
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    _ready(store, _quiet_bars(start, 4), {"held": -3, "target": -3}, strategy="thirty")
+    saved = store.load(state_key("thirty", ACCOUNT))
+    saved["halted"] = "позиция на счёте 0, в книге -3"
+    store.save(state_key("thirty", ACCOUNT), saved)
+    sent: list[dict[str, object]] = []
+
+    def factory(token: str):
+        raise AssertionError(token)
+
+    result = handle(
+        {"strategy": "thirty", "account_id": ACCOUNT, "token": "secret-token", "probe": True},
+        store=store,
+        broker_factory=factory,
+        status_notifier=sent.append,
+    )
+    assert result["phase"] == "probe"
+    assert result["secid"] == "CRZ6"
+    assert result["bars"] == 4
+    assert result["held"] == -3
+    assert result["target"] == -3
+    assert result["halted"] == "позиция на счёте 0, в книге -3"
+    assert result["order"] is None
+    assert sent == [result]
+    assert "secret-token" not in capsys.readouterr().out
+    assert store.saves == 2
 
 
 def test_handler_logs_the_same_json_it_returns(capsys):
