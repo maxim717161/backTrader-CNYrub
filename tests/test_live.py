@@ -39,7 +39,7 @@ from cnyrub.live.service import (
     order_reason,
     run_minute,
 )
-from cnyrub.live.telegram import notify_trade, trade_text
+from cnyrub.live.telegram import notify_trade, status_text, trade_text
 from cnyrub.live.state import MemoryStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -1028,6 +1028,33 @@ def test_probe_sends_the_saved_status_and_does_not_trade(capsys):
     assert sent == [result]
     assert "secret-token" not in capsys.readouterr().out
     assert store.saves == 2
+
+
+def test_probe_still_answers_when_the_book_cannot_be_read(capsys):
+    class Broken:
+        def load(self, key: str) -> dict[str, object] | None:
+            raise TimeoutError(key)
+
+        def save(self, key: str, document: dict[str, object]) -> None:
+            raise AssertionError(key)
+
+    sent: list[dict[str, object]] = []
+
+    def factory(token: str):
+        raise AssertionError(token)
+
+    result = handle(
+        {"strategy": "thirty", "account_id": ACCOUNT, "token": "secret-token", "probe": True},
+        store=Broken(),
+        broker_factory=factory,
+        status_notifier=sent.append,
+    )
+    assert result["phase"] == "probe"
+    assert result["state"] == "не прочитано"
+    assert result["order"] is None
+    assert sent == [result]
+    assert "книга не прочитана" in status_text(result)
+    assert "secret-token" not in capsys.readouterr().out
 
 
 def test_handler_logs_the_same_json_it_returns(capsys):

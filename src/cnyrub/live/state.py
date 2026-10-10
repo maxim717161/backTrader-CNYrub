@@ -88,12 +88,16 @@ class ObjectStore:
         if self._client is None:
             import boto3
 
+            from botocore.config import Config
+
+            # Короткий предел: иначе одно зависшее соединение съедает все 60 секунд функции.
             self._client = boto3.client(
                 "s3",
                 endpoint_url=self.endpoint,
                 aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                 aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
                 region_name="ru-central1",
+                config=Config(connect_timeout=3, read_timeout=15, retries={"max_attempts": 1}),
             )
         return self._client
 

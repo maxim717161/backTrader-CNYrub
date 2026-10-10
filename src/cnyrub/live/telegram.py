@@ -79,6 +79,8 @@ def status_text(result: Mapping[str, object]) -> str:
     phase = str(result.get("phase") or "").strip()
     if phase:
         lines.append(f"фаза {phase}")
+    if result.get("state") == "не прочитано":
+        lines.append("книга не прочитана")
     halted = result.get("halted")
     if isinstance(halted, str) and halted.strip():
         lines.append(f"остановка {halted.strip()}")

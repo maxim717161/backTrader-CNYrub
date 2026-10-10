@@ -50,10 +50,14 @@ def handle(
 ) -> dict[str, object]:
     """Разобрать событие, достать токен и прогнать одну минуту."""
     request = parse_event(event)
-    if store is None:
-        store = object_store_from_env()
     if request.probe:
-        result = _probe_result(request, store)
+        result = _empty_probe(request)
+        try:
+            if store is None:
+                store = object_store_from_env()
+            result = _probe_result(request, store)
+        except Exception:
+            result["state"] = "не прочитано"
         sender = notify_status if status_notifier is None else status_notifier
         try:
             sender(result)
@@ -61,6 +65,8 @@ def handle(
             result["telegram"] = "не отправлено"
         _log_run(result)
         return result
+    if store is None:
+        store = object_store_from_env()
     token = request.token
     if token is None:
         reader = secret_reader or read_lockbox_token
@@ -78,6 +84,20 @@ def handle(
         result["telegram"] = "не отправлено"
     _log_run(result)
     return result
+
+
+def _empty_probe(request) -> dict[str, object]:
+    return {
+        "strategy": request.strategy,
+        "account_id": request.account_id,
+        "phase": "probe",
+        "halted": None,
+        "order": None,
+        "secid": None,
+        "bars": None,
+        "held": None,
+        "target": None,
+    }
 
 
 def _probe_result(request, store: StateStore | None) -> dict[str, object]:
