@@ -15,6 +15,8 @@ from collections.abc import Callable, Mapping
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from cnyrub.live.maxbot import notify_max
+
 _REASONS = {
     "up": "пробой вверх",
     "down": "пробой вниз",
@@ -67,6 +69,41 @@ def trade_text(result: Mapping[str, object]) -> str | None:
     return "\n".join(lines)
 
 
+def status_text(result: Mapping[str, object]) -> str:
+    """Короткая проба: стратегия, фаза, контракт, минутки и позиция."""
+    lines = ["проба"]
+    strategy = str(result.get("strategy") or "").strip()
+    account = str(result.get("account_id") or "").strip()
+    if strategy:
+        lines.append(f"стратегия {strategy}")
+    if account:
+        lines.append(f"счёт {account}")
+    phase = str(result.get("phase") or "").strip()
+    if phase:
+        lines.append(f"фаза {phase}")
+    if result.get("state") == "не прочитано":
+        lines.append("книга не прочитана")
+    halted = result.get("halted")
+    if isinstance(halted, str) and halted.strip():
+        lines.append(f"остановка {halted.strip()}")
+    secid = str(result.get("secid") or "").strip()
+    bars = result.get("bars")
+    place = secid
+    if isinstance(bars, int) and not isinstance(bars, bool):
+        place = f"{place} минуток {bars}".strip()
+    if place:
+        lines.append(place)
+    held = result.get("held")
+    target = result.get("target")
+    held_ok = isinstance(held, int) and not isinstance(held, bool)
+    target_ok = isinstance(target, int) and not isinstance(target, bool)
+    if held_ok and target_ok:
+        lines.append(f"позиция {held}, цель {target}")
+    elif held_ok:
+        lines.append(f"позиция {held}")
+    return "\n".join(lines)
+
+
 def notify_trade(
     result: dict[str, object],
     *,
@@ -77,6 +114,31 @@ def notify_trade(
     text = trade_text(result)
     if text is None:
         return
+    _send(result, text, environ=environ, post=post)
+    notify_max(result, text, environ=environ)
+
+
+def notify_status(
+    result: dict[str, object],
+    *,
+    environ: Mapping[str, str] | None = None,
+    post: Callable[[str, str, str], None] | None = None,
+) -> None:
+    """Отправить пробу. Заявку не описывает и сделку не меняет."""
+    text = status_text(result)
+    _send(result, text, environ=environ, post=post)
+    if "telegram" not in result:
+        result["telegram"] = "не настроено"
+    notify_max(result, text, environ=environ)
+
+
+def _send(
+    result: dict[str, object],
+    text: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    post: Callable[[str, str, str], None] | None = None,
+) -> None:
     env = os.environ if environ is None else environ
     token = str(env.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = str(env.get("TELEGRAM_CHAT_ID") or "").strip()

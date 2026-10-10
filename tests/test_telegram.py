@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from cnyrub.live.telegram import notify_trade, trade_text
+from cnyrub.live.telegram import notify_status, notify_trade, status_text, trade_text
 
 
 def _fill(**overrides) -> dict[str, object]:
@@ -51,6 +51,56 @@ def test_trade_text_names_the_strategy_and_the_reason():
     assert "результат +3 996.5 руб." in trade_text(partial)
     assert trade_text({"order": None, "phase": "idle"}) is None
     assert trade_text({"phase": "halted"}) is None
+
+
+def test_status_text_reports_the_saved_book():
+    text = status_text(
+        {
+            "strategy": "thirty",
+            "account_id": "2254834906",
+            "phase": "probe",
+            "halted": None,
+            "order": None,
+            "secid": "CRZ6",
+            "bars": 12231,
+            "held": 0,
+            "target": 0,
+        }
+    )
+    assert text == (
+        "проба\n"
+        "стратегия thirty\n"
+        "счёт 2254834906\n"
+        "фаза probe\n"
+        "CRZ6 минуток 12231\n"
+        "позиция 0, цель 0"
+    )
+    halted = status_text({"strategy": "thirty", "phase": "probe", "halted": "позиция на счёте 0, в книге -3"})
+    assert "остановка позиция на счёте 0, в книге -3" in halted
+
+
+def test_notify_status_posts_the_probe_without_an_order():
+    seen: list[str] = []
+    result = {
+        "strategy": "thirty",
+        "account_id": "2254834906",
+        "phase": "probe",
+        "secid": "CRZ6",
+        "bars": 12,
+        "held": 0,
+        "target": 0,
+        "order": None,
+    }
+    notify_status(
+        result,
+        environ={"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "-1001"},
+        post=lambda token, chat_id, text: seen.append(text),
+    )
+    assert result["telegram"] == "отправлено"
+    assert seen == [status_text(result)]
+    quiet = {"strategy": "thirty", "phase": "probe", "order": None}
+    notify_status(quiet, environ={})
+    assert quiet["telegram"] == "не настроено"
 
 
 def test_notify_stays_quiet_without_telegram_settings():
