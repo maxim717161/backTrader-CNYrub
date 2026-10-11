@@ -28,7 +28,6 @@ FILES = (
     "src/cnyrub/live/maxbot.py",
     "src/cnyrub/live/service.py",
     "src/cnyrub/live/state.py",
-    "src/cnyrub/live/telegram.py",
 )
 
 
