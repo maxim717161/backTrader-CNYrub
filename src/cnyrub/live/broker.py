@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from urllib.error import HTTPError
@@ -16,6 +17,8 @@ from urllib.request import Request, urlopen
 from cnyrub.contracts import Contract, front_windows
 
 API = "https://invest-public-api.tbank.ru/rest/"
+_BUDGET = 45.0
+_CALL_TIMEOUT = 15.0
 _TICKER = re.compile(r"^CR[HMUZ][0-9]$")
 
 
@@ -230,6 +233,7 @@ class TinkoffClient:
     def __init__(self, token: str, transport=None) -> None:
         self._token = token
         self._transport = transport or _urllib_post
+        self._deadline = time.monotonic() + _BUDGET
 
     def cny_futures(self) -> list[Instrument]:
         payload = self._call(
@@ -326,7 +330,14 @@ class TinkoffClient:
 
     def _call(self, service: str, method: str, body: dict[str, object]) -> dict[str, object]:
         url = f"{API}tinkoff.public.invest.api.contract.v1.{service}/{method}"
-        payload = self._transport(url, body, {"Authorization": f"Bearer {self._token}"})
+        headers = {"Authorization": f"Bearer {self._token}"}
+        if self._transport is _urllib_post:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 1:
+                raise RuntimeError("исчерпан лимит времени на запросы к API")
+            payload = _urllib_post(url, body, headers, timeout=min(_CALL_TIMEOUT, remaining))
+        else:
+            payload = self._transport(url, body, headers)
         if not isinstance(payload, dict):
             raise RuntimeError("пустой ответ API")
         if payload.get("code") and payload.get("message") and _looks_like_error(payload):
@@ -387,7 +398,12 @@ def api_error_text(status: int, body: str) -> str:
     return f"HTTP {status}"
 
 
-def _urllib_post(url: str, body: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
+def _urllib_post(
+    url: str,
+    body: dict[str, object],
+    headers: dict[str, str],
+    timeout: float = _CALL_TIMEOUT,
+) -> dict[str, object]:
     data = json.dumps(body).encode("utf-8")
     request = Request(
         url,
@@ -396,7 +412,7 @@ def _urllib_post(url: str, body: dict[str, object], headers: dict[str, str]) -> 
         method="POST",
     )
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         detail = api_error_text(exc.code, exc.read().decode("utf-8", errors="replace"))

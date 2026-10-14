@@ -76,7 +76,18 @@ def handle(
         broker = TinkoffClient(token)
     else:
         broker = broker_factory(token)
-    result = run_minute(request, broker, store, now=now)
+    try:
+        result = run_minute(request, broker, store, now=now)
+    except Exception as exc:
+        _log_run(
+            {
+                "strategy": request.strategy,
+                "account_id": request.account_id,
+                "phase": "error",
+                "error": f"{type(exc).__name__}: {exc}".replace(token, "***") if token else str(exc),
+            }
+        )
+        raise
     sender = notify_trade if notifier is None else notifier
     try:
         sender(result)

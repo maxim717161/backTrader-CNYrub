@@ -6,6 +6,7 @@ import base64
 import json
 import subprocess
 import sys
+import uuid
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,7 @@ import pytest
 from backtest import WINDOWS, channel_view
 from cnyrub.engine import _FillBook, export_book, reprice_fill, step_minute
 from cnyrub.live.broker import (
+    TinkoffClient,
     FillReport,
     Instrument,
     book_lots,
@@ -35,6 +37,7 @@ from cnyrub.live.service import (
     bars_to_keep,
     history_goal,
     close_pnl,
+    fill_price,
     make_order_id,
     order_reason,
     run_minute,
@@ -617,7 +620,7 @@ def test_breakout_orders_at_most_ten_and_reuses_the_minute_id():
     order = filled["order"]
     assert order["signed"] == 10
     assert order["executed"] == 10
-    assert order["id"] == "short-202609281006"
+    assert order["id"] == make_order_id("short", start + timedelta(minutes=6))
     assert len(order["id"]) <= 36
     assert order["price"] == 10.8
     assert order["time"] == "2026-09-28 10:06"
@@ -1069,6 +1072,32 @@ def test_handler_logs_the_same_json_it_returns(capsys):
     assert json.loads(logged) == result
 
 
+def test_handler_logs_a_failed_run_and_reraises(capsys):
+    class Broken(FakeBroker):
+        def cny_futures(self):
+            raise RuntimeError("API недоступно, секрет secret-token")
+
+    with pytest.raises(RuntimeError):
+        handle(
+            {"strategy": "short", "account_id": ACCOUNT, "token": "secret-token", "channel": 3, "exit_channel": 0, "clock_cap": None},
+            store=MemoryStore(),
+            now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+            broker_factory=lambda token: Broken(),
+        )
+    logged = json.loads(capsys.readouterr().out)
+    assert logged["phase"] == "error"
+    assert "secret-token" not in json.dumps(logged)
+
+
+def test_client_stops_when_the_time_budget_is_spent():
+    import cnyrub.live.broker as broker_module
+
+    client = TinkoffClient("t")
+    client._deadline = broker_module.time.monotonic() - 1
+    with pytest.raises(RuntimeError, match="лимит времени"):
+        client._call("OrdersService", "GetOrders", {})
+
+
 def test_handler_uses_the_token_only_to_build_the_broker():
     seen: list[str] = []
 
@@ -1183,7 +1212,17 @@ def test_close_pnl_is_the_chunk_until_the_position_is_flat():
 def test_order_id_is_stable_for_the_minute():
     moment = datetime(2026, 9, 28, 10, 6, tzinfo=MSK)
     assert make_order_id("long", moment) == make_order_id("long", moment)
-    assert make_order_id("long", moment) == "long-202609281006"
+    assert make_order_id("long", moment) != make_order_id("short", moment)
+    assert make_order_id("long", moment) != make_order_id("long", moment + timedelta(minutes=1))
+    assert str(uuid.UUID(make_order_id("long", moment))) == make_order_id("long", moment)
+
+
+def test_fill_price_accepts_points_and_rejects_wrong_scale():
+    assert fill_price(10.8, 10.75) == 10.8
+    assert fill_price(10_800.0, 10.75) == pytest.approx(10.8)
+    assert fill_price(1.0, 10.75) == 10.75
+    assert fill_price(None, 10.75) == 10.75
+    assert fill_price(0.0, 10.75) == 10.75
 
 
 def test_yandex_zip_contains_only_the_cloud_function(tmp_path):

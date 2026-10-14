@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -92,7 +93,22 @@ def following_day(bar_time: datetime, last_day: date) -> date | None:
 def make_order_id(strategy: str, when: datetime) -> str:
     """Один и тот же id на эту минуту: повторный вызов не ставит вторую заявку."""
     stamp = when.astimezone(MSK).strftime("%Y%m%d%H%M")
-    return f"{strategy}-{stamp}"[:36]
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cnyrub:{strategy}:{stamp}"))
+
+
+def fill_price(reported: float | None, close: float) -> float:
+    """Цена исполнения из ответа брокера; если масштаб не тот, берём close.
+
+    Для фьючерса брокер может прислать цену в пунктах либо в рублях за контракт
+    (в последнем случае в 1000 раз больше). Принимаем только значение в пределах
+    10% от последней цены, иначе средняя цена в книге и стоп были бы испорчены.
+    """
+    if reported is None or reported <= 0:
+        return close
+    for candidate in (float(reported), float(reported) / 1000):
+        if abs(candidate - close) <= 0.1 * close:
+            return candidate
+    return close
 
 
 def move_side(
@@ -387,7 +403,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             request.params,
         )
 
-    price = last.close if report.price is None or report.price <= 0 else float(report.price)
+    price = fill_price(report.price, last.close)
     reprice_fill(book, before, last.close, price)
     if book.held == 0:
         try:
