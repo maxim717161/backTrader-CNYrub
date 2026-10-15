@@ -42,7 +42,7 @@ from cnyrub.live.service import (
     order_reason,
     run_minute,
 )
-from cnyrub.live.maxbot import status_text, trade_text
+from cnyrub.live.vk import status_text, trade_text
 from cnyrub.live.state import MemoryStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -1139,7 +1139,7 @@ def test_handler_tells_max_about_the_fill_and_survives_a_notifier_error():
     broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
     signal = handle(event, store=store, now=start + timedelta(minutes=6), broker_factory=lambda token: broker)
     assert signal["order"] is None
-    assert "max" not in signal
+    assert "vk" not in signal
     sent: list[dict[str, object]] = []
     broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
     broker.fill_price = 10.8
@@ -1157,7 +1157,7 @@ def test_handler_tells_max_about_the_fill_and_survives_a_notifier_error():
     )
 
     def broken(result: dict[str, object]) -> None:
-        raise RuntimeError("bot 123456:secret https://platform-api2.max.ru/messages")
+        raise RuntimeError("bot 123456:secret https://api.vk.com/messages")
 
     again = handle(
         event,
@@ -1166,9 +1166,9 @@ def test_handler_tells_max_about_the_fill_and_survives_a_notifier_error():
         broker_factory=lambda token: broker,
         notifier=broken,
     )
-    assert again["max"] == "не отправлено"
+    assert again["vk"] == "не отправлено"
     assert "secret" not in str(again)
-    assert "platform-api2.max.ru" not in str(again)
+    assert "api.vk.com" not in str(again)
 
 
 def test_order_reason_separates_the_breakout_from_the_next_chunk_and_the_return():

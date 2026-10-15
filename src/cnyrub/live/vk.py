@@ -1,8 +1,10 @@
-"""Сообщение в MAX после исполненной заявки и пробный статус.
+"""Сообщение в ВКонтакте после исполненной заявки и пробный статус.
 
 Токен и адресат читаются из окружения функции:
-MAX_BOT_TOKEN и MAX_CHAT_ID (чат или канал) либо MAX_USER_ID (личный диалог).
-Если настроек нет, сообщение не отправляется. Сбой MAX не отменяет сделку
+VK_TOKEN — ключ доступа сообщества с правом на сообщения,
+VK_USER_ID — личный диалог (пользователь должен сам написать сообществу),
+VK_PEER_ID — любой peer_id, например беседа (2000000000 + номер беседы).
+Если настроек нет, сообщение не отправляется. Сбой ВК сделку не отменяет
 и не попадает в ответ функции вместе с токеном.
 """
 
@@ -13,10 +15,11 @@ import os
 import sys
 import urllib.parse
 from collections.abc import Callable, Mapping
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-_API = "https://platform-api2.max.ru/messages"
+_API = "https://api.vk.com/method/messages.send"
+_VERSION = "5.199"
+_LIMIT = 4000
 _REASONS = {
     "up": "пробой вверх",
     "down": "пробой вниз",
@@ -108,61 +111,61 @@ def notify_trade(
     result: dict[str, object],
     *,
     environ: Mapping[str, str] | None = None,
-    post: Callable[[str, str, str, str], None] | None = None,
+    post: Callable[[str, str, str], None] | None = None,
 ) -> None:
     """Отправить текст сделки. Без настроек ничего не делает."""
     text = trade_text(result)
     if text is None:
         return
-    notify_max(result, text, environ=environ, post=post)
+    notify_vk(result, text, environ=environ, post=post)
 
 
 def notify_status(
     result: dict[str, object],
     *,
     environ: Mapping[str, str] | None = None,
-    post: Callable[[str, str, str, str], None] | None = None,
+    post: Callable[[str, str, str], None] | None = None,
 ) -> None:
     """Отправить пробу. Заявку не описывает и сделку не меняет."""
-    notify_max(result, status_text(result), environ=environ, post=post)
-    if "max" not in result:
-        result["max"] = "не настроено"
+    notify_vk(result, status_text(result), environ=environ, post=post)
+    if "vk" not in result:
+        result["vk"] = "не настроено"
 
 
-def notify_max(
+def notify_vk(
     result: dict[str, object],
     text: str,
     *,
     environ: Mapping[str, str] | None = None,
-    post: Callable[[str, str, str, str], None] | None = None,
+    post: Callable[[str, str, str], None] | None = None,
 ) -> None:
     """Отправить уже собранный текст. Пустой текст не шлёт."""
     if not text.strip():
         return
     env = os.environ if environ is None else environ
-    token = str(env.get("MAX_BOT_TOKEN") or "").strip()
-    chat_id = str(env.get("MAX_CHAT_ID") or "").strip()
-    user_id = str(env.get("MAX_USER_ID") or "").strip()
-    if not token and not chat_id and not user_id:
+    token = str(env.get("VK_TOKEN") or "").strip()
+    peers: list[str] = []
+    for name in ("VK_PEER_ID", "VK_USER_ID"):
+        value = str(env.get(name) or "").strip()
+        if value and value not in peers:
+            peers.append(value)
+    if not token and not peers:
         return
-    targets = [("chat_id", chat_id)] if chat_id else []
-    if user_id:
-        targets.append(("user_id", user_id))
-    if not token or not targets:
-        result["max"] = "не настроено"
+    if not token or not peers:
+        result["vk"] = "не настроено"
         return
     send = post or _post
     try:
-        for kind, value in targets:
-            send(token, kind, value, text)
+        for peer in peers:
+            send(token, peer, text)
     except Exception as exc:
         detail = " ".join(str(exc).split())
-        if not detail or token in detail or "platform-api2.max.ru" in detail:
+        if not detail or token in detail or "api.vk.com" in detail:
             detail = "не отправлено"
-        print(f"max: {detail[:180]}", file=sys.stderr)
-        result["max"] = "не отправлено"
+        print(f"vk: {detail[:180]}", file=sys.stderr)
+        result["vk"] = "не отправлено"
         return
-    result["max"] = "отправлено"
+    result["vk"] = "отправлено"
 
 
 def _money(value: float) -> str:
@@ -186,39 +189,37 @@ def _price(value: object) -> str:
     return f"{float(value):.6f}".rstrip("0").rstrip(".")
 
 
-def _post(token: str, kind: str, value: str, text: str) -> None:
-    query = urllib.parse.urlencode({kind: value, "disable_link_preview": "true"})
-    url = f"{_API}?{query}"
-    body = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
+def _post(token: str, peer_id: str, text: str) -> None:
+    form = urllib.parse.urlencode(
+        {
+            "peer_id": peer_id,
+            "random_id": 0,
+            "message": text[:_LIMIT],
+            "v": _VERSION,
+        }
+    ).encode("utf-8")
     request = Request(
-        url,
-        data=body,
-        headers={"Authorization": token, "Content-Type": "application/json"},
+        _API,
+        data=form,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
         method="POST",
     )
     try:
         with urlopen(request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(_description(raw) or "max не ответил") from None
     except Exception:
-        raise RuntimeError("max не ответил") from None
-    if not isinstance(payload, dict) or "message" not in payload:
-        description = ""
-        if isinstance(payload, dict):
-            description = str(payload.get("message") or payload.get("description") or "")
-        raise RuntimeError(_description(description) or "max не принял сообщение")
+        raise RuntimeError("вк не ответил") from None
+    if isinstance(payload, dict) and "response" in payload:
+        return
+    message = ""
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        error = payload["error"]
+        message = f"{error.get('error_code', '')} {error.get('error_msg', '')}".strip()
+    raise RuntimeError(_description(message) or "вк не принял сообщение")
 
 
 def _description(raw: str) -> str:
-    text = raw.strip()
-    try:
-        payload = json.loads(text) if text.startswith("{") else None
-    except json.JSONDecodeError:
-        payload = None
-    if isinstance(payload, dict):
-        message = payload.get("message") or payload.get("description")
-        if isinstance(message, str) and message.strip():
-            text = message
-    return " ".join(text.split())[:180]
+    return " ".join(raw.split())[:180]

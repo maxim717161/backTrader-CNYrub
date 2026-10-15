@@ -1,7 +1,7 @@
 """Обработчик Cloud Functions.
 
 Каждый запуск, и таймер и тестовый вызов, ставит заявки на реальный счёт
-Т-Инвестиций. Исключение — поле probe: оно только пишет пробу в MAX.
+Т-Инвестиций. Исключение — поле probe: оно только пишет пробу в ВК.
 Токен передаётся полем token в тестовом JSON либо полем
 secret_id: тогда он читается из Lockbox, ключ записи token или TOKEN.
 В лог и в ответ функции токен не попадает. После каждого запуска
@@ -11,9 +11,9 @@ secret_id: тогда он читается из Lockbox, ключ записи 
 Окружение функции:
   STATE_BUCKET — бакет Object Storage, один JSON на стратегию и счёт
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — статический ключ бакета
-  MAX_BOT_TOKEN и MAX_CHAT_ID либо MAX_USER_ID — куда писать исполненную
+  VK_TOKEN и VK_USER_ID либо VK_PEER_ID — куда писать исполненную
     заявку на фьючерс. Если настроек нет, сделка просто сохраняется.
-  Поле probe в тестовом JSON шлёт одну пробу в MAX и не ставит заявку.
+  Поле probe в тестовом JSON шлёт одну пробу в ВК и не ставит заявку.
   В таймер его класть не нужно: пока оно включено, минута не торгует.
 
 Сервисный аккаунт функции должен читать Lockbox. Повторы таймера лучше
@@ -31,7 +31,7 @@ from cnyrub.live.broker import TinkoffClient
 from cnyrub.live.config import parse_event
 from cnyrub.live.service import run_minute
 from cnyrub.live.state import StateStore, object_store_from_env, state_key
-from cnyrub.live.maxbot import notify_status, notify_trade
+from cnyrub.live.vk import notify_status, notify_trade
 
 _METADATA = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 _LOCKBOX = "https://payload.lockbox.api.cloud.yandex.net/lockbox/v1/secrets/{secret_id}/payload"
@@ -62,7 +62,7 @@ def handle(
         try:
             sender(result)
         except Exception:
-            result["max"] = "не отправлено"
+            result["vk"] = "не отправлено"
         _log_run(result)
         return result
     if store is None:
@@ -92,7 +92,7 @@ def handle(
     try:
         sender(result)
     except Exception:
-        result["max"] = "не отправлено"
+        result["vk"] = "не отправлено"
     _log_run(result)
     return result
 

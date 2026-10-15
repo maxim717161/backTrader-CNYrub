@@ -1,4 +1,4 @@
-"""Текст сделки и отправка в MAX без сети."""
+"""Текст сделки и отправка в ВК без сети."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from cnyrub.live.maxbot import notify_max, notify_status, notify_trade, status_text, trade_text
+from cnyrub.live.vk import notify_vk, notify_status, notify_trade, status_text, trade_text
 
 
 def _fill(**overrides) -> dict[str, object]:
@@ -81,57 +81,61 @@ def test_status_text_reports_the_saved_book():
     assert "книга не прочитана" in unread
 
 
-def test_notify_stays_quiet_without_max_settings():
+def test_notify_stays_quiet_without_vk_settings():
     result = _fill()
     notify_trade(result, environ={})
-    assert "max" not in result
-    notify_trade(result, environ={"MAX_BOT_TOKEN": "secret"})
-    assert result["max"] == "не настроено"
+    assert "vk" not in result
+    notify_trade(result, environ={"VK_TOKEN": "secret"})
+    assert result["vk"] == "не настроено"
     quiet = {"strategy": "thirty", "phase": "probe", "order": None}
     notify_status(quiet, environ={})
-    assert quiet["max"] == "не настроено"
+    assert quiet["vk"] == "не настроено"
 
 
-def test_notify_posts_the_fill_to_a_user():
-    seen: list[tuple[str, str, str, str]] = []
+def test_notify_posts_the_fill_to_a_user_and_a_chat():
+    seen: list[tuple[str, str, str]] = []
 
-    def post(token: str, kind: str, value: str, text: str) -> None:
-        seen.append((token, kind, value, text))
+    def post(token: str, peer_id: str, text: str) -> None:
+        seen.append((token, peer_id, text))
 
     result = _fill(order={"reason": "scale", "signed": -4, "executed": 4, "price": 11.25}, held=6, target=6)
     notify_trade(
         result,
-        environ={"MAX_BOT_TOKEN": "max-secret", "MAX_USER_ID": "42"},
+        environ={"VK_TOKEN": "vk-secret", "VK_USER_ID": "42", "VK_PEER_ID": "2000000001"},
         post=post,
     )
-    assert result["max"] == "отправлено"
-    assert seen == [("max-secret", "user_id", "42", trade_text(result))]
+    assert result["vk"] == "отправлено"
+    text = trade_text(result)
+    assert seen == [("vk-secret", "2000000001", text), ("vk-secret", "42", text)]
 
 
-def test_notify_keeps_the_fill_when_max_rejects_it(capsys):
-    def post(token: str, kind: str, value: str, text: str) -> None:
-        raise RuntimeError(f"https://platform-api2.max.ru/messages {token}")
+def test_notify_keeps_the_fill_when_vk_rejects_it(capsys):
+    def post(token: str, peer_id: str, text: str) -> None:
+        raise RuntimeError(f"https://api.vk.com/method/messages.send {token}")
 
     result = _fill()
-    notify_trade(result, environ={"MAX_BOT_TOKEN": "max-secret", "MAX_CHAT_ID": "100"}, post=post)
-    assert result["max"] == "не отправлено"
+    notify_trade(result, environ={"VK_TOKEN": "vk-secret", "VK_USER_ID": "42"}, post=post)
+    assert result["vk"] == "не отправлено"
     assert result["order"]["signed"] == 10
     logged = capsys.readouterr()
-    assert "max-secret" not in logged.err
-    assert "platform-api2.max.ru" not in logged.err
+    assert "vk-secret" not in logged.err
+    assert "api.vk.com" not in logged.err
     assert "не отправлено" in logged.err
 
 
-def test_notify_max_stays_quiet_without_settings():
+def test_notify_vk_stays_quiet_without_settings():
     result: dict[str, object] = {}
-    notify_max(result, "проба", environ={})
-    assert "max" not in result
+    notify_vk(result, "проба", environ={})
+    assert "vk" not in result
 
 
-def test_post_sends_the_chat_and_hides_the_token(monkeypatch):
-    from cnyrub.live import maxbot
+def test_post_sends_a_form_and_hides_the_token(monkeypatch):
+    from urllib.parse import parse_qs
+
+    from cnyrub.live import vk
 
     captured: dict[str, object] = {}
+    reply = {"response": 7}
 
     class Response:
         def __enter__(self):
@@ -141,26 +145,32 @@ def test_post_sends_the_chat_and_hides_the_token(monkeypatch):
             return False
 
         def read(self):
-            return json.dumps({"message": {"body": {}}}).encode("utf-8")
+            return json.dumps(reply).encode("utf-8")
 
     def urlopen(request, timeout):
         captured["url"] = request.full_url
         captured["auth"] = request.get_header("Authorization")
-        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["form"] = parse_qs(request.data.decode("utf-8"))
         captured["timeout"] = timeout
         return Response()
 
-    monkeypatch.setattr(maxbot, "urlopen", urlopen)
-    maxbot._post("max-secret", "chat_id", "100", "проба")
-    assert captured["url"] == "https://platform-api2.max.ru/messages?chat_id=100&disable_link_preview=true"
-    assert captured["auth"] == "max-secret"
+    monkeypatch.setattr(vk, "urlopen", urlopen)
+    vk._post("vk-secret", "42", "проба")
+    assert captured["url"] == "https://api.vk.com/method/messages.send"
+    assert captured["auth"] == "Bearer vk-secret"
     assert captured["timeout"] == 10
-    assert captured["body"] == {"text": "проба"}
+    assert captured["form"] == {"peer_id": ["42"], "random_id": ["0"], "message": ["проба"], "v": ["5.199"]}
+    assert "vk-secret" not in captured["url"]
+
+    reply = {"error": {"error_code": 901, "error_msg": "Can't send messages for users without permission"}}
+    with pytest.raises(RuntimeError, match="901") as error:
+        vk._post("vk-secret", "42", "x")
+    assert "vk-secret" not in str(error.value)
 
     def refuse(request, timeout):
-        raise maxbot.HTTPError(request.full_url, 401, "Unauthorized", hdrs=None, fp=None)
+        raise OSError("https://api.vk.com vk-secret")
 
-    monkeypatch.setattr(maxbot, "urlopen", refuse)
-    with pytest.raises(RuntimeError, match="max не ответил") as error:
-        maxbot._post("max-secret", "user_id", "42", "x")
-    assert "max-secret" not in str(error.value)
+    monkeypatch.setattr(vk, "urlopen", refuse)
+    with pytest.raises(RuntimeError, match="вк не ответил") as error:
+        vk._post("vk-secret", "42", "x")
+    assert "vk-secret" not in str(error.value)
