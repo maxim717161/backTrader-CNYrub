@@ -965,7 +965,7 @@ def test_reprice_open_add_reduce_and_close():
 def test_step_minute_pace_override_does_not_change_the_default():
     def run(pace):
         book = _FillBook("CRZ6", 100_000.0)
-        book.target = 25
+        book.target = 250
         step_minute(
             book,
             1,
@@ -1002,7 +1002,7 @@ def test_step_minute_pace_override_does_not_change_the_default():
         )
         return book.held
 
-    assert run(None) == 10
+    assert run(None) == 100
     assert run(2) == 2
     assert run(0) == 0
 

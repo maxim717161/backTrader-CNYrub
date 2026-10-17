@@ -438,7 +438,8 @@ def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
     assert run_contract("CRZ5", _days(far), 5, **kwargs).trades == []
 
 
-def test_a_position_above_ten_contracts_is_built_and_closed_one_minute_at_a_time():
+def test_a_position_above_ten_contracts_is_built_and_closed_one_minute_at_a_time(monkeypatch):
+    monkeypatch.setattr("cnyrub.engine.FILL_PER_MINUTE", 10)
     start = datetime(2024, 1, 2, 10, 0)
     rows = [_quiet() for _ in range(3)]
     rows.append((10.0, 10.50, 10.00, 10.40, 1000))
@@ -500,7 +501,8 @@ def _minute_frame(closes: list[float], last_on_next_day: bool = True) -> pd.Data
     return frame
 
 
-def test_a_pullback_cuts_the_position_and_a_return_builds_it_back():
+def test_a_pullback_cuts_the_position_and_a_return_builds_it_back(monkeypatch):
+    monkeypatch.setattr("cnyrub.engine.FILL_PER_MINUTE", 10)
     # Диапазон каждой минуты 0.10. Откат на 0.10 уменьшает 40 контрактов до 75%,
     # откат до 0.05 и меньше возвращает полный размер.
     closes = [10.0, 10.0, 10.0, 10.40, 10.00, 10.10, 10.20, 10.30, 10.20, 10.15, 10.26, 10.28, 10.28]
