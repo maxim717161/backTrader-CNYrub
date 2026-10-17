@@ -1,6 +1,7 @@
 """Собрать архив Cloud Function: только то, что исполняется в Яндекс Облаке.
 
-В архиве точка входа function.index.handler, код живого счёта и requirements.txt.
+В архиве точка входа function.index.handler, код живого счёта, requirements.txt
+и README.txt с описанием всех команд запуска.
 Исследование, история минуток и тесты туда не входят. backtrader тоже.
 """
 
@@ -15,6 +16,7 @@ ZIP_PATH = ROOT / "yandex" / "cnyrub-function.zip"
 # Корень архива совпадает с корнем функции. requirements.txt лежит сверху:
 # Облако ставит из него зависимости само.
 FILES = (
+    "README.txt",
     "requirements.txt",
     "function/index.py",
     "src/cnyrub/__init__.py",
@@ -30,6 +32,9 @@ FILES = (
     "src/cnyrub/live/state.py",
 )
 
+# Исходник README лежит рядом с точкой входа, в архиве это README.txt в корне.
+SOURCES = {"README.txt": "function/README.txt"}
+
 
 def build(dest: Path | None = None) -> Path:
     """Записать архив. Повторная сборка из тех же файлов даёт те же байты."""
@@ -40,7 +45,7 @@ def build(dest: Path | None = None) -> Path:
             info = zipfile.ZipInfo(filename=name, date_time=(2026, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
-            archive.writestr(info, (ROOT / name).read_bytes())
+            archive.writestr(info, (ROOT / SOURCES.get(name, name)).read_bytes())
     return target
 
 

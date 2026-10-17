@@ -1241,6 +1241,11 @@ def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
         text = stored.read("requirements.txt").decode("utf-8")
         assert "boto3" in text
         assert "backtrader" not in text and "pandas" not in text
+        readme = stored.read("README.txt").decode("utf-8")
+        for word in ("reconcile", "probe", "fill_per_minute", "secret_id", "halted", "VK_TOKEN"):
+            assert word in readme
+        for name in PRESETS:
+            assert name in readme
         stored.extractall(extract)
     code = (
         "import function.index, sys; "
