@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from cnyrub.live.vk import halt_text, notify_vk, notify_status, notify_trade, status_text, trade_text
+from cnyrub.live.vk import error_text, halt_text, notify_vk, notify_status, notify_trade, status_text, trade_text
 
 
 def _fill(**overrides) -> dict[str, object]:
@@ -220,3 +220,13 @@ def test_trade_text_marks_a_partial_fill():
     result = _fill(order={"signed": 3, "executed": 3, "requested": 10})
     assert "исполнено частично: 3 из 10" in trade_text(result)
     assert "частично" not in trade_text(_fill(order={"requested": 10}))
+
+
+def test_error_text_only_when_the_alert_is_due():
+    failed = {"strategy": "thirty", "account_id": "2254834906", "phase": "error", "error": "RuntimeError: API  недоступно", "error_new": True}
+    text = error_text(failed)
+    assert text.startswith("стратегия thirty: сбой запуска\nсчёт 2254834906\nRuntimeError: API недоступно")
+    assert error_text({**failed, "error_new": False}) is None
+    seen: list[str] = []
+    notify_trade(failed, environ={"VK_TOKEN": "t", "VK_USER_ID": "42"}, post=lambda token, peer, body: seen.append(body))
+    assert seen == [text]

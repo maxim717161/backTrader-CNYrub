@@ -101,6 +101,22 @@ def halt_text(result: Mapping[str, object]) -> str | None:
     return "\n".join(lines)
 
 
+def error_text(result: Mapping[str, object]) -> str | None:
+    """Текст сбоя запуска. Пусто, если на сегодня сообщение уже было."""
+    if result.get("error_new") is not True:
+        return None
+    strategy = str(result.get("strategy") or "").strip()
+    lines = [f"стратегия {strategy}: сбой запуска" if strategy else "сбой запуска"]
+    account = str(result.get("account_id") or "").strip()
+    if account:
+        lines.append(f"счёт {account}")
+    detail = " ".join(str(result.get("error") or "").split())
+    if detail:
+        lines.append(detail[:180])
+    lines.append("следующее сообщение о сбоях не раньше завтра или после перезапуска")
+    return "\n".join(lines)
+
+
 def status_text(result: Mapping[str, object]) -> str:
     """Короткая проба: стратегия, фаза, контракт, минутки и позиция."""
     lines = ["проба"]
@@ -142,8 +158,8 @@ def notify_trade(
     environ: Mapping[str, str] | None = None,
     post: Callable[[str, str, str], None] | None = None,
 ) -> None:
-    """Отправить текст сделки или остановки. Без настроек ничего не делает."""
-    text = trade_text(result) or halt_text(result)
+    """Отправить текст сделки, остановки или сбоя. Без настроек ничего не делает."""
+    text = trade_text(result) or halt_text(result) or error_text(result)
     if text is None:
         return
     notify_vk(result, text, environ=environ, post=post)

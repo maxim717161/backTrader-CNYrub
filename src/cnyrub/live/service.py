@@ -35,6 +35,7 @@ from cnyrub.live.indicators import bar_get, bar_levels
 from cnyrub.live.state import StateStore, state_key
 
 MSK = ZoneInfo("Europe/Moscow")
+ZERO_FILL_LIMIT = 10
 FLATTEN_AT = time(23, 40)
 # В истории последняя вечерняя свеча — 23:49. Следующая минута уже другой день.
 SESSION_LAST = time(23, 49)
@@ -249,6 +250,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     if request.reconcile:
         _adopt_position(book, broker, request, front, broker_lots, list(state.get("bars") or []))
         state["halted"] = None
+        state["zero_fills"] = 0
         _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
@@ -396,7 +398,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         state["last_bar"] = stamp
         return _halt(state, store, key, result, "заявка не подтверждена", book, request.params)
     wanted = abs(signed)
-    if report.executed <= 0 or report.executed > wanted:
+    if report.executed > wanted:
         restore_book(book, before)
         state["last_bar"] = stamp
         return _halt(
@@ -404,12 +406,36 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             store,
             key,
             result,
-            f"заявка не исполнена: {report.executed} из {wanted}"
-            if report.executed <= 0
-            else f"исполнено больше заявленного: {report.executed} из {wanted}",
+            f"исполнено больше заявленного: {report.executed} из {wanted}",
             book,
             request.params,
         )
+    if report.executed <= 0:
+        restore_book(book, before)
+        misses = int(state.get("zero_fills") or 0) + 1
+        state["zero_fills"] = misses
+        if misses >= ZERO_FILL_LIMIT:
+            state["last_bar"] = stamp
+            return _halt(
+                state,
+                store,
+                key,
+                result,
+                f"заявка не исполнена {misses} раз подряд",
+                book,
+                request.params,
+            )
+        # last_bar остаётся прежним: следующая минута заново решит, нужна ли заявка.
+        _trim_bars(state, book, request.params)
+        state["book"] = export_book(book)
+        store.save(key, state)
+        result["phase"] = "unfilled"
+        result["unfilled"] = misses
+        result["held"] = book.held
+        result["target"] = book.target
+        result["bars"] = len(state["bars"])
+        return result
+    state["zero_fills"] = 0
     if report.executed < wanted:
         # Принимаем исполненную часть: книга повторяет минуту с этим потолком, остаток
         # цель дозаберёт на следующих минутах.
