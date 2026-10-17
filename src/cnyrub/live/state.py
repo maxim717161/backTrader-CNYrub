@@ -28,6 +28,11 @@ def state_key(strategy: str, account_id: str) -> str:
     return f"state/{strategy}-{safe}.json"
 
 
+def alert_key(strategy: str, account_id: str) -> str:
+    """Отдельный файл: оповещение о сбое не трогает книгу стратегии."""
+    return state_key(strategy, account_id).replace("state/", "alerts/", 1)
+
+
 class StateStore(Protocol):
     def load(self, key: str) -> dict[str, object] | None: ...
 
