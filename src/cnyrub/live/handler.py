@@ -14,6 +14,7 @@ secret_id: тогда он читается из Lockbox, ключ записи 
   VK_TOKEN и VK_USER_ID либо VK_PEER_ID — куда писать исполненную заявку,
     остановку стратегии и (раз в сутки) сбой запуска. Если настроек нет,
     сделка просто сохраняется.
+  RUN_DEADLINE — секунд до принудительной остановки запуска (по умолчанию 45).
   Поле probe в тестовом JSON шлёт одну пробу в ВК и не ставит заявку.
   В таймер его класть не нужно: пока оно включено, минута не торгует.
 
@@ -24,11 +25,15 @@ secret_id: тогда он читается из Lockbox, ключ записи 
 from __future__ import annotations
 
 import json
+import os
+import signal
+import time
 from collections.abc import Callable
 from datetime import datetime
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from cnyrub.live import trace
 from cnyrub.live.broker import TinkoffClient
 from cnyrub.live.config import parse_event
 from cnyrub.live.service import run_minute
@@ -40,7 +45,48 @@ _METADATA = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts
 _LOCKBOX = "https://payload.lockbox.api.cloud.yandex.net/lockbox/v1/secrets/{secret_id}/payload"
 
 
-def handle(
+_DEADLINE = 45.0
+_GRACE = 8
+_started = 0.0
+
+
+def _deadline() -> float:
+    try:
+        value = float(os.environ.get("RUN_DEADLINE") or _DEADLINE)
+    except ValueError:
+        value = _DEADLINE
+    return max(value, 1.0)
+
+
+def _on_alarm(signum, frame) -> None:
+    signal.alarm(_GRACE)
+    raise TimeoutError(f"запуск не уложился в {_deadline():g} с, этап: {trace.stage}")
+
+
+def handle(event: object, context: object = None, **kwargs) -> dict[str, object]:
+    """Один запуск с предохранителем: зависший запрос не съедает все 60 секунд функции.
+
+    По истечении RUN_DEADLINE (по умолчанию 45 с) запуск прерывается ошибкой с названием
+    этапа. Она попадает в лог и в суточное сообщение ВК, а не обрывается молча.
+    """
+    global _started
+    _started = time.monotonic()
+    trace.mark("старт")
+    armed = False
+    try:
+        signal.signal(signal.SIGALRM, _on_alarm)
+        signal.alarm(max(int(_deadline()), 1))
+        armed = True
+    except (ValueError, AttributeError):
+        pass
+    try:
+        return _handle(event, context, **kwargs)
+    finally:
+        if armed:
+            signal.alarm(0)
+
+
+def _handle(
     event: object,
     context: object = None,
     *,
@@ -58,6 +104,7 @@ def handle(
         try:
             if store is None:
                 store = object_store_from_env()
+            trace.mark("бакет: чтение книги")
             result = _probe_result(request, store)
         except Exception:
             result["state"] = "не прочитано"
@@ -73,12 +120,14 @@ def handle(
         if store is None:
             store = object_store_from_env()
         if token is None:
+            trace.mark("Lockbox: чтение токена")
             reader = secret_reader or read_lockbox_token
             token = reader(request.secret_id or "")
         if broker_factory is None:
             broker = TinkoffClient(token)
         else:
             broker = broker_factory(token)
+        trace.mark("минута стратегии")
         result = run_minute(request, broker, store, now=now)
     except Exception as exc:
         _report_failure(request, exc, token, store, now, notifier)
@@ -86,10 +135,12 @@ def handle(
     if request.reconcile:
         _reset_alert(request, store)
     sender = notify_trade if notifier is None else notifier
+    trace.mark("ВК: сообщение")
     try:
         sender(result)
     except Exception:
         result["vk"] = "не отправлено"
+    result["sec"] = round(time.monotonic() - _started, 1)
     _log_run(result)
     return result
 

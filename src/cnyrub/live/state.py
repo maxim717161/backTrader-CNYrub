@@ -6,6 +6,8 @@ import json
 import os
 from typing import Protocol
 
+from cnyrub.live import trace
+
 
 def compact_document(document: dict[str, object]) -> dict[str, object]:
     """Свечи в бакете — списки из шести полей, без повторения имён на каждой минуте."""
@@ -68,6 +70,7 @@ class ObjectStore:
     def load(self, key: str) -> dict[str, object] | None:
         from botocore.exceptions import ClientError
 
+        trace.mark(f"бакет: чтение {key}")
         try:
             response = self._s3().get_object(Bucket=self.bucket, Key=key)
         except ClientError as exc:
@@ -87,6 +90,7 @@ class ObjectStore:
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        trace.mark(f"бакет: запись {key}")
         self._s3().put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="application/json")
 
     def _s3(self):

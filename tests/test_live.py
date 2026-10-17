@@ -983,6 +983,41 @@ def test_a_failed_run_writes_to_vk_once_a_day_and_a_restart_resets_it(capsys):
     assert len(sent) == 1
 
 
+def test_a_hung_run_is_cut_off_and_names_the_stage(monkeypatch, capsys):
+    import time
+
+    class Hanging(FakeBroker):
+        def cny_futures(self):
+            time.sleep(30)
+
+    monkeypatch.setenv("RUN_DEADLINE", "1")
+    sent: list[dict] = []
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="этап: минута стратегии"):
+        handle(
+            _failing_event(),
+            store=MemoryStore(),
+            now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+            broker_factory=lambda token: Hanging(),
+            notifier=sent.append,
+        )
+    assert time.monotonic() - started < 5
+    assert len(sent) == 1
+    assert "этап: минута стратегии" in sent[0]["error"]
+    assert "secret-token" not in capsys.readouterr().out
+
+
+def test_a_normal_run_reports_its_duration(capsys):
+    result = handle(
+        _failing_event(),
+        store=MemoryStore(),
+        now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+        broker_factory=lambda token: FakeBroker(),
+    )
+    assert isinstance(result["sec"], float)
+    assert json.loads(capsys.readouterr().out)["sec"] == result["sec"]
+
+
 def test_error_alert_survives_a_dead_bucket():
     from cnyrub.live import handler as handler_module
 
