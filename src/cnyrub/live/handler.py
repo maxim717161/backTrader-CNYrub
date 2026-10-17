@@ -11,8 +11,10 @@ secret_id: тогда он читается из Lockbox, ключ записи 
 Окружение функции:
   STATE_BUCKET — бакет Object Storage, один JSON на стратегию и счёт
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — статический ключ бакета
-  VK_TOKEN и VK_USER_ID либо VK_PEER_ID — куда писать исполненную
-    заявку на фьючерс. Если настроек нет, сделка просто сохраняется.
+  VK_TOKEN и VK_USER_ID либо VK_PEER_ID — куда писать исполненную заявку,
+    остановку стратегии и (раз в сутки) сбой запуска. Если настроек нет,
+    сделка просто сохраняется.
+  RUN_DEADLINE — секунд до принудительной остановки запуска (по умолчанию 45).
   Поле probe в тестовом JSON шлёт одну пробу в ВК и не ставит заявку.
   В таймер его класть не нужно: пока оно включено, минута не торгует.
 
@@ -23,21 +25,68 @@ secret_id: тогда он читается из Lockbox, ключ записи 
 from __future__ import annotations
 
 import json
+import os
+import signal
+import time
 from collections.abc import Callable
 from datetime import datetime
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
+from cnyrub.live import trace
 from cnyrub.live.broker import TinkoffClient
 from cnyrub.live.config import parse_event
 from cnyrub.live.service import run_minute
-from cnyrub.live.state import StateStore, object_store_from_env, state_key
+from cnyrub.live.state import StateStore, alert_key, object_store_from_env, state_key
 from cnyrub.live.vk import notify_status, notify_trade
 
+_MSK = ZoneInfo("Europe/Moscow")
 _METADATA = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 _LOCKBOX = "https://payload.lockbox.api.cloud.yandex.net/lockbox/v1/secrets/{secret_id}/payload"
 
 
-def handle(
+_DEADLINE = 45.0
+_GRACE = 8
+_started = 0.0
+
+
+def _deadline() -> float:
+    try:
+        value = float(os.environ.get("RUN_DEADLINE") or _DEADLINE)
+    except ValueError:
+        value = _DEADLINE
+    return max(value, 1.0)
+
+
+def _on_alarm(signum, frame) -> None:
+    signal.alarm(_GRACE)
+    raise TimeoutError(f"запуск не уложился в {_deadline():g} с, этап: {trace.stage}")
+
+
+def handle(event: object, context: object = None, **kwargs) -> dict[str, object]:
+    """Один запуск с предохранителем: зависший запрос не съедает все 60 секунд функции.
+
+    По истечении RUN_DEADLINE (по умолчанию 45 с) запуск прерывается ошибкой с названием
+    этапа. Она попадает в лог и в суточное сообщение ВК, а не обрывается молча.
+    """
+    global _started
+    _started = time.monotonic()
+    trace.mark("старт")
+    armed = False
+    try:
+        signal.signal(signal.SIGALRM, _on_alarm)
+        signal.alarm(max(int(_deadline()), 1))
+        armed = True
+    except (ValueError, AttributeError):
+        pass
+    try:
+        return _handle(event, context, **kwargs)
+    finally:
+        if armed:
+            signal.alarm(0)
+
+
+def _handle(
     event: object,
     context: object = None,
     *,
@@ -55,6 +104,7 @@ def handle(
         try:
             if store is None:
                 store = object_store_from_env()
+            trace.mark("бакет: чтение книги")
             result = _probe_result(request, store)
         except Exception:
             result["state"] = "не прочитано"
@@ -65,36 +115,95 @@ def handle(
             result["vk"] = "не отправлено"
         _log_run(result)
         return result
-    if store is None:
-        store = object_store_from_env()
     token = request.token
-    if token is None:
-        reader = secret_reader or read_lockbox_token
-        secret_id = request.secret_id or ""
-        token = reader(secret_id)
-    if broker_factory is None:
-        broker = TinkoffClient(token)
-    else:
-        broker = broker_factory(token)
     try:
+        if store is None:
+            store = object_store_from_env()
+        if token is None:
+            trace.mark("Lockbox: чтение токена")
+            reader = secret_reader or read_lockbox_token
+            token = reader(request.secret_id or "")
+        if broker_factory is None:
+            broker = TinkoffClient(token)
+        else:
+            broker = broker_factory(token)
+        trace.mark("минута стратегии")
         result = run_minute(request, broker, store, now=now)
     except Exception as exc:
-        _log_run(
-            {
-                "strategy": request.strategy,
-                "account_id": request.account_id,
-                "phase": "error",
-                "error": f"{type(exc).__name__}: {exc}".replace(token, "***") if token else str(exc),
-            }
-        )
+        _report_failure(request, exc, token, store, now, notifier)
         raise
+    if request.reconcile:
+        _reset_alert(request, store)
     sender = notify_trade if notifier is None else notifier
+    trace.mark("ВК: сообщение")
     try:
         sender(result)
     except Exception:
         result["vk"] = "не отправлено"
+    result["sec"] = round(time.monotonic() - _started, 1)
     _log_run(result)
     return result
+
+
+_ALERTED: dict[str, str] = {}
+
+
+def _today(now: datetime | None) -> str:
+    moment = datetime.now(_MSK) if now is None else now.astimezone(_MSK)
+    return moment.date().isoformat()
+
+
+def _alert_due(request, store: StateStore | None, today: str) -> bool:
+    """Одно сообщение о сбое в сутки. Нет доступа к бакету — помним в этом процессе."""
+    key = alert_key(request.strategy, request.account_id)
+    if store is not None:
+        try:
+            saved = store.load(key)
+            if isinstance(saved, dict) and saved.get("date") == today:
+                return False
+            store.save(key, {"date": today})
+            _ALERTED[key] = today
+            return True
+        except Exception:
+            pass
+    if _ALERTED.get(key) == today:
+        return False
+    _ALERTED[key] = today
+    return True
+
+
+def _reset_alert(request, store: StateStore | None) -> None:
+    """Перезапуск снимает отметку: следующий сбой снова придёт в ВК."""
+    key = alert_key(request.strategy, request.account_id)
+    _ALERTED.pop(key, None)
+    if store is None:
+        return
+    try:
+        store.save(key, {"date": None})
+    except Exception:
+        pass
+
+
+def _report_failure(request, exc: Exception, token, store, now, notifier) -> None:
+    detail = f"{type(exc).__name__}: {exc}"
+    if token:
+        detail = detail.replace(token, "***")
+    entry: dict[str, object] = {
+        "strategy": request.strategy,
+        "account_id": request.account_id,
+        "phase": "error",
+        "error": detail,
+    }
+    try:
+        if _alert_due(request, store, _today(now)):
+            entry["error_new"] = True
+            sender = notify_trade if notifier is None else notifier
+            try:
+                sender(entry)
+            except Exception:
+                entry["vk"] = "не отправлено"
+    finally:
+        _log_run(entry)
 
 
 def _empty_probe(request) -> dict[str, object]:

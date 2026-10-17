@@ -874,21 +874,167 @@ def test_partial_close_keeps_the_remaining_position_and_its_stop():
     assert last["order"]["pnl"] is not None
 
 
-def test_zero_fill_halts_once_and_flags_the_halt_for_the_alert():
+def test_zero_fill_does_not_halt_and_the_next_minute_decides_again():
     broker, store, request, start = _breakout_ready()
     broker.executed = 0
-    halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
-    assert halted["phase"] == "halted"
-    assert halted["halted"] == "заявка не исполнена: 0 из 10"
-    assert halted["halt_new"] is True
-    book = store.load(state_key("short", ACCOUNT))["book"]
-    assert book["held"] == 0
-    assert book["target"] != 0
+    first = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert first["phase"] == "unfilled"
+    assert first["unfilled"] == 1
+    assert first["halted"] is None
+    assert "halt_new" not in first
+    saved = store.load(state_key("short", ACCOUNT))
+    assert saved["zero_fills"] == 1
+    assert saved["halted"] is None
+    assert saved["book"]["held"] == 0
+    assert saved["last_bar"] != _bar_stamp(start + timedelta(minutes=6))
     assert len(broker.orders) == 1
-    again = run_minute(request, broker, store, now=start + timedelta(minutes=8))
+
+    broker.executed = None
+    broker._candles.append(_candle(start + timedelta(minutes=7), 10.6, high=10.65, low=10.5))
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=8))
+    assert filled["phase"] == "order"
+    assert filled["order"]["executed"] == filled["order"]["requested"]
+    assert store.load(state_key("short", ACCOUNT))["zero_fills"] == 0
+
+
+def _bar_stamp(moment: datetime) -> str:
+    return moment.isoformat()
+
+
+def test_ten_zero_fills_in_a_row_halt_the_strategy():
+    from cnyrub.live.service import ZERO_FILL_LIMIT
+
+    assert ZERO_FILL_LIMIT == 10
+    broker, store, request, start = _breakout_ready()
+    broker.executed = 0
+    for n in range(1, 10):
+        result = run_minute(request, broker, store, now=start + timedelta(minutes=6 + n))
+        assert result["phase"] == "unfilled", n
+        assert result["unfilled"] == n
+        broker._candles.append(_candle(start + timedelta(minutes=6 + n), 10.5 + n * 0.1, high=10.6 + n * 0.1, low=10.4 + n * 0.1))
+    halted = run_minute(request, broker, store, now=start + timedelta(minutes=16))
+    assert halted["phase"] == "halted"
+    assert halted["halted"] == "заявка не исполнена 10 раз подряд"
+    assert halted["halt_new"] is True
+    assert len(broker.orders) == 10
+    again = run_minute(request, broker, store, now=start + timedelta(minutes=17))
     assert again["phase"] == "halted"
     assert "halt_new" not in again
-    assert len(broker.orders) == 1
+    assert len(broker.orders) == 10
+
+    broker.executed = None
+    broker.lots = 0
+    reconciled = run_minute(parse_event({**_event_for(request), "reconcile": True}), broker, store, now=start + timedelta(minutes=18))
+    assert reconciled["phase"] == "reconciled"
+    assert store.load(state_key("short", ACCOUNT))["zero_fills"] == 0
+
+
+def _event_for(request) -> dict:
+    return {"strategy": request.strategy, "account_id": request.account_id, "token": "t", "channel": 5, "exit_channel": 5, "clock_cap": None}
+
+
+def test_a_filled_order_resets_the_zero_fill_counter():
+    broker, store, request, start = _breakout_ready()
+    broker.executed = 0
+    run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    run_minute(request, broker, store, now=start + timedelta(minutes=8))
+    assert store.load(state_key("short", ACCOUNT))["zero_fills"] == 2
+    broker.executed = None
+    broker._candles.append(_candle(start + timedelta(minutes=7), 10.6, high=10.65, low=10.5))
+    run_minute(request, broker, store, now=start + timedelta(minutes=9))
+    assert store.load(state_key("short", ACCOUNT))["zero_fills"] == 0
+
+
+def _failing_event(**extra):
+    return {"strategy": "short", "account_id": ACCOUNT, "token": "secret-token", "channel": 3, "exit_channel": 0, "clock_cap": None, **extra}
+
+
+def test_a_failed_run_writes_to_vk_once_a_day_and_a_restart_resets_it(capsys):
+    class Broken(FakeBroker):
+        def cny_futures(self):
+            raise RuntimeError("API недоступно, секрет secret-token")
+
+        def candles(self, uid, start, end):
+            raise RuntimeError("API недоступно, секрет secret-token")
+
+    store = MemoryStore()
+    sent: list[dict] = []
+    noon = datetime(2026, 9, 28, 12, 0, tzinfo=MSK)
+
+    def failing(event, when):
+        with pytest.raises(RuntimeError):
+            handle(event, store=store, now=when, broker_factory=lambda token: Broken(), notifier=sent.append)
+
+    failing(_failing_event(), noon)
+    failing(_failing_event(), noon + timedelta(minutes=1))
+    assert len(sent) == 1
+    assert sent[0]["phase"] == "error" and sent[0]["error_new"] is True
+    assert "secret-token" not in json.dumps(sent[0])
+    logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(logged) == 2
+    assert "secret-token" not in json.dumps(logged)
+
+    failing(_failing_event(), noon + timedelta(days=1))
+    assert len(sent) == 2
+
+    handle(_failing_event(reconcile=True), store=store, now=noon + timedelta(days=1), broker_factory=lambda token: FakeBroker(), notifier=sent.append)
+    sent.clear()
+    failing(_failing_event(), noon + timedelta(days=1, minutes=5))
+    assert len(sent) == 1
+
+
+def test_a_hung_run_is_cut_off_and_names_the_stage(monkeypatch, capsys):
+    import time
+
+    class Hanging(FakeBroker):
+        def cny_futures(self):
+            time.sleep(30)
+
+    monkeypatch.setenv("RUN_DEADLINE", "1")
+    sent: list[dict] = []
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="этап: минута стратегии"):
+        handle(
+            _failing_event(),
+            store=MemoryStore(),
+            now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+            broker_factory=lambda token: Hanging(),
+            notifier=sent.append,
+        )
+    assert time.monotonic() - started < 5
+    assert len(sent) == 1
+    assert "этап: минута стратегии" in sent[0]["error"]
+    assert "secret-token" not in capsys.readouterr().out
+
+
+def test_a_normal_run_reports_its_duration(capsys):
+    result = handle(
+        _failing_event(),
+        store=MemoryStore(),
+        now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK),
+        broker_factory=lambda token: FakeBroker(),
+    )
+    assert isinstance(result["sec"], float)
+    assert json.loads(capsys.readouterr().out)["sec"] == result["sec"]
+
+
+def test_error_alert_survives_a_dead_bucket():
+    from cnyrub.live import handler as handler_module
+
+    class DeadStore:
+        def load(self, key):
+            raise RuntimeError("bucket down")
+
+        def save(self, key, document):
+            raise RuntimeError("bucket down")
+
+    handler_module._ALERTED.clear()
+    sent: list[dict] = []
+    noon = datetime(2026, 9, 28, 12, 0, tzinfo=MSK)
+    for minute in (0, 1):
+        with pytest.raises(RuntimeError):
+            handle(_failing_event(), store=DeadStore(), now=noon + timedelta(minutes=minute), broker_factory=lambda token: FakeBroker(), notifier=sent.append)
+    assert len(sent) == 1
 
 
 def test_overfill_halts():

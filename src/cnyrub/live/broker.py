@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from cnyrub.contracts import Contract, front_windows
+from cnyrub.live import trace
 
 API = "https://invest-public-api.tbank.ru/rest/"
 _BUDGET = 45.0
@@ -331,6 +332,7 @@ class TinkoffClient:
     def _call(self, service: str, method: str, body: dict[str, object]) -> dict[str, object]:
         url = f"{API}tinkoff.public.invest.api.contract.v1.{service}/{method}"
         headers = {"Authorization": f"Bearer {self._token}"}
+        trace.mark(f"API {service}/{method}")
         if self._transport is _urllib_post:
             remaining = self._deadline - time.monotonic()
             if remaining <= 1:

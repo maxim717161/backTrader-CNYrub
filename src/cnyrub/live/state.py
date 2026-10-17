@@ -6,6 +6,8 @@ import json
 import os
 from typing import Protocol
 
+from cnyrub.live import trace
+
 
 def compact_document(document: dict[str, object]) -> dict[str, object]:
     """Свечи в бакете — списки из шести полей, без повторения имён на каждой минуте."""
@@ -26,6 +28,11 @@ def _compact_bar(bar: object) -> list[object]:
 def state_key(strategy: str, account_id: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in account_id)
     return f"state/{strategy}-{safe}.json"
+
+
+def alert_key(strategy: str, account_id: str) -> str:
+    """Отдельный файл: оповещение о сбое не трогает книгу стратегии."""
+    return state_key(strategy, account_id).replace("state/", "alerts/", 1)
 
 
 class StateStore(Protocol):
@@ -63,6 +70,7 @@ class ObjectStore:
     def load(self, key: str) -> dict[str, object] | None:
         from botocore.exceptions import ClientError
 
+        trace.mark(f"бакет: чтение {key}")
         try:
             response = self._s3().get_object(Bucket=self.bucket, Key=key)
         except ClientError as exc:
@@ -82,6 +90,7 @@ class ObjectStore:
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        trace.mark(f"бакет: запись {key}")
         self._s3().put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="application/json")
 
     def _s3(self):
