@@ -59,6 +59,9 @@ def trade_text(result: Mapping[str, object]) -> str | None:
     if reason:
         deal = f"{deal}, {reason}"
     lines.append(deal)
+    requested = order.get("requested")
+    if isinstance(requested, int) and not isinstance(requested, bool) and lots < requested:
+        lines.append(f"исполнено частично: {lots} из {requested}, остаток дозаберёт следующая минута")
     pnl = order.get("pnl")
     if isinstance(pnl, (int, float)) and not isinstance(pnl, bool):
         lines.append(f"результат {_money(float(pnl))}")
@@ -69,6 +72,32 @@ def trade_text(result: Mapping[str, object]) -> str | None:
             lines.append(f"позиция {held}, цель {target}")
         else:
             lines.append(f"позиция {held}")
+    return "\n".join(lines)
+
+
+def halt_text(result: Mapping[str, object]) -> str | None:
+    """Текст остановки. Пусто, если эта минута стратегию не останавливала."""
+    if result.get("halt_new") is not True:
+        return None
+    strategy = str(result.get("strategy") or "").strip()
+    lines = [f"стратегия {strategy} остановлена" if strategy else "стратегия остановлена"]
+    account = str(result.get("account_id") or "").strip()
+    if account:
+        lines.append(f"счёт {account}")
+    secid = str(result.get("secid") or "").strip()
+    if secid:
+        lines.append(secid)
+    reason = str(result.get("halted") or "").strip()
+    if reason:
+        lines.append(f"причина: {reason}")
+    held = result.get("held")
+    target = result.get("target")
+    if isinstance(held, int) and not isinstance(held, bool):
+        if isinstance(target, int) and not isinstance(target, bool):
+            lines.append(f"позиция {held}, цель {target}")
+        else:
+            lines.append(f"позиция {held}")
+    lines.append("проверьте счёт и пришлите reconcile: true")
     return "\n".join(lines)
 
 
@@ -113,8 +142,8 @@ def notify_trade(
     environ: Mapping[str, str] | None = None,
     post: Callable[[str, str, str], None] | None = None,
 ) -> None:
-    """Отправить текст сделки. Без настроек ничего не делает."""
-    text = trade_text(result)
+    """Отправить текст сделки или остановки. Без настроек ничего не делает."""
+    text = trade_text(result) or halt_text(result)
     if text is None:
         return
     notify_vk(result, text, environ=environ, post=post)

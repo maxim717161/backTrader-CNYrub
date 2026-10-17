@@ -323,52 +323,55 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["held"] = book.held
         result["target"] = book.target
         return result
-    step_minute(
-        book,
-        len(state["bars"]) - 1,
-        opened=last.open,
-        high=last.high,
-        low=last.low,
-        close=last.close,
-        volume=last.volume,
-        day=local.date(),
-        next_day=following_day(local, front.lsttrade),
-        last_day=front.lsttrade,
-        prior_high=levels["prior_high"],
-        prior_low=levels["prior_low"],
-        prior_vol=levels["prior_vol"],
-        prior_range=levels["prior_range"],
-        exit_high=levels["exit_high"],
-        exit_low=levels["exit_low"],
-        clock_vol=levels["clock_vol"],
-        entry_ready=levels["entry_ready"],
-        clearance=0.0,
-        cooldown=request.params.cooldown,
-        clock_volume=False,
-        clock_cap=request.params.clock_cap,
-        size_mode=request.params.size_mode,
-        stop_mult=request.params.stop_mult,
-        loss_bars=request.params.loss_bars,
-        risk_fraction=request.params.risk_fraction,
-        margin=margin,
-        stop_rub=request.params.stop_rub,
-        breakout_span=request.params.breakout_span,
-        trade_from=trade_from,
-        trail=False,
-        scale_step=request.params.scale_step,
-        scale_floor=request.params.scale_floor,
-        scale_back=request.params.scale_back,
-        fill_per_minute=pace,
-        drift=levels["drift"],
-        path=levels["path"],
-        surge_vol=levels["surge_vol"],
-        eff_low=request.params.eff_low,
-        eff_high=request.params.eff_high,
-        surge_cap=request.params.surge_cap,
-        leverage=request.params.leverage,
-        min_stop=request.params.min_stop,
-        skip_flat=request.params.skip_flat,
-    )
+    def advance(limit: int) -> None:
+        step_minute(
+            book,
+            len(state["bars"]) - 1,
+            opened=last.open,
+            high=last.high,
+            low=last.low,
+            close=last.close,
+            volume=last.volume,
+            day=local.date(),
+            next_day=following_day(local, front.lsttrade),
+            last_day=front.lsttrade,
+            prior_high=levels["prior_high"],
+            prior_low=levels["prior_low"],
+            prior_vol=levels["prior_vol"],
+            prior_range=levels["prior_range"],
+            exit_high=levels["exit_high"],
+            exit_low=levels["exit_low"],
+            clock_vol=levels["clock_vol"],
+            entry_ready=levels["entry_ready"],
+            clearance=0.0,
+            cooldown=request.params.cooldown,
+            clock_volume=False,
+            clock_cap=request.params.clock_cap,
+            size_mode=request.params.size_mode,
+            stop_mult=request.params.stop_mult,
+            loss_bars=request.params.loss_bars,
+            risk_fraction=request.params.risk_fraction,
+            margin=margin,
+            stop_rub=request.params.stop_rub,
+            breakout_span=request.params.breakout_span,
+            trade_from=trade_from,
+            trail=False,
+            scale_step=request.params.scale_step,
+            scale_floor=request.params.scale_floor,
+            scale_back=request.params.scale_back,
+            fill_per_minute=limit,
+            drift=levels["drift"],
+            path=levels["path"],
+            surge_vol=levels["surge_vol"],
+            eff_low=request.params.eff_low,
+            eff_high=request.params.eff_high,
+            surge_cap=request.params.surge_cap,
+            leverage=request.params.leverage,
+            min_stop=request.params.min_stop,
+            skip_flat=request.params.skip_flat,
+        )
+
+    advance(pace)
     stamp = _bar(last)["t"]
     signed = int(book.last_signed)
     if signed == 0:
@@ -392,7 +395,8 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         restore_book(book, before)
         state["last_bar"] = stamp
         return _halt(state, store, key, result, "заявка не подтверждена", book, request.params)
-    if report.executed != abs(signed):
+    wanted = abs(signed)
+    if report.executed <= 0 or report.executed > wanted:
         restore_book(book, before)
         state["last_bar"] = stamp
         return _halt(
@@ -400,10 +404,18 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             store,
             key,
             result,
-            f"заявка исполнена не целиком: {report.executed} из {abs(signed)}",
+            f"заявка не исполнена: {report.executed} из {wanted}"
+            if report.executed <= 0
+            else f"исполнено больше заявленного: {report.executed} из {wanted}",
             book,
             request.params,
         )
+    if report.executed < wanted:
+        # Принимаем исполненную часть: книга повторяет минуту с этим потолком, остаток
+        # цель дозаберёт на следующих минутах.
+        restore_book(book, before)
+        advance(report.executed)
+        signed = int(book.last_signed)
 
     price = fill_price(report.price, last.close)
     reprice_fill(book, before, last.close, price)
@@ -421,6 +433,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     result["order"] = {
         "id": order_id,
         "signed": signed,
+        "requested": wanted,
         "executed": report.executed,
         "price": price,
         "time": local.strftime("%Y-%m-%d %H:%M"),
@@ -723,6 +736,8 @@ def _halt(
     book: _FillBook | None,
     params,
 ) -> dict[str, object]:
+    if not state.get("halted"):
+        result["halt_new"] = True
     state["halted"] = reason
     _trim_bars(state, book, params)
     if book is not None:

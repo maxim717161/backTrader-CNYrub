@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from cnyrub.live.vk import notify_vk, notify_status, notify_trade, status_text, trade_text
+from cnyrub.live.vk import halt_text, notify_vk, notify_status, notify_trade, status_text, trade_text
 
 
 def _fill(**overrides) -> dict[str, object]:
@@ -174,3 +174,49 @@ def test_post_sends_a_form_and_hides_the_token(monkeypatch):
     with pytest.raises(RuntimeError, match="вк не ответил") as error:
         vk._post("vk-secret", "42", "x")
     assert "vk-secret" not in str(error.value)
+
+
+def test_halt_text_only_for_a_new_halt():
+    halted = {
+        "strategy": "sixty",
+        "account_id": "2254834906",
+        "phase": "halted",
+        "halted": "позиция на счёте 0, в книге -3",
+        "secid": "CRZ6",
+        "held": -3,
+        "target": -3,
+        "halt_new": True,
+    }
+    assert halt_text(halted) == (
+        "стратегия sixty остановлена\n"
+        "счёт 2254834906\n"
+        "CRZ6\n"
+        "причина: позиция на счёте 0, в книге -3\n"
+        "позиция -3, цель -3\n"
+        "проверьте счёт и пришлите reconcile: true"
+    )
+    assert halt_text({**halted, "halt_new": False}) is None
+    repeated = dict(halted)
+    del repeated["halt_new"]
+    assert halt_text(repeated) is None
+
+
+def test_notify_trade_sends_the_halt_alert_once():
+    seen: list[str] = []
+
+    def post(token: str, peer_id: str, text: str) -> None:
+        seen.append(text)
+
+    result = {"strategy": "thirty", "phase": "halted", "halted": "заявка не подтверждена", "order": None, "halt_new": True}
+    notify_trade(result, environ={"VK_TOKEN": "t", "VK_USER_ID": "42"}, post=post)
+    assert result["vk"] == "отправлено"
+    assert "заявка не подтверждена" in seen[0]
+    quiet = {"strategy": "thirty", "phase": "halted", "halted": "заявка не подтверждена", "order": None}
+    notify_trade(quiet, environ={"VK_TOKEN": "t", "VK_USER_ID": "42"}, post=post)
+    assert "vk" not in quiet and len(seen) == 1
+
+
+def test_trade_text_marks_a_partial_fill():
+    result = _fill(order={"signed": 3, "executed": 3, "requested": 10})
+    assert "исполнено частично: 3 из 10" in trade_text(result)
+    assert "частично" not in trade_text(_fill(order={"requested": 10}))

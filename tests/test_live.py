@@ -801,7 +801,7 @@ def test_position_mismatch_halts_and_reconcile_adopts_the_broker():
     assert broker.orders == []
 
 
-def test_partial_fill_restores_the_book_and_halts():
+def _breakout_ready():
     broker = FakeBroker()
     store = MemoryStore()
     start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
@@ -810,14 +810,93 @@ def test_partial_fill_restores_the_book_and_halts():
     broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
     run_minute(request, broker, store, now=start + timedelta(minutes=6))
     broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    return broker, store, request, start
+
+
+def test_partial_fill_is_accepted_and_the_rest_is_taken_next_minute():
+    broker, store, request, start = _breakout_ready()
     broker.executed = 3
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["phase"] == "order"
+    assert filled["halted"] is None
+    assert "halt_new" not in filled
+    assert filled["order"]["requested"] == 10
+    assert filled["order"]["executed"] == 3
+    assert filled["order"]["signed"] == 3
+    assert filled["held"] == 3
+    assert filled["target"] > 3
+    book = store.load(state_key("short", ACCOUNT))["book"]
+    assert book["held"] == 3 == broker.lots
+    assert book["commission"] == pytest.approx(3 * COMMISSION)
+
+    broker.executed = None
+    broker._candles.append(_candle(start + timedelta(minutes=7), 10.5, high=10.55, low=10.4))
+    more = run_minute(request, broker, store, now=start + timedelta(minutes=8))
+    assert more["phase"] == "order"
+    assert more["held"] == broker.lots
+    assert more["order"]["executed"] == more["order"]["requested"]
+
+
+def test_partial_close_keeps_the_remaining_position_and_its_stop():
+    broker = FakeBroker()
+    broker.lots = 10
+    broker.executed = 4
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = 10
+    book.target = 10
+    book.avg = 10.0
+    book.stop_dist = 0.2
+    book.stop_px = 9.8
+    book.base = 10
+    book.entry_i = 1
+    book.opened = 10
+    book.peak = 10
+    book.commission = 10 * COMMISSION
+    _ready(store, _quiet_bars(start, 5), export_book(book))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
+    assert result["phase"] == "order"
+    assert result["order"]["requested"] == 10
+    assert result["order"]["executed"] == 4
+    assert result["held"] == 6 == broker.lots
+    assert result["order"]["pnl"] == pytest.approx(-0.6 * 4 * 1000 - 4 * COMMISSION)
+    saved = store.load(state_key("short", ACCOUNT))["book"]
+    assert saved["held"] == 6
+    assert saved["target"] == 0
+    assert saved["stop_px"] == pytest.approx(9.8)
+
+    broker.executed = None
+    broker._candles.append(_candle(start + timedelta(minutes=6), 9.4, high=9.5, low=9.3))
+    last = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert last["held"] == 0 == broker.lots
+    assert last["order"]["pnl"] is not None
+
+
+def test_zero_fill_halts_once_and_flags_the_halt_for_the_alert():
+    broker, store, request, start = _breakout_ready()
+    broker.executed = 0
     halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
     assert halted["phase"] == "halted"
-    assert "3" in halted["halted"]
+    assert halted["halted"] == "заявка не исполнена: 0 из 10"
+    assert halted["halt_new"] is True
     book = store.load(state_key("short", ACCOUNT))["book"]
     assert book["held"] == 0
     assert book["target"] != 0
     assert len(broker.orders) == 1
+    again = run_minute(request, broker, store, now=start + timedelta(minutes=8))
+    assert again["phase"] == "halted"
+    assert "halt_new" not in again
+    assert len(broker.orders) == 1
+
+
+def test_overfill_halts():
+    broker, store, request, start = _breakout_ready()
+    broker.executed = 11
+    halted = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert halted["phase"] == "halted"
+    assert "больше заявленного" in halted["halted"]
 
 
 def test_missed_bar_stop_sends_one_reduce_and_keeps_open_equity():
