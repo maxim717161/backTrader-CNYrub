@@ -196,6 +196,15 @@ def _resize_for_pullback(
     book.target = (1 if book.base > 0 else -1) * desired
 
 
+def _stop_distance(stop_mult: float | None, prior_range: float, min_stop: float | None) -> float | None:
+    if stop_mult is None:
+        return None
+    width = stop_mult * prior_range if prior_range == prior_range else 0.0
+    if min_stop is not None and min_stop > 0:
+        width = max(width, min_stop)
+    return width
+
+
 def step_minute(
     book: _FillBook,
     index: int,
@@ -240,8 +249,14 @@ def step_minute(
     eff_high: float | None = None,
     surge_cap: float | None = None,
     leverage: float | None = None,
+    min_stop: float | None = None,
+    skip_flat: bool = False,
 ) -> None:
-    """Одна минута: сначала кусок по её закрытию, потом решение на следующие."""
+    """Одна минута: сначала кусок по её закрытию, потом решение на следующие.
+
+    min_stop — наименьшая дистанция стопа в цене. skip_flat запрещает вход,
+    когда медианный диапазон окна нулевой: в такой минутке стоп не имеет смысла.
+    """
     if day == last_day and (book.held != 0 or book.target != 0):
         book.target = 0
         if book.held != 0 and not book.reason:
@@ -332,6 +347,9 @@ def step_minute(
         return
     if close <= 0:
         return
+    flat_window = not prior_range > 0
+    if skip_flat and stop_mult is not None and flat_window:
+        return
     if leverage is not None and leverage > 0:
         if book.equity is None:
             raise ValueError("Для плеча нужен текущий счёт")
@@ -341,7 +359,7 @@ def step_minute(
             lots = min(lots, int(book.equity // margin))
         if lots < 1:
             return
-        book.stop_dist = None if stop_mult is None else stop_mult * prior_range
+        book.stop_dist = _stop_distance(stop_mult, prior_range, min_stop)
     elif breakout_span:
         if prior_range == prior_range and prior_range > 0:
             beyond = (close - prior_high) / prior_range if side > 0 else (prior_low - close) / prior_range
@@ -353,7 +371,7 @@ def step_minute(
         if sized is None:
             return
         lots = sized
-        book.stop_dist = None if stop_mult is None else stop_mult * prior_range
+        book.stop_dist = _stop_distance(stop_mult, prior_range, min_stop)
     elif risk_fraction:
         if book.equity is None:
             raise ValueError("Для доли риска нужен текущий счёт")
@@ -367,7 +385,7 @@ def step_minute(
             return
         lots, book.stop_dist = sized_risk
     else:
-        book.stop_dist = None if stop_mult is None else stop_mult * prior_range
+        book.stop_dist = _stop_distance(stop_mult, prior_range, min_stop)
         lots = entry_lots(size_mode, side, close, prior_high, prior_low, prior_range)
     book.reason = ""
     book.entry = "up" if side > 0 else "down"

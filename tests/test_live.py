@@ -497,12 +497,12 @@ def _ready(store: MemoryStore, bars: list[dict], book: dict | None = None, strat
 def test_history_loads_one_day_and_does_not_order_until_the_next_call():
     broker = FakeBroker()
     store = MemoryStore()
-    day = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
-    previous = datetime(2026, 9, 27, 10, 0, tzinfo=MSK)
+    day = datetime(2026, 9, 29, 10, 0, tzinfo=MSK)
+    previous = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
     broker._candles = [_candle(previous + timedelta(minutes=i), 10.0) for i in range(2)]
     broker._candles += [_candle(day + timedelta(minutes=i), 10.0) for i in range(2)]
     request = _request(channel=4, exit_channel=4)
-    now = datetime(2026, 9, 28, 12, 0, tzinfo=MSK)
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=MSK)
     first = run_minute(request, broker, store, now=now)
     assert first["phase"] == "history"
     assert first["ready"] is False
@@ -513,12 +513,61 @@ def test_history_loads_one_day_and_does_not_order_until_the_next_call():
     assert second["ready"] is True
     assert second["bars"] == 4
     assert broker.orders == []
-    broker._candles.append(_candle(datetime(2026, 9, 28, 10, 2, tzinfo=MSK), 10.4, high=10.4, low=10.3))
-    third = run_minute(request, broker, store, now=datetime(2026, 9, 28, 12, 5, tzinfo=MSK))
+    broker._candles.append(_candle(datetime(2026, 9, 29, 10, 2, tzinfo=MSK), 10.4, high=10.4, low=10.3))
+    third = run_minute(request, broker, store, now=datetime(2026, 9, 29, 12, 5, tzinfo=MSK))
     assert third["order"] is None
     assert third["phase"] == "signal"
     assert third["target"] != 0
     assert broker.orders == []
+
+
+def test_weekend_minutes_are_skipped_unless_asked():
+    friday = datetime(2026, 10, 16, 10, 0, tzinfo=MSK)
+    saturday = datetime(2026, 10, 17, 10, 0, tzinfo=MSK)
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=MSK)
+
+    def run(**overrides):
+        broker = FakeBroker()
+        store = MemoryStore()
+        _ready(store, _quiet_bars(friday, 5))
+        broker._candles.append(_candle(saturday, 10.4, high=10.45, low=10.3))
+        result = run_minute(_request(**overrides), broker, store, now=now)
+        return result, store.load(state_key("short", ACCOUNT))
+
+    quiet, saved = run()
+    assert quiet["phase"] == "idle"
+    assert len(saved["bars"]) == 5
+    busy, saved = run(weekends=True)
+    assert busy["phase"] == "signal"
+    assert len(saved["bars"]) == 6
+
+
+def test_thin_market_guards_are_on_for_the_stop_windows():
+    for name in ("thirty", "fortyfive", "sixty"):
+        params = PRESETS[name]
+        assert params.min_stop == pytest.approx(0.008)
+        assert params.cooldown == 15
+        assert params.skip_flat is True
+        assert params.weekends is False
+    assert PRESETS["long"].min_stop == pytest.approx(0.008)
+    assert PRESETS["long"].skip_flat is True
+    assert PRESETS["long"].cooldown == 0
+    assert PRESETS["short"].min_stop is None and PRESETS["short"].cooldown == 0
+    request = parse_event(
+        {
+            "strategy": "sixty",
+            "account_id": ACCOUNT,
+            "token": "t",
+            "min_stop": 0.012,
+            "cooldown": 0,
+            "skip_flat": False,
+            "weekends": True,
+        }
+    )
+    assert request.params.min_stop == pytest.approx(0.012)
+    assert request.params.cooldown == 0
+    assert request.params.skip_flat is False
+    assert request.params.weekends is True
 
 
 def test_every_window_keeps_ten_sessions_past_its_own_goal():

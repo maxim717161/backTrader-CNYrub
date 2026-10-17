@@ -222,7 +222,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
 
     book = load_book(state.get("book") if isinstance(state.get("book"), dict) else None, front.secid, None)
     if not state.get("ready"):
-        _pull_history_day(state, broker, front, moment.date())
+        _pull_history_day(state, broker, front, moment.date(), request.params.weekends)
         bars = list(state.get("bars") or [])
         goal = history_goal(request.params)
         history_before = state.get("history_before")
@@ -269,7 +269,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
 
     sync_before = state.get("sync_from")
     bars_before = len(state.get("bars") or [])
-    fresh = _fresh_candles(state, broker, front.uid, moment)
+    fresh = _fresh_candles(state, broker, front.uid, moment, request.params.weekends)
     if fresh is None:
         _save_trimmed(state, store, key, book, request.params)
         result["phase"] = "catchup"
@@ -343,7 +343,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         clock_vol=levels["clock_vol"],
         entry_ready=levels["entry_ready"],
         clearance=0.0,
-        cooldown=0,
+        cooldown=request.params.cooldown,
         clock_volume=False,
         clock_cap=request.params.clock_cap,
         size_mode=request.params.size_mode,
@@ -366,6 +366,8 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         eff_high=request.params.eff_high,
         surge_cap=request.params.surge_cap,
         leverage=request.params.leverage,
+        min_stop=request.params.min_stop,
+        skip_flat=request.params.skip_flat,
     )
     stamp = _bar(last)["t"]
     signed = int(book.last_signed)
@@ -517,7 +519,9 @@ def _adopt_instrument(state: dict[str, object], front: Instrument, trade_from: d
     return "reset"
 
 
-def _pull_history_day(state: dict[str, object], broker, front: Instrument, today: date) -> None:
+def _pull_history_day(
+    state: dict[str, object], broker, front: Instrument, today: date, weekends: bool = False
+) -> None:
     walked = int(state.get("history_walked") or 0)
     if walked >= HISTORY_WALKS:
         return
@@ -529,14 +533,21 @@ def _pull_history_day(state: dict[str, object], broker, front: Instrument, today
     candles = [
         candle
         for candle in broker.candles(front.uid, start, end)
-        if start <= candle.time.astimezone(MSK) < end
+        if start <= candle.time.astimezone(MSK) < end and (weekends or _weekday(candle.time))
     ]
     state["bars"] = _merge_bars(list(state.get("bars") or []), [_bar(candle) for candle in candles])
     state["history_before"] = day.isoformat()
     state["history_walked"] = walked + 1
 
 
-def _fresh_candles(state: dict[str, object], broker, uid: str, now: datetime) -> list[Candle] | None:
+def _weekday(moment: datetime) -> bool:
+    """Суббота и воскресенье: сессия выходного дня тонкая, окно по ней не считаем."""
+    return moment.astimezone(MSK).weekday() < 5
+
+
+def _fresh_candles(
+    state: dict[str, object], broker, uid: str, now: datetime, weekends: bool = False
+) -> list[Candle] | None:
     """Новые закрытые свечи после last_bar.
 
     None значит, что до текущей минуты ещё больше трёх суток. Курсор
@@ -559,7 +570,7 @@ def _fresh_candles(state: dict[str, object], broker, uid: str, now: datetime) ->
         extra = [
             _bar(candle)
             for candle in downloaded
-            if cursor <= candle.time.astimezone(MSK) < end
+            if cursor <= candle.time.astimezone(MSK) < end and (weekends or _weekday(candle.time))
         ]
         before = len(bars)
         bars = _merge_bars(bars, extra)

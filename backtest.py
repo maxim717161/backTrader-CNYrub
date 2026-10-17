@@ -540,6 +540,8 @@ def simulate(
     eff_high: float | None = None,
     surge_cap: float | None = None,
     leverage: float | None = None,
+    min_stop: float | None = None,
+    skip_flat: bool = False,
 ) -> list[dict[str, object]]:
     """Те же правила, что у стратегии в backtrader, без самого движка.
 
@@ -645,6 +647,8 @@ def simulate(
             eff_high=eff_high,
             surge_cap=surge_cap,
             leverage=leverage,
+            min_stop=min_stop,
+            skip_flat=skip_flat,
         )
         if marks is not None:
             marks.append(marked_equity(book, float(close[i])))

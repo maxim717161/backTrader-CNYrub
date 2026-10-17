@@ -34,7 +34,17 @@ class StrategyParams:
     eff_high: float | None = None
     surge_cap: float | None = None
     leverage: float | None = None
+    min_stop: float | None = None
+    cooldown: int = 0
+    skip_flat: bool = False
+    weekends: bool = False
 
+
+# Дистанция стопа не меньше 8 тиков (0,008): это 4 комиссии круга и 10-й процентиль
+# будней по окнам 30, 45 и 60. Пауза 15 минуток после стопа разрывает цепочку
+# «вход, стоп, вход» на одном и том же уровне. Выходные по умолчанию не торгуем.
+MIN_STOP = 0.008
+COOLDOWN = 15
 
 # Те же числа, что у WINDOWS в исследовании. Короткое окно без уменьшения
 # на откате. Длинное — стоп 22 медианы и уменьшение до половины на 100 медианах.
@@ -69,6 +79,8 @@ PRESETS: dict[str, StrategyParams] = {
         scale_step=100.0,
         scale_back=50.0,
         scale_floor=0.5,
+        min_stop=MIN_STOP,
+        skip_flat=True,
     ),
     "thirty": StrategyParams(
         channel=30,
@@ -87,6 +99,9 @@ PRESETS: dict[str, StrategyParams] = {
         eff_high=0.5,
         surge_cap=3.0,
         leverage=4.0,
+        min_stop=MIN_STOP,
+        cooldown=COOLDOWN,
+        skip_flat=True,
     ),
     "fortyfive": StrategyParams(
         channel=45,
@@ -102,6 +117,9 @@ PRESETS: dict[str, StrategyParams] = {
         scale_back=None,
         scale_floor=0.5,
         leverage=4.0,
+        min_stop=MIN_STOP,
+        cooldown=COOLDOWN,
+        skip_flat=True,
     ),
     "sixty": StrategyParams(
         channel=60,
@@ -117,6 +135,9 @@ PRESETS: dict[str, StrategyParams] = {
         scale_back=None,
         scale_floor=0.5,
         leverage=5.0,
+        min_stop=MIN_STOP,
+        cooldown=COOLDOWN,
+        skip_flat=True,
     ),
 }
 
@@ -133,8 +154,10 @@ _OPTIONAL_FLOATS = (
     "eff_high",
     "surge_cap",
     "leverage",
+    "min_stop",
 )
-_OPTIONAL_INTS = ("channel", "exit_channel", "loss_bars")
+_OPTIONAL_INTS = ("channel", "exit_channel", "loss_bars", "cooldown")
+_OPTIONAL_FLAGS = ("skip_flat", "weekends")
 
 
 @dataclass(frozen=True)
@@ -192,6 +215,9 @@ def _apply_overrides(params: StrategyParams, data: dict[str, object]) -> Strateg
             continue
         raw = data[name]
         changes[name] = None if raw is None else float(raw)
+    for name in _OPTIONAL_FLAGS:
+        if name in data:
+            changes[name] = _flag(data[name])
     if "size_mode" in data and data["size_mode"] is not None:
         changes["size_mode"] = str(data["size_mode"])
     if "loss_bars" in changes and changes["loss_bars"] == 0:

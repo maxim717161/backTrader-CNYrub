@@ -102,8 +102,8 @@ def test_open_position_is_closed_on_the_last_day_and_not_reopened():
         assert buy_and_hold(frame, 20) == trade["pnlcomm"]
 
 
-def _signal_book(**overrides: object) -> _FillBook:
-    book = _FillBook("CRZ5", 100_000.0)
+def _signal_book(book: _FillBook | None = None, index: int = 100, **overrides: object) -> _FillBook:
+    book = _FillBook("CRZ5", 100_000.0) if book is None else book
     args = dict(
         opened=10.0,
         high=10.3,
@@ -143,7 +143,7 @@ def _signal_book(**overrides: object) -> _FillBook:
         leverage=4.0,
     )
     args.update(overrides)
-    step_minute(book, 100, **args)
+    step_minute(book, index, **args)
     return book
 
 
@@ -587,3 +587,36 @@ def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():
     assert 600 in extra
     assert 14880 in extra
     assert 14400 not in extra
+
+
+def test_flat_window_blocks_entry_when_asked_and_floors_the_stop_otherwise():
+    assert _signal_book(prior_range=0.0).target == 39
+    assert _signal_book(prior_range=0.0).stop_dist == 0.0
+    assert _signal_book(prior_range=0.0, skip_flat=True).target == 0
+    assert _signal_book(prior_range=float("nan"), skip_flat=True).target == 0
+    floored = _signal_book(prior_range=0.0, min_stop=0.008)
+    assert floored.stop_dist == pytest.approx(0.008)
+    assert _signal_book(prior_range=0.001, min_stop=0.008).stop_dist == pytest.approx(0.008)
+    assert _signal_book(prior_range=0.05, min_stop=0.008).stop_dist == pytest.approx(0.4)
+
+
+def test_pause_after_a_stop_blocks_the_next_entry():
+    def stopped() -> _FillBook:
+        book = _FillBook("CRZ5", 100_000.0)
+        book.held = 3
+        book.avg = 10.0
+        book.stop_dist = 0.1
+        book.stop_px = 9.9
+        book.entry_i = 90
+        book.opened = 3
+        book.peak = 3
+        return book
+
+    book = _signal_book(stopped(), 100, low=9.8, high=10.0, close=9.85, cooldown=15)
+    assert book.trades[-1]["reason"] == "stop"
+    assert book.cooldown_until == 115
+    assert book.held == 0
+    again = _signal_book(book, 110, cooldown=15)
+    assert again.target == 0
+    later = _signal_book(book, 115, cooldown=15)
+    assert later.target == 39
