@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from backtest import WINDOWS, channel_view
-from cnyrub.engine import _FillBook, export_book, reprice_fill, step_minute
+from cnyrub.engine import COMMISSION, _FillBook, export_book, reprice_fill, step_minute
 from cnyrub.live.broker import (
     TinkoffClient,
     FillReport,
@@ -841,7 +841,7 @@ def test_missed_bar_stop_sends_one_reduce_and_keeps_open_equity():
     assert result["phase"] == "order"
     assert result["order"]["signed"] == -10
     assert result["order"]["reason"] == "stop"
-    assert result["order"]["pnl"] == pytest.approx(-10)
+    assert result["order"]["pnl"] == pytest.approx(-10 * COMMISSION)
     assert len(broker.orders) == 1
     saved = store.load(state_key("short", ACCOUNT))["book"]
     assert saved["held"] == 2
@@ -886,7 +886,7 @@ def test_closing_a_future_reports_the_trade_result():
     result = run_minute(_request(), broker, store, now=start + timedelta(minutes=6))
     assert result["order"]["signed"] == -10
     assert result["order"]["reason"] == "stop"
-    assert result["order"]["pnl"] == pytest.approx(-6010)
+    assert result["order"]["pnl"] == pytest.approx(-6000 - 10 * COMMISSION)
     assert broker.lots == 0
     assert [item["uid"] for item in broker.orders] == [broker.instrument.uid]
 

@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import pytest
 
-from cnyrub.engine import _FillBook, step_minute
+from cnyrub.engine import COMMISSION, _FillBook, step_minute
 
 from backtest import (
     WINDOWS,
@@ -54,7 +54,7 @@ def test_stop_is_measured_from_the_fill_in_backtrader_and_the_simulator():
         assert trade["direction"] == "long"
         assert trade["reason"] == "stop"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
-        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2 * COMMISSION)
 
 
 def test_tighter_stop_without_a_channel_exit_matches_backtrader():
@@ -69,7 +69,7 @@ def test_tighter_stop_without_a_channel_exit_matches_backtrader():
         assert trade["direction"] == "long"
         assert trade["reason"] == "stop"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
-        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2 * COMMISSION)
 
 
 def test_without_a_stop_the_position_is_held_until_expiry():
@@ -83,7 +83,7 @@ def test_without_a_stop_the_position_is_held_until_expiry():
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
-        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2 * COMMISSION)
 
 
 def test_open_position_is_closed_on_the_last_day_and_not_reopened():
@@ -305,7 +305,7 @@ def test_inverse_size_uses_three_lots_on_a_fresh_breakout():
         assert trade["lots"] == 3
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 3 * 1000)
-        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6 * COMMISSION)
 
 
 def _front_frame() -> pd.DataFrame:
@@ -327,7 +327,7 @@ def test_warmup_bars_form_the_channel_and_the_fill_opens_the_front_contract():
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["reason"] == "expiry"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 1000)
-        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 1000 - 2 * COMMISSION)
 
 
 def test_a_fill_during_the_warmup_month_is_not_a_trade():
@@ -367,7 +367,7 @@ def test_a_fixed_ruble_stop_sizes_the_position_and_exits_at_the_minute_close():
         assert trade["lots"] == 3
         assert trade["reason"] == "stop"
         assert trade["pnl"] == pytest.approx((exit_ - entry) * 3 * 1000)
-        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6)
+        assert trade["pnlcomm"] == pytest.approx((exit_ - entry) * 3 * 1000 - 6 * COMMISSION)
         assert 3 * 285 + 6 <= 0.10 * cash
     assert strategy.broker.getvalue() == pytest.approx(cash + simulated[0]["pnlcomm"])
 
@@ -431,7 +431,7 @@ def test_breakout_percent_scales_contracts_down_from_the_margin_cap():
     assert len(simulated) == len(strategy.trades) == 1
     for trade in (simulated[0], strategy.trades[0]):
         assert trade["lots"] == 4
-        assert trade["pnlcomm"] == pytest.approx(-8)
+        assert trade["pnlcomm"] == pytest.approx(-8 * COMMISSION)
     far = rows.copy()
     far[5] = (10.0, 22.5, 10.0, 22.5, 1000.0)
     assert simulate("CRZ5", _days(far), 5, **kwargs) == []
@@ -477,15 +477,15 @@ def test_a_position_above_ten_contracts_is_built_and_closed_one_minute_at_a_time
     assert len(simulated) == len(strategy.trades) == 1
     bought = (10.00, 10.10, 10.20, 10.30)
     sold = (9.70, 9.60, 9.50, 9.40)
-    sizes = (10, 10, 10, 4)
-    average = sum(price * size for price, size in zip(bought, sizes)) / 34
+    sizes = (10, 10, 10, 3)
+    average = sum(price * size for price, size in zip(bought, sizes)) / 33
     gross = sum((price - average) * size * 1000 for price, size in zip(sold, sizes))
     for trade in (simulated[0], strategy.trades[0]):
-        assert trade["lots"] == 34
+        assert trade["lots"] == 33
         assert trade["reason"] == "stop"
         assert trade["bars"] == 7
         assert trade["pnl"] == pytest.approx(gross)
-        assert trade["pnlcomm"] == pytest.approx(gross - 68)
+        assert trade["pnlcomm"] == pytest.approx(gross - 66 * COMMISSION)
     assert strategy.broker.getvalue() == pytest.approx(cash + simulated[0]["pnlcomm"])
 
 
@@ -505,7 +505,7 @@ def test_a_pullback_cuts_the_position_and_a_return_builds_it_back():
     # откат до 0.05 и меньше возвращает полный размер.
     closes = [10.0, 10.0, 10.0, 10.40, 10.00, 10.10, 10.20, 10.30, 10.20, 10.15, 10.26, 10.28, 10.28]
     frame = _minute_frame(closes)
-    cash = 114_800.0
+    cash = 118_000.0
     kwargs = dict(
         stop_mult=None,
         exit_channel=0,
@@ -532,7 +532,7 @@ def test_a_pullback_cuts_the_position_and_a_return_builds_it_back():
         assert trade["reason"] == "expiry"
         assert trade["scaled"] is True
         assert trade["pnl"] == pytest.approx(gross)
-        assert trade["pnlcomm"] == pytest.approx(gross - 100)
+        assert trade["pnlcomm"] == pytest.approx(gross - 100 * COMMISSION)
     assert len(strategy.values) == len(marks)
     for (_, broker_value), marked in zip(strategy.values, marks, strict=True):
         assert broker_value == pytest.approx(marked, abs=0.02)
@@ -543,7 +543,7 @@ def test_a_pullback_cuts_the_position_and_a_return_builds_it_back():
     assert len(held) == 1
     assert held[0]["scaled"] is False
     plain = (10.26 - average) * 40 * 1000
-    assert held[0]["pnlcomm"] == pytest.approx(plain - 80)
+    assert held[0]["pnlcomm"] == pytest.approx(plain - 80 * COMMISSION)
 
 
 def test_entry_lots_step_down_as_the_breakout_grows():

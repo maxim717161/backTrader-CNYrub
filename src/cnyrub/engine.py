@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import date
 
 MULTIPLIER = 1000.0
-COMMISSION = 1.0
+COMMISSION = 5.0
 # За минуту позиция меняется не больше чем на столько контрактов.
 FILL_PER_MINUTE = 10
 CLOCK_DAYS = 5
