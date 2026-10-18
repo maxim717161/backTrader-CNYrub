@@ -189,8 +189,6 @@ def parse_event(event: object) -> RunRequest:
         raise ValueError("нужен account_id")
     token = _text(data.get("token"))
     secret_id = _text(data.get("secret_id"))
-    if token is None and secret_id is None:
-        raise ValueError("нужен token или secret_id")
     params = _apply_overrides(params, data)
     return RunRequest(
         strategy=strategy,

@@ -2,8 +2,9 @@
 
 Каждый запуск, и таймер и тестовый вызов, ставит заявки на реальный счёт
 Т-Инвестиций. Исключение — поле probe: оно только пишет пробу в ВК.
-Токен передаётся полем token в тестовом JSON либо полем
-secret_id: тогда он читается из Lockbox, ключ записи token или TOKEN.
+Токен берётся по порядку: поле token в тестовом JSON; поле secret_id (читается
+из Lockbox, ключ записи token или TOKEN); переменная окружения TOKEN — так он
+приходит, если секрет Lockbox подключён к версии функции.
 В лог и в ответ функции токен не попадает. После каждого запуска
 в лог пишется одна строка JSON — тот же ответ: фаза, остановка,
 заявка, контракт, число минуток, позиция и цель.
@@ -119,10 +120,14 @@ def _handle(
     try:
         if store is None:
             store = object_store_from_env()
-        if token is None:
+        if token is None and request.secret_id is not None:
             trace.mark("Lockbox: чтение токена")
             reader = secret_reader or read_lockbox_token
-            token = reader(request.secret_id or "")
+            token = reader(request.secret_id)
+        if token is None:
+            token = (os.environ.get("TOKEN") or "").strip() or None
+        if token is None:
+            raise ValueError("нужен token, secret_id или переменная окружения TOKEN из секрета Lockbox")
         if broker_factory is None:
             broker = TinkoffClient(token)
         else:

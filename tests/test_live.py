@@ -291,11 +291,11 @@ def test_parse_https_invoke_envelope():
         parse_event({"httpMethod": "POST", "headers": {}, "body": "", "isBase64Encoded": False})
 
 
-def test_parse_requires_account_and_a_secret():
+def test_parse_requires_an_account_but_not_a_token():
     with pytest.raises(ValueError):
         parse_event({"strategy": "short", "token": "t"})
-    with pytest.raises(ValueError):
-        parse_event({"strategy": "short", "account_id": "1"})
+    bare = parse_event({"strategy": "short", "account_id": "1"})
+    assert bare.token is None and bare.secret_id is None
     with pytest.raises(ValueError):
         parse_event({"strategy": "short", "account_id": "1", "token": "t", "fill_per_minute": -1})
     with pytest.raises(ValueError):
@@ -1370,6 +1370,31 @@ def test_client_stops_when_the_time_budget_is_spent():
     client._deadline = broker_module.time.monotonic() - 1
     with pytest.raises(RuntimeError, match="лимит времени"):
         client._call("OrdersService", "GetOrders", {})
+
+
+def test_timer_payload_without_a_token_uses_the_function_secret(monkeypatch, capsys):
+    seen: list[str] = []
+
+    def factory(token: str):
+        seen.append(token)
+        return FakeBroker()
+
+    event = {"strategy": "short", "account_id": ACCOUNT, "channel": 3, "exit_channel": 0, "clock_cap": None}
+    monkeypatch.setenv("TOKEN", "  env-secret  ")
+    result = handle(event, store=MemoryStore(), now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK), broker_factory=factory)
+    assert seen == ["env-secret"]
+    assert "env-secret" not in json.dumps(result) and "env-secret" not in capsys.readouterr().out
+
+    seen.clear()
+    handle({**event, "token": "field-token"}, store=MemoryStore(), now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK), broker_factory=factory)
+    assert seen == ["field-token"]
+
+
+def test_a_run_without_any_token_source_fails_clearly(monkeypatch):
+    monkeypatch.delenv("TOKEN", raising=False)
+    event = {"strategy": "short", "account_id": ACCOUNT}
+    with pytest.raises(ValueError, match="TOKEN"):
+        handle(event, store=MemoryStore(), now=datetime(2026, 9, 28, 12, 0, tzinfo=MSK), notifier=lambda result: None)
 
 
 def test_handler_uses_the_token_only_to_build_the_broker():
