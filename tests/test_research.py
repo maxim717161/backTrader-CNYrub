@@ -275,3 +275,29 @@ def test_table_formats_intervals_and_event_tuples():
     frame = pd.DataFrame({"a": [(0.1, -0.2, 0.3)], "b": [(1.5, 2.0)]}, index=["x"])
     text = battery.table(frame)
     assert "+0.100 [-0.200; +0.300]" in text and "+1.5 (t=+2.0)" in text
+
+
+def test_stop_is_filled_at_the_open_when_price_gaps_through_it():
+    jump = np.zeros(MINUTES)
+    jump[50] = -0.05
+    market = synthetic([jump])
+    data = core.arrays(market)
+    data["o"] = data["o"].copy()
+    data["o"][50] = data["c"][50]
+    entry = core.Entry(index=10, side=1, stop=0.01)
+    trades = core.run_entries(data, [entry])
+    assert trades.iloc[0]["reason"] == "stop"
+    entry_price = data["c"][11]
+    assert trades.iloc[0]["gross"] < -0.01 * core.MULTIPLIER
+    assert trades.iloc[0]["gross"] == pytest.approx((data["o"][50] - entry_price) * core.MULTIPLIER)
+
+
+def test_short_stop_is_filled_at_the_open_when_price_gaps_up():
+    jump = np.zeros(MINUTES)
+    jump[50] = 0.05
+    market = synthetic([jump])
+    data = core.arrays(market)
+    data["o"] = data["o"].copy()
+    data["o"][50] = data["c"][50]
+    trades = core.run_entries(data, [core.Entry(index=10, side=-1, stop=0.01)])
+    assert trades.iloc[0]["gross"] == pytest.approx(-(data["o"][50] - data["c"][11]) * core.MULTIPLIER)
