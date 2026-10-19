@@ -14,7 +14,7 @@ from research.families import Spec
 OUT = Path(__file__).resolve().parent
 
 
-COUNT_COLUMNS = ("сделок", "вариантов", "net>0", "год", "удержание")
+COUNT_COLUMNS = ("сделок", "вариантов", "net>0", "gross>0", "t>2", "в плюсе", "год", "удержание", "дней", "контрактов", "минуток")
 
 
 def md(frame: pd.DataFrame, digits: int = 1, index: bool = True) -> str:
