@@ -329,11 +329,13 @@ def run_entries(
 
     Вход по закрытию минуты index+delay (так делает и живая функция: сигнал на закрытии,
     заявка исполняется следующей минуткой). Стоп и цель проверяются по high/low следующих
-    минуток, внутри минутки стоп приоритетнее цели. hold — предельное число минуток
+    минуток, внутри минутки стоп приоритетнее цели. Стоп исполняется по худшей из цены стопа и
+    открытия минутки: пролетевший через стоп разрыв (ночь, выходные, новость) не обрезается.
+    Цель исполняется по своей цене, без улучшения на разрыве. hold — предельное число минуток
     (0 — без предела). Конец дня закрывает сделку, если flatten_day, конец контракта —
     всегда. Результат — рубли на контракт после комиссии и проскальзывания."""
     cost = round_trip_cost()
-    close, high, low, day = data["c"], data["h"], data["l"], data["day"]
+    close, high, low, day, open_ = data["c"], data["h"], data["l"], data["day"], data["o"]
     n = len(close)
     if "_end_day" not in data:
         data["_end_day"] = _segment_ends(np.char.add(data["contract"].astype(str), day.astype("datetime64[D]").astype(str)))
@@ -369,7 +371,10 @@ def run_entries(
         k = limit - i - 1
         exit_px = close[limit]
         if first_stop is not None and (first_target is None or first_stop <= first_target):
-            k, exit_px, reason = first_stop, price - side * entry.stop, "stop"
+            stop_px = price - side * entry.stop
+            bar_open = open_[i + 1 + first_stop]
+            exit_px = min(stop_px, bar_open) if side > 0 else max(stop_px, bar_open)
+            k, reason = first_stop, "stop"
         elif first_target is not None:
             k, exit_px, reason = first_target, price + side * entry.target, "target"
         elif entry.hold and limit - i >= entry.hold:
