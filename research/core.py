@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BARS_DIR = ROOT / "data" / "bars"
 MULTIPLIER = 1000.0
 TICK = 0.001
+UNIT = TICK
 COMMISSION = 5.0
 SLIPPAGE_TICKS = 1.0
 SEED = 20261018
@@ -30,6 +31,17 @@ class Market:
 
     bars: pd.DataFrame
     grid: pd.DataFrame
+
+
+def configure(multiplier: float, tick: float, unit: float | None = None) -> None:
+    """Параметры инструмента: рублей за единицу цены, шаг цены и «тик сравнения».
+
+    Пороги правил заданы в тиках CR (0,001 при цене около 12,5, то есть 0,008% цены).
+    Для другого инструмента тот же относительный порог — UNIT = 8·10⁻⁵ цены, округлённый
+    до шага; так, например, разрыв «20 тиков» везде означает 0,16% цены."""
+    global MULTIPLIER, TICK, UNIT
+    MULTIPLIER, TICK = float(multiplier), float(tick)
+    UNIT = float(unit) if unit else TICK
 
 
 def round_trip_cost() -> float:
@@ -52,6 +64,10 @@ def load_front(weekdays_only: bool = True, bars_dir: Path = BARS_DIR) -> Market:
         frame = frame.loc[keep].copy()
         frame["contract"] = row["secid"]
         frames.append(frame)
+    return assemble(frames, weekdays_only)
+
+
+def assemble(frames: list[pd.DataFrame], weekdays_only: bool = True) -> Market:
     bars = pd.concat(frames, ignore_index=True).sort_values("datetime").reset_index(drop=True)
     if weekdays_only:
         bars = bars[bars["datetime"].dt.dayofweek < 5].reset_index(drop=True)

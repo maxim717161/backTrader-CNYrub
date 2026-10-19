@@ -18,7 +18,7 @@ def test_countertrend_grid_has_unique_labels_and_only_fades_signals():
 def test_countertrend_targets_exceed_round_trip_cost():
     from research import countertrend
 
-    assert min(countertrend.MIN_DISTANCES) * core.MULTIPLIER > core.round_trip_cost()
+    assert min(countertrend.min_distances()) * core.MULTIPLIER > core.round_trip_cost()
 
 
 def test_bounce_table_and_gap_table_run_on_synthetic_data():

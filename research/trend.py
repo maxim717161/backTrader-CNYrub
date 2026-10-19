@@ -18,7 +18,7 @@ import itertools
 from research import battery, core, evaluate, report
 from research.families import Spec
 
-MIN_STOP = 0.008
+MIN_STOP_TICKS = 8
 
 FOCUS = (
     "Для гипотезы о тренде нужны положительная автокорреляция, VR > 1 и Хёрст > 0,5 хотя бы "
@@ -36,9 +36,9 @@ INTRO = (
 def specs() -> list[Spec]:
     out: list[Spec] = []
     for channel, stop, flatten in itertools.product((15, 30, 60, 120, 240, 525), (2, 4, 8), (True, False)):
-        out.append(Spec("donchian", 1, dict(channel=channel, stop=stop, min_stop=MIN_STOP), flatten))
+        out.append(Spec("donchian", 1, dict(channel=channel, stop=stop, min_stop=MIN_STOP_TICKS * core.UNIT), flatten))
     for window, k, stop, flatten in itertools.product((60, 240), (2, 3), (4, 8), (True, False)):
-        out.append(Spec("zscore", 1, dict(window=window, k=k, stop=stop, min_stop=MIN_STOP), flatten))
+        out.append(Spec("zscore", 1, dict(window=window, k=k, stop=stop, min_stop=MIN_STOP_TICKS * core.UNIT), flatten))
     for lookback, hold in itertools.product((30, 60, 120, 240), (30, 60, 120)):
         out.append(Spec("momentum", 1, dict(lookback=lookback, every=hold, hold=hold, min_move=10)))
     for gap, hold in itertools.product((5, 10, 20), (0, 60)):

@@ -100,7 +100,7 @@ def build(spec: Spec, market: core.Market, data: dict[str, np.ndarray]) -> list[
         move = close - past
         stamp = market.bars.index
         aligned = ((stamp.hour * 60 + stamp.minute) % p["every"]) == 0
-        ok = aligned & (np.abs(move) >= p["min_move"] * core.TICK)
+        ok = aligned & (np.abs(move) >= p["min_move"] * core.UNIT)
         for i in np.flatnonzero(ok):
             add(i, 1 if move[i] > 0 else -1)
     elif spec.family == "gap":
@@ -108,7 +108,7 @@ def build(spec: Spec, market: core.Market, data: dict[str, np.ndarray]) -> list[
         previous_close = np.r_[np.nan, close[:-1]]
         same_contract = np.r_[False, data["contract"][1:] == data["contract"][:-1]]
         gap = data["o"] - previous_close
-        ok = s["first"] & same_contract & (np.abs(gap) >= p["min_gap"] * core.TICK)
+        ok = s["first"] & same_contract & (np.abs(gap) >= p["min_gap"] * core.UNIT)
         for i in np.flatnonzero(ok):
             add(i, 1 if gap[i] > 0 else -1)
     elif spec.family == "firsthour":
@@ -119,13 +119,13 @@ def build(spec: Spec, market: core.Market, data: dict[str, np.ndarray]) -> list[
         last_inside = inside & ~np.r_[inside[1:], False]
         last_inside |= inside & np.r_[start[1:] != start[:-1], True]
         move = close - data["o"][start]
-        ok = last_inside & (since >= window * 0.5) & (np.abs(move) >= p["min_move"] * core.TICK)
+        ok = last_inside & (since >= window * 0.5) & (np.abs(move) >= p["min_move"] * core.UNIT)
         for i in np.flatnonzero(ok):
             add(i, 1 if move[i] > 0 else -1)
     elif spec.family == "scalp":
         past = lagged_close(market, data, 1)
         move = close - past
-        ok = np.abs(move) >= p["min_move"] * core.TICK
+        ok = np.abs(move) >= p["min_move"] * core.UNIT
         for i in np.flatnonzero(ok):
             add(i, 1 if move[i] > 0 else -1)
     else:

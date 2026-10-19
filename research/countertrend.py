@@ -22,7 +22,11 @@ import pandas as pd
 from research import battery, core, evaluate, report
 from research.families import Spec, build
 
-MIN_DISTANCES = (0.015, 0.030)
+MIN_DISTANCE_TICKS = (15, 30)
+
+
+def min_distances() -> tuple[float, ...]:
+    return tuple(ticks * core.UNIT for ticks in MIN_DISTANCE_TICKS)
 
 FOCUS = (
     "Для гипотезы о возврате нужны отрицательная автокорреляция, VR < 1 и Хёрст < 0,5 — причём "
@@ -41,9 +45,9 @@ INTRO = (
 
 def specs() -> list[Spec]:
     out: list[Spec] = []
-    for channel, stop, target, floor, hold in itertools.product((30, 60, 120, 525), (4, 8), (2, 4, 8), MIN_DISTANCES, (60, 240)):
+    for channel, stop, target, floor, hold in itertools.product((30, 60, 120, 525), (4, 8), (2, 4, 8), min_distances(), (60, 240)):
         out.append(Spec("donchian", -1, dict(channel=channel, stop=stop, target=target, hold=hold, min_stop=floor)))
-    for window, k, stop, target, floor in itertools.product((60, 240), (2, 3), (4, 8), (2, 4, 8), MIN_DISTANCES):
+    for window, k, stop, target, floor in itertools.product((60, 240), (2, 3), (4, 8), (2, 4, 8), min_distances()):
         out.append(Spec("zscore", -1, dict(window=window, k=k, stop=stop, target=target, hold=120, min_stop=floor)))
     for lookback, hold in itertools.product((30, 60, 120, 240), (30, 60, 120)):
         out.append(Spec("momentum", -1, dict(lookback=lookback, every=hold, hold=hold, min_move=10)))
