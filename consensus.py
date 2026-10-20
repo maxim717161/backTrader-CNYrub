@@ -484,6 +484,50 @@ def run_consensus(
     )
 
 
+def conclusion(results: list[ConsensusResult]) -> str:
+    """Короткий итог набора: где сумма выше базы и где просадка меньше."""
+    base = next((item for item in results if item.rule.id == "base"), results[0])
+    others = [item for item in results if item.rule.id != "base"]
+    if not others:
+        return "В наборе только база, сравнивать не с чем."
+    best = max(others, key=lambda item: item.net)
+    calmest = max(others, key=lambda item: item.combined_drawdown)
+    above = [item for item in others if item.net > base.net + 0.5]
+    lines = [
+        f"База без фильтра: итог {_money(base.net)} руб., просадка суммы счетов {_money(base.combined_drawdown)} руб.",
+    ]
+    if above:
+        lines.append(
+            "Выше базы по сумме: "
+            + "; ".join(f"«{item.rule.title}» {_signed(item.net - base.net)}" for item in above)
+            + "."
+        )
+    else:
+        lines.append("Ни одно правило не дало сумму выше базы.")
+    best_parts = _part_nets(best.trades)
+    base_parts = _part_nets(base.trades)
+    weaker = [index for index, (left, right) in enumerate(zip(base_parts, best_parts, strict=True), start=1) if right < left - 0.5]
+    weaker_text = ", ".join(f"Ч{index}" for index in weaker) if weaker else "ни в одной"
+    lines.append(
+        f"Наибольшая сумма — «{best.rule.title}»: {_money(best.net)} руб., {_signed(best.net - base.net)} к базе. "
+        f"Части, где оно слабее базы: {weaker_text}."
+    )
+    lines.append(
+        f"Меньше всех просела сумма при «{calmest.rule.title}»: {_money(calmest.combined_drawdown)} руб., "
+        f"итог {_signed(calmest.net - base.net)} к базе."
+    )
+    headline = next((item for item in others if item.rule.id == "d3-grows"), None)
+    if headline is not None:
+        base_long = next((stats for stats in base.strategies if stats.name == "long"), None)
+        head_long = next((stats for stats in headline.strategies if stats.name == "long"), None)
+        if base_long is not None and head_long is not None:
+            lines.append(
+                f"Правило «{headline.rule.title}» даёт {_money(headline.net)} руб. ({_signed(headline.net - base.net)} к базе). "
+                f"Длинное окно при нём {_signed(head_long.net - base_long.net)} руб."
+            )
+    return "\n".join(lines)
+
+
 def _factor_text(factor: float | None) -> str:
     if factor is None:
         return "—"
@@ -523,7 +567,7 @@ def report(results: list[ConsensusResult]) -> str:
             f"{_money(item.net):>14} {_signed(delta):>14} {_factor_text(_profit_factor(item.trades)):>7} "
             f"{_money(item.combined_drawdown):>14} {_signed(dd_delta):>14}"
         )
-    lines.append("")
+    lines.extend(["", conclusion(results), ""])
     lines.append("Просадка — худшее падение суммы пяти счетов от её пика. К базе: больше нуля — просадка меньше.")
     lines.append("Части истории, сумма пяти счетов: " + "  ".join(f"{secids[0]}–{secids[-1]}" for secids in PARTS))
     lines.append(f"{'ПРАВИЛО':<42} " + " ".join(f"{'Ч' + str(index):>12}" for index in range(1, 6)))

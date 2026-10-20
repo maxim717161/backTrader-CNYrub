@@ -258,3 +258,27 @@ def test_report_names_the_rule_and_the_base_gap():
     assert text == "Нет прогонов."
     assert [rule.id for rule in RULES].count("base") == 1
     assert len({rule.id for rule in RULES}) == len(RULES)
+
+
+def test_conclusion_names_the_stronger_sum_and_the_shallower_drawdown():
+    from consensus import ConsensusResult, StrategyStats, conclusion
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty")
+
+    def pack(rule: ConsensusRule, nets: tuple[float, ...], drawdown: float) -> ConsensusResult:
+        strategies = []
+        for name, net in zip(names, nets, strict=True):
+            trades = [{"secid": "CRU2", "pnlcomm": net}] if net else []
+            strategies.append(StrategyStats(name, trades, 0, 0, 0, 100_000.0 + net, 0.0, 100_000.0))
+        return ConsensusResult(rule, strategies, drawdown, dict.fromkeys(names, 0))
+
+    base = pack(RULES[0], (10.0, 20.0, 5.0, 5.0, 5.0), -100.0)
+    grows = pack(next(rule for rule in RULES if rule.id == "d3-grows"), (10.0, 5.0, 5.0, 5.0, 5.0), -80.0)
+    fast = pack(next(rule for rule in RULES if rule.id == "fast-d3"), (10.0, 20.0, 8.0, 9.0, 5.0), -90.0)
+    text = conclusion([base, grows, fast])
+    assert "Выше базы по сумме" in text
+    assert "глушит только 30/45/60" in text
+    assert "3 дня, плюс растёт" in text
+    assert "Длинное окно" in text
+    full = report([base, grows, fast])
+    assert "Выше базы по сумме" in full
