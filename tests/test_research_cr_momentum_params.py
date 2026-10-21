@@ -144,7 +144,29 @@ def test_report_contains_both_cost_models():
     text = cp.build_report(series, study)
     assert "Удержание: деньги и риск" in text
     assert "Блок: деньги и риск" in text
+    assert "Счёт 100 000" in text
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
     assert hold["gross"] == pytest.approx(block["gross"])
+
+
+def test_ten_percent_budget_rounds_the_contract_count_down():
+    assert cp.contracts_for_drawdown(2_106, 100_000, 0.10) == 4
+    assert cp.contracts_for_drawdown(1_880, 100_000, 0.10) == 5
+    assert cp.contracts_for_drawdown(10_001, 100_000, 0.10) == 0
+
+
+def test_account_scales_linearly_and_margin_limit_matches_a_scan():
+    series = make_series([0.0, 0.02, -0.08, 0.03, 0.01, -0.04, 0.02, 0.0, 0.01], level=10.0)
+    frame, _ = cp.simulate_hold(series, lookback=2, step=2)
+    one = cp.account_curve(frame, series.level, 1, cash=10_000, margin_rate=0.1)
+    four = cp.account_curve(frame, series.level, 4, cash=10_000, margin_rate=0.1)
+    assert four["net"].sum() == pytest.approx(4 * frame["net"].sum())
+    assert four["equity"].iloc[-1] == pytest.approx(10_000 + 4 * frame["net"].sum())
+    assert four["drawdown"].max() == pytest.approx(4 * one["drawdown"].max())
+    flat = frame["position"].to_numpy() == 0
+    assert one.loc[flat, "margin"].sum() == 0
+    cap = cp.max_contracts_by_margin(frame, series.level, 10_000, 0.1)
+    assert cp.account_curve(frame, series.level, cap, cash=10_000, margin_rate=0.1)["free"].min() > 0
+    assert cp.account_curve(frame, series.level, cap + 1, cash=10_000, margin_rate=0.1)["free"].min() < 0

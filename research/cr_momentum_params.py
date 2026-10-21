@@ -202,6 +202,185 @@ def month_t(frame: pd.DataFrame) -> float:
     return float(monthly.mean() / se)
 
 
+# Доля риска та же, что у короткого окна в backtest.py: запланированный убыток не больше 10% счёта.
+# У этого моментума нет стопа, поэтому убыток — просадка одного контракта.
+ACCOUNT_CASH = 100_000.0
+ACCOUNT_RISK = 0.10
+# ISS FORTS на 2026-10-21: CRZ6, INITIALMARGIN 1200.40 при PREVSETTLEPRICE 12.532.
+EXCHANGE_MARGIN_DAY = "2026-10-21"
+EXCHANGE_MARGIN_RUB = 1200.40
+EXCHANGE_SETTLE = 12.532
+MARGIN_RATE = EXCHANGE_MARGIN_RUB / (EXCHANGE_SETTLE * 1000.0)
+ACCOUNT_GRID = (1, 2, 4, 5, 8, 10, 20, 40)
+
+
+def contracts_for_drawdown(max_dd: float, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> int:
+    """Сколько контрактов, чтобы просадка max_dd на контракт забрала не больше risk от счёта."""
+    if max_dd != max_dd or max_dd <= 0 or cash <= 0 or risk <= 0:
+        return 0
+    return int((risk * cash) // max_dd)
+
+
+def account_curve(
+    frame: pd.DataFrame,
+    level: np.ndarray,
+    contracts: int,
+    cash: float = ACCOUNT_CASH,
+    margin_rate: float = MARGIN_RATE,
+) -> pd.DataFrame:
+    """Счёт с постоянным числом контрактов. PnL и ГО одного контракта умножаются на это число.
+
+    ГО дня — та же доля номинала, что у биржи на CRZ6 в EXCHANGE_MARGIN_DAY. В день без позиции залог не блокируется.
+    Свободные деньги — equity минус ГО. Ноль и ниже — маржин-колл: биржа закрыла бы позицию, кривая дальше этого не учитывает.
+    """
+    if contracts < 0:
+        raise ValueError(contracts)
+    if len(level) != len(frame):
+        raise ValueError("длина цены и дневной кривой не совпадает")
+    lots = int(contracts)
+    net = frame["net"].to_numpy(dtype=float) * lots
+    equity = cash + (np.cumsum(net) if len(net) else np.array([cash], dtype=float))
+    peak = np.maximum.accumulate(equity)
+    held = frame["position"].to_numpy() != 0.0
+    margin = np.where(held, margin_rate * np.asarray(level, dtype=float) * core.MULTIPLIER * lots, 0.0)
+    return pd.DataFrame(
+        {
+            "day": frame["day"].to_numpy(),
+            "contracts": lots,
+            "net": net,
+            "equity": equity,
+            "drawdown": peak - equity,
+            "margin": margin,
+            "free": equity - margin,
+        }
+    )
+
+
+def account_summary(curve: pd.DataFrame, cash: float = ACCOUNT_CASH) -> dict[str, float]:
+    equity = curve["equity"].to_numpy(dtype=float)
+    net = curve["net"].to_numpy(dtype=float)
+    drawdown = curve["drawdown"].to_numpy(dtype=float)
+    worst = int(drawdown.argmax()) if len(drawdown) else 0
+    dd = float(drawdown[worst]) if len(drawdown) else 0.0
+    peak = float(equity[worst] + dd) if len(equity) else cash
+    std = float(net.std(ddof=1)) if len(net) > 1 else float("nan")
+    return {
+        "contracts": float(curve["contracts"].iloc[0]) if len(curve) else 0.0,
+        "end": float(equity[-1]) if len(equity) else cash,
+        "net": float(net.sum()) if len(net) else 0.0,
+        "max_dd": dd,
+        "max_dd_pct_start": dd / cash * 100.0 if cash else float("nan"),
+        "max_dd_pct_peak": dd / peak * 100.0 if peak else float("nan"),
+        "min_equity": float(equity.min()) if len(equity) else cash,
+        "min_free": float(curve["free"].min()) if len(curve) else cash,
+        "margin_call": float((curve["free"] < 0).any()) if len(curve) else 0.0,
+        "ruined": float((equity <= 0).any()) if len(equity) else 0.0,
+        "sharpe": float(net.mean() / std * np.sqrt(252)) if std and std == std and std > 0 else float("nan"),
+    }
+
+
+def max_contracts_by_margin(
+    frame: pd.DataFrame,
+    level: np.ndarray,
+    cash: float = ACCOUNT_CASH,
+    margin_rate: float = MARGIN_RATE,
+) -> int:
+    """Самое большое целое число контрактов, при котором свободные деньги каждый день строго выше нуля.
+
+    Свободные деньги линейны по числу контрактов, поэтому предел считается по дням, а не перебором.
+    """
+    if frame.empty or cash <= 0:
+        return 0
+    equity_one = np.cumsum(frame["net"].to_numpy(dtype=float))
+    margin_one = margin_rate * np.asarray(level, dtype=float) * core.MULTIPLIER
+    held = frame["position"].to_numpy() != 0.0
+    coefficient = equity_one - np.where(held, margin_one, 0.0)
+    negative = coefficient < -1e-9
+    if not negative.any():
+        held_margin = margin_one[held]
+        if held_margin.size == 0 or float(held_margin.min()) <= 0:
+            return 0
+        return int(cash // float(held_margin.min()))
+    return max(int(np.floor(np.min(cash / -coefficient[negative]) - 1e-9)), 0)
+
+
+def drawdown_by_year(frame: pd.DataFrame, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> pd.DataFrame:
+    """На конец каждого года — просадка одного контракта, уже видная к этой дате, и число контрактов по доле риска."""
+    rows = []
+    net = frame["net"].to_numpy(dtype=float)
+    equity = np.cumsum(net)
+    drawdown = np.maximum.accumulate(equity) - equity
+    seen = np.maximum.accumulate(drawdown)
+    years = frame["day"].dt.year.to_numpy()
+    for year in sorted(set(years.tolist())):
+        last = int(np.where(years == year)[0][-1])
+        unit = float(seen[last])
+        rows.append({"year": int(year), "max_dd": unit, "contracts": contracts_for_drawdown(unit, cash, risk)})
+    return pd.DataFrame(rows)
+
+
+@dataclass(frozen=True)
+class AccountBook:
+    chosen: int
+    per_contract_dd: float
+    by_year: pd.DataFrame
+    grid: pd.DataFrame
+    chosen_curve: pd.DataFrame
+    max_by_margin: int
+    dd_from: str
+    dd_to: str
+    low_day: str
+    worst_day: str
+    worst_day_pnl: float
+    go_min: float
+    go_max: float
+
+
+def describe_account(
+    frame: pd.DataFrame,
+    level: np.ndarray,
+    cash: float = ACCOUNT_CASH,
+    risk: float = ACCOUNT_RISK,
+    margin_rate: float = MARGIN_RATE,
+    grid: tuple[int, ...] = ACCOUNT_GRID,
+) -> AccountBook:
+    net = frame["net"].to_numpy(dtype=float)
+    equity = np.cumsum(net) if len(net) else np.array([0.0])
+    drawdown = np.maximum.accumulate(equity) - equity
+    trough = int(drawdown.argmax()) if len(drawdown) else 0
+    unit_dd = float(drawdown[trough]) if len(drawdown) else 0.0
+    peak_at = int(np.where(equity[: trough + 1] == equity[: trough + 1].max())[0][-1]) if len(equity) else 0
+    low = int(equity.argmin()) if len(equity) else 0
+    worst = int(net.argmin()) if len(net) else 0
+    margin_one = margin_rate * np.asarray(level, dtype=float) * core.MULTIPLIER
+    chosen = contracts_for_drawdown(unit_dd, cash, risk)
+    counts = list(dict.fromkeys([*grid, chosen, max_contracts_by_margin(frame, level, cash, margin_rate)]))
+    rows = []
+    curves: dict[int, pd.DataFrame] = {}
+    for count in counts:
+        if count < 0:
+            continue
+        curve = account_curve(frame, level, count, cash, margin_rate)
+        curves[count] = curve
+        rows.append(account_summary(curve, cash))
+    table = pd.DataFrame(rows)
+    return AccountBook(
+        chosen=chosen,
+        per_contract_dd=unit_dd,
+        by_year=drawdown_by_year(frame, cash, risk),
+        grid=table,
+        chosen_curve=curves.get(chosen, account_curve(frame, level, chosen, cash, margin_rate)),
+        max_by_margin=max_contracts_by_margin(frame, level, cash, margin_rate),
+        dd_from=str(pd.Timestamp(frame["day"].iloc[peak_at]).date()) if len(frame) else "",
+        dd_to=str(pd.Timestamp(frame["day"].iloc[trough]).date()) if len(frame) else "",
+        low_day=str(pd.Timestamp(frame["day"].iloc[low]).date()) if len(frame) else "",
+        worst_day=str(pd.Timestamp(frame["day"].iloc[worst]).date()) if len(frame) else "",
+        worst_day_pnl=float(net[worst]) if len(net) else 0.0,
+        go_min=float(margin_one.min()) if len(margin_one) else 0.0,
+        go_max=float(margin_one.max()) if len(margin_one) else 0.0,
+    )
+
+
 def financials(frame: pd.DataFrame, trips: pd.DataFrame, base: float) -> dict[str, float]:
     """Результат одного контракта на всём ряду: деньги, риск и помесячная устойчивость."""
     net = frame["net"].to_numpy()
@@ -577,6 +756,117 @@ def _yearly_view(yearly: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def _account_grid_view(grid: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for _, row in grid.sort_values("contracts").iterrows():
+        out.append(
+            {
+                "контрактов": int(row["contracts"]),
+                "финиш, ₽": _num(row["end"]),
+                "net, ₽": _num(row["net"], signed=True),
+                "просадка, ₽": _num(row["max_dd"]),
+                "просадка, % старта": _num(row["max_dd_pct_start"], 1),
+                "минимум счёта, ₽": _num(row["min_equity"]),
+                "мин. свободно, ₽": _num(row["min_free"]),
+                "маржин-колл": "да" if row["margin_call"] else "нет",
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def _account_year_rule(table: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for _, row in table.iterrows():
+        out.append(
+            {
+                "на конец года": int(row["year"]),
+                "видимая просадка 1 контракта, ₽": _num(row["max_dd"]),
+                "контрактов по 10%": int(row["contracts"]),
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def _account_pnl_by_year(curve: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for year, part in curve.groupby(curve["day"].dt.year, sort=True):
+        out.append({"год": int(year), "net, ₽": _num(float(part["net"].sum()), signed=True)})
+    return pd.DataFrame(out)
+
+
+def _five_contract_line(book: AccountBook) -> str:
+    match = book.grid[book.grid["contracts"] == 5]
+    if match.empty or book.chosen == 5:
+        return ""
+    five = match.iloc[0]
+    return (
+        f" Пять контрактов на той же истории: финиш {_rub(five['end'])} ₽, "
+        f"просадка {_rub(five['max_dd'])} ₽ ({_comma(five['max_dd_pct_start'], 1)}% старта)."
+    )
+
+
+def _account_section(series: cm.Series, study: Study) -> list[str]:
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    book = describe_account(frame, series.level)
+    chosen = book.grid[book.grid["contracts"] == book.chosen]
+    row = chosen.iloc[0] if len(chosen) else None
+    slots = int(ACCOUNT_CASH // EXCHANGE_MARGIN_RUB)
+    lines = [
+        "## 9. Счёт 100 000 ₽\n",
+        (
+            f"Опорное удержание L = {PRIMARY[0]}, H = {PRIMARY[1]}, число контрактов одно и то же всю историю. "
+            "Шарп от этого числа не меняется: и прибыль, и просадка растут пропорционально. "
+            f"Стартовые деньги — {f'{int(ACCOUNT_CASH):,}'.replace(',', ' ')} ₽."
+        ),
+        (
+            f"ГО. На {EXCHANGE_MARGIN_DAY} биржа по CRZ6 берёт {_rub(EXCHANGE_MARGIN_RUB, 2)} ₽ "
+            f"при расчётной цене {str(EXCHANGE_SETTLE).replace('.', ',')} — это {_comma(MARGIN_RATE * 100, 1)}% номинала. "
+            f"На стартовые 100 000 ₽ по этому ГО влезает {slots} контрактов. "
+            f"Если ту же долю приложить к ценам истории, ГО одного контракта было от {_rub(book.go_min)} до {_rub(book.go_max)} ₽. "
+            f"Свободные деньги на кривой остаются выше нуля до {book.max_by_margin} контрактов включительно. "
+            "Это потолок залога, не размер для торговли."
+        ),
+        (
+            "Размер. Доля риска та же, что у короткого минутного окна: запланированный убыток не больше 10% счёта, то есть 10 000 ₽. "
+            + (
+                f"У моментума нет стопа, поэтому мера убытка — просадка одного контракта {_rub(book.per_contract_dd)} ₽ с {book.dd_from} по {book.dd_to}. "
+                f"10 000 / {_rub(book.per_contract_dd)} — это {_comma(ACCOUNT_RISK * ACCOUNT_CASH / book.per_contract_dd, 2)}, "
+                f"целое число вниз — **{book.chosen}**. "
+                "До этой просадки видимый убыток был меньше, и то же правило разрешало больше контрактов."
+                if book.per_contract_dd > 0
+                else "Просадки одного контракта на этом ряду нет, поэтому правило 10% не назначает размер."
+            )
+        ),
+    ]
+    if len(book.by_year):
+        lines.extend(["", report.md(_account_year_rule(book.by_year), index=False)])
+    if row is not None:
+        lines.extend(
+            [
+                "",
+                (
+                    f"Прогон {book.chosen} контрактов: финиш {_rub(row['end'])} ₽, net {_rub(row['net'], signed=True)} ₽, "
+                    f"просадка {_rub(row['max_dd'])} ₽ ({_comma(row['max_dd_pct_start'], 1)}% старта, "
+                    f"{_comma(row['max_dd_pct_peak'], 1)}% пика, с которого она началась). "
+                    f"Самый низкий счёт — {_rub(row['min_equity'])} ₽ на {book.low_day}. "
+                    f"Худший день одного контракта {_rub(book.worst_day_pnl, signed=True)} ₽ ({book.worst_day}), "
+                    f"на этом счёте {_rub(book.worst_day_pnl * book.chosen, signed=True)} ₽. "
+                    f"Минимум свободных после ГО — {_rub(row['min_free'])} ₽."
+                    + _five_contract_line(book)
+                ),
+                "",
+                "Число контрактов взято по просадке той же истории. Прогон показывает, каким был бы счёт, а не то, что правило было известно в 2022 году.",
+                "",
+                report.md(_account_grid_view(book.grid), index=False),
+            ]
+        )
+        if book.chosen and len(book.chosen_curve):
+            lines.extend(["", "Net выбранного числа контрактов по календарным годам. Шарп года совпадает с одним контрактом.\n", report.md(_account_pnl_by_year(book.chosen_curve), index=False)])
+    lines.append("В живую функцию правило не переносится: это размер исследовательского счёта, не заявка.")
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
 def _walk_view(table: pd.DataFrame) -> pd.DataFrame:
     out = []
     for _, row in table.iterrows():
@@ -597,6 +887,15 @@ def _walk_view(table: pd.DataFrame) -> pd.DataFrame:
 def _comma(value: float, digits: int = 0, signed: bool = False) -> str:
     text = _num(value, digits, signed)
     return text.replace(".", ",")
+
+
+def _rub(value: float, digits: int = 0, signed: bool = False) -> str:
+    """Рубли с пробелом между тысячами. Знак только если signed."""
+    if value != value:
+        return "—"
+    sign = "+" if signed and value > 0 else ("-" if value < 0 else "")
+    text = f"{abs(value):,.{digits}f}".replace(",", " ").replace(".", ",")
+    return sign + text
 
 
 def _book_line(total: dict[str, float]) -> str:
@@ -820,6 +1119,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         f"\nКнига этих лет: {_book_line(study.walk_all_total)}, gross {_comma(study.walk_all_total['gross'], signed=True)} ₽, издержки {_comma(study.walk_all_total['cost'])} ₽, PF {_comma(study.walk_all_total['pf'], 2)}.\n",
         "## 8. Что из этого следует\n",
         _primary_blurb(rows, study),
+        *_account_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -884,6 +1184,28 @@ def export_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "months": months,
         "equity": equities,
         "coverage": [{key: _json_value(value) for key, value in row.items()} for _, row in study.coverage.iterrows()],
+        "account": _account_payload(series, study),
+    }
+
+
+def _account_payload(series: cm.Series, study: Study) -> dict[str, object]:
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    book = describe_account(frame, series.level)
+    return {
+        "cash": ACCOUNT_CASH,
+        "risk": ACCOUNT_RISK,
+        "margin_day": EXCHANGE_MARGIN_DAY,
+        "margin_rub": EXCHANGE_MARGIN_RUB,
+        "margin_rate": round(MARGIN_RATE, 6),
+        "chosen": book.chosen,
+        "per_contract_dd": round(book.per_contract_dd, 2),
+        "max_by_margin": book.max_by_margin,
+        "dd_from": book.dd_from,
+        "dd_to": book.dd_to,
+        "go_min": round(book.go_min, 2),
+        "go_max": round(book.go_max, 2),
+        "by_year": [{key: _json_value(value) for key, value in row.items()} for _, row in book.by_year.iterrows()],
+        "grid": [{key: _json_value(value) for key, value in row.items()} for _, row in book.grid.iterrows()],
     }
 
 
@@ -896,6 +1218,8 @@ def main() -> None:
     study.rows.to_csv(report.OUT / "out" / "cr_momentum_params.csv", index=False)
     payload = export_payload(series, study)
     (report.OUT / "out" / "cr_momentum_params.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    account = describe_account(study.frames[("hold", PRIMARY[0], PRIMARY[1])], series.level)
+    account.grid.to_csv(report.OUT / "out" / "cr_momentum_account.csv", index=False)
 
 
 if __name__ == "__main__":
