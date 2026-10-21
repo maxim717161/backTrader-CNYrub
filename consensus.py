@@ -64,7 +64,15 @@ RULES: tuple[ConsensusRule, ...] = (
     ConsensusRule("d3-grows", "3 дня, плюс растёт", 3, "soft"),
     ConsensusRule("d5-grows", "5 дней, плюс растёт", 5, "soft"),
     ConsensusRule("long-d3", "глушит только окно 12420", 3, "soft", source="long"),
-    ConsensusRule("slower-d3", "глушит только старшее окно", 3, "soft", source="slower"),
+    # Короткое окно не глушит длинное: запрет ставит только канал строго длиннее.
+    ConsensusRule("slower-d1", "старшее, 1 день, плюс растёт", 1, "soft", source="slower"),
+    ConsensusRule("slower-d2-plus", "старшее, 2 дня, только плюс", 2, "no", source="slower"),
+    ConsensusRule("slower-d2", "старшее, 2 дня, плюс растёт", 2, "soft", source="slower"),
+    ConsensusRule("slower-d3-plus", "старшее, 3 дня, только плюс", 3, "no", source="slower"),
+    ConsensusRule("slower-d3-strict", "старшее, 3 дня, плюс выше вчера", 3, "strict", source="slower"),
+    ConsensusRule("slower-d3", "старшее, 3 дня, плюс растёт", 3, "soft", source="slower"),
+    ConsensusRule("slower-d5", "старшее, 5 дней, плюс растёт", 5, "soft", source="slower"),
+    ConsensusRule("slower-wide", "старшее, 3 дня, 20 диапазонов", 3, "soft", source="slower", min_ranges=20.0),
     ConsensusRule(
         "fast-d3",
         "глушит только 30/45/60",
@@ -525,6 +533,13 @@ def conclusion(results: list[ConsensusResult]) -> str:
                 f"Правило «{headline.rule.title}» даёт {_money(headline.net)} руб. ({_signed(headline.net - base.net)} к базе). "
                 f"Длинное окно при нём {_signed(head_long.net - base_long.net)} руб."
             )
+    slower = [item for item in others if item.rule.source == "slower"]
+    if slower:
+        best_slower = max(slower, key=lambda item: item.net)
+        lines.append(
+            f"Если короткое окно не глушит длинное, наибольшая сумма — «{best_slower.rule.title}»: "
+            f"{_money(best_slower.net)} руб., {_signed(best_slower.net - base.net)} к базе."
+        )
     return "\n".join(lines)
 
 
@@ -556,6 +571,7 @@ def report(results: list[ConsensusResult]) -> str:
         "«Только плюс» — открытый результат больше нуля, даже если сегодня он меньше вчерашнего.",
         "«Выше вчера» — плюс больше закрытия прошлого торгового дня.",
         "«Растёт» — вчера плюс был больше позавчерашнего, а сегодня позиция всё ещё в плюсе.",
+        "«Старшее» — запрет ставит только окно длиннее того, которое хочет войти. 30 минут не глушит 45, 60, 525 и 12420.",
         "",
         f"{'ПРАВИЛО':<42} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'ФАКТОР':>7} {'ПРОСАДКА':>14} {'К БАЗЕ':>14}",
     ]

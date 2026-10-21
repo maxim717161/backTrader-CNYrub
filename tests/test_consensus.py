@@ -77,11 +77,21 @@ def test_strict_growth_rejects_a_dip_that_soft_growth_still_treats_as_a_trend():
 def test_only_the_long_window_or_only_a_slower_window_may_veto():
     short = _state(name="short", channel=525, side=-1)
     slow = _state(name="long", channel=12_420, side=-1)
+    thirty = _state(name="thirty", channel=30, side=-1)
+    fortyfive = _state(name="fortyfive", channel=45, side=-1)
+    sixty = _state(name="sixty", channel=60, side=-1)
+    rule = _rule(source="slower")
     assert veto_side([short, slow], _rule(source="long"), "thirty", 30) == 1
     assert veto_side([short], _rule(source="long"), "thirty", 30) == 0
-    assert veto_side([short], _rule(source="slower"), "sixty", 60) == 1
-    assert veto_side([short], _rule(source="slower"), "long", 12_420) == 0
     assert veto_side([slow], _rule(shielded=frozenset({"thirty"})), "thirty", 30) == 0
+    assert veto_side([thirty], rule, "fortyfive", 45) == 0
+    assert veto_side([thirty, fortyfive], rule, "sixty", 60) == 0
+    assert veto_side([sixty], rule, "short", 525) == 0
+    assert veto_side([short], rule, "long", 12_420) == 0
+    assert veto_side([fortyfive], rule, "thirty", 30) == 1
+    assert veto_side([sixty], rule, "fortyfive", 45) == 1
+    assert veto_side([short], rule, "sixty", 60) == 1
+    assert veto_side([slow], rule, "short", 525) == 1
 
 
 def test_two_profitable_sides_block_both_entries():
@@ -275,10 +285,17 @@ def test_conclusion_names_the_stronger_sum_and_the_shallower_drawdown():
     base = pack(RULES[0], (10.0, 20.0, 5.0, 5.0, 5.0), -100.0)
     grows = pack(next(rule for rule in RULES if rule.id == "d3-grows"), (10.0, 5.0, 5.0, 5.0, 5.0), -80.0)
     fast = pack(next(rule for rule in RULES if rule.id == "fast-d3"), (10.0, 20.0, 8.0, 9.0, 5.0), -90.0)
-    text = conclusion([base, grows, fast])
+    slower = pack(
+        next(rule for rule in RULES if rule.id == "slower-d3"),
+        (4.0, 20.0, 4.0, 4.0, 4.0),
+        -70.0,
+    )
+    text = conclusion([base, grows, fast, slower])
     assert "Выше базы по сумме" in text
     assert "глушит только 30/45/60" in text
     assert "3 дня, плюс растёт" in text
     assert "Длинное окно" in text
+    assert "короткое окно не глушит длинное" in text
+    assert "старшее, 3 дня, плюс растёт" in text
     full = report([base, grows, fast])
     assert "Выше базы по сумме" in full
