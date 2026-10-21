@@ -1366,10 +1366,25 @@ def _exit_decision(
     return coarse + " Рабочие выходы после более широкой проверки: " + locked + "."
 
 
+def _run_adopted(frames: dict[str, pd.DataFrame], starts: dict[str, date]) -> int:
+    """Пять счетов со стартом 100 000 руб. и запретом «старшее, 2 дня, только плюс»."""
+    from consensus import ADOPTED_RULE, RULES, build_views, report as consensus_report, run_consensus
+
+    base = next(rule for rule in RULES if rule.id == "base")
+    views = build_views(frames)
+    results = []
+    for rule in (base, ADOPTED_RULE):
+        print(f"правило {rule.id}", flush=True)
+        results.append(run_consensus(frames, rule, starts, views=views))
+    print(consensus_report(results))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Канал по закрытиям минуток CNY/RUB")
     parser.add_argument("--grid", action="store_true", help="Прогнать сетку окон и выбрать N")
     parser.add_argument("--exits", action="store_true", help="Сравнить выходы на двух окнах по общему итогу")
+    parser.add_argument("--solo", action="store_true", help="Пять счетов по отдельности, без запрета старшего окна")
     parser.add_argument("--bars", type=Path, default=BARS_DIR, help="Каталог parquet по контрактам")
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
@@ -1395,6 +1410,8 @@ def main(argv: list[str] | None = None) -> int:
             f"худшая часть {_money(min(float(part) for part in chosen['parts']))} руб."
         )
         return 0
+    if not args.solo:
+        return _run_adopted(frames, starts)
     for window in WINDOWS:
         if window.risk_fraction or window.breakout_span or window.leverage:
             print(report(run_account(frames, window, starts)))

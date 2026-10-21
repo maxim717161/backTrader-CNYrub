@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest import Window, simulate
+from backtest import WINDOWS, Window, simulate
 from consensus import (
     RULES,
     ConsensusRule,
@@ -261,6 +261,17 @@ def test_a_multi_day_short_rejects_the_other_strategy_long_breakout():
     assert not any(trade["direction"] == "long" for trade in filtered_other)
     assert filtered.source_setups["holder"] >= 1
     assert any(trade["direction"] == "short" for trade in filtered.strategies[0].trades)
+
+
+def test_adopted_rule_is_two_days_of_profit_from_a_longer_window():
+    from consensus import ADOPTED_RULE
+
+    assert ADOPTED_RULE.id == "slower-d2-plus"
+    assert ADOPTED_RULE.hold_days == 2
+    assert ADOPTED_RULE.growing == "no"
+    assert ADOPTED_RULE.source == "slower"
+    assert ADOPTED_RULE.min_ranges == 0
+    assert all(window.cash == 100_000 for window in WINDOWS)
 
 
 def test_report_names_the_rule_and_the_base_gap():

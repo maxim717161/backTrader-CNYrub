@@ -83,6 +83,10 @@ RULES: tuple[ConsensusRule, ...] = (
     ConsensusRule("wide-d3", "3 дня, плюс и 20 диапазонов", 3, "soft", min_ranges=20.0),
 )
 
+# Основной прогон backtest.py. Короткое окно не глушит длинное.
+# Два торговых дня в плюсе — и вход против этой позиции не открывается.
+ADOPTED_RULE = next(rule for rule in RULES if rule.id == "slower-d2-plus")
+
 
 @dataclass(frozen=True)
 class OpenState:
