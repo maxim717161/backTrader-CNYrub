@@ -372,6 +372,7 @@ def build_report(series: Series) -> str:
     own = variants_table(series)
     out = [
         "# Моментум на CR: отдельная проверка\n",
+        "Финансовый результат счёта по сетке L, H, порогу хода и проскальзыванию — в `REPORT_cr_momentum_params.md` (там же удержание позиции до смены знака, а не новый круг каждые H дней).\n",
         METHOD.format(first=pd.Timestamp(series.days[0]).date(), last=pd.Timestamp(series.days[-1]).date(), n=len(series), rolls=int(series.roll.sum()), notional=base, cost=core.round_trip_cost()),
         "## 1. Сетка L × H на непрерывном ряду\n",
         f"Знак доходности за L дней → позиция на H дней, сделки не пересекаются, роллировка внутри позиции стоит ещё один круг. net и gross — в б.п. номинала; t — с кластеризацией по месяцам. Проверка перебора (White) по всей сетке из {len(grid_table)} вариантов: **p = {white:.3f}**.\n",
