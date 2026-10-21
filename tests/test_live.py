@@ -44,6 +44,7 @@ from cnyrub.live.service import (
 )
 from cnyrub.live.vk import status_text, trade_text
 from cnyrub.live.state import MemoryStore, state_key
+from cnyrub.live.veto import held_trading_days, peer_key, publish_peer, veto_source
 
 MSK = ZoneInfo("Europe/Moscow")
 ACCOUNT = "acc-short"
@@ -1524,6 +1525,159 @@ def test_fill_price_accepts_points_and_rejects_wrong_scale():
     assert fill_price(0.0, 10.75) == 10.75
 
 
+def _peer(name: str, *, channel: int, held: int, days: int, pnl: float) -> dict[str, object]:
+    return {
+        "strategy": name,
+        "channel": channel,
+        "held": held,
+        "target": held,
+        "held_days": days,
+        "pnl": pnl,
+    }
+
+
+def test_held_days_count_dates_after_the_entry_and_add_one_when_it_fell_out():
+    bars = [
+        {"t": "2026-09-28T10:00:00+03:00", "c": 10},
+        {"t": "2026-09-28T10:01:00+03:00", "c": 10},
+        {"t": "2026-09-29T10:00:00+03:00", "c": 10},
+        {"t": "2026-09-30T10:00:00+03:00", "c": 10},
+    ]
+    assert held_trading_days(bars, 0) == 2
+    assert held_trading_days(bars, 2) == 1
+    assert held_trading_days(bars, -1) == 3
+    assert held_trading_days(bars[:2], -1) == 1
+    assert held_trading_days([], 0) == 0
+
+
+def test_only_a_longer_green_position_blocks_the_opposite_entry():
+    store = MemoryStore()
+    book = _FillBook("CRZ6", 100_000.0)
+    book.target = 10
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    store.save(peer_key("thirty"), _peer("thirty", channel=30, held=-8, days=2, pnl=1500))
+    assert veto_source(store, "short", 525, book) == "long"
+    book.target = -10
+    assert veto_source(store, "short", 525, book) == ""
+    book.held = -1
+    book.target = 10
+    assert veto_source(store, "short", 525, book) == ""
+    book.held = 0
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=1, pnl=1500))
+    assert veto_source(store, "short", 525, book) == ""
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=0))
+    assert veto_source(store, "short", 525, book) == ""
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    store.save(peer_key("fortyfive"), {"strategy": "other", "channel": 45, "held": -8, "target": -8, "held_days": 2, "pnl": 1})
+    assert veto_source(store, "short", 525, book) == "long"
+
+    class Broken:
+        def load(self, key: str):
+            raise RuntimeError(key)
+
+    assert veto_source(Broken(), "short", 525, book) == ""
+
+
+def test_a_senior_short_in_profit_blocks_a_fresh_long_and_keeps_a_short():
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    broker = FakeBroker()
+    store = MemoryStore()
+    _ready(store, _quiet_bars(start, 5))
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    blocked = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert blocked["phase"] == "veto"
+    assert blocked["veto"] == "long"
+    assert blocked["order"] is None
+    assert blocked["target"] == 0
+    assert broker.orders == []
+    assert store.load(state_key("short", ACCOUNT))["book"]["target"] == 0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    still = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert still["phase"] == "veto"
+    assert broker.orders == []
+
+    same = FakeBroker()
+    same_store = MemoryStore()
+    _ready(same_store, _quiet_bars(start, 5))
+    same_store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    same._candles.append(_candle(start + timedelta(minutes=5), 9.8, high=9.9, low=9.7))
+    opened = run_minute(request, same, same_store, now=start + timedelta(minutes=6))
+    assert opened["phase"] == "signal"
+    assert opened["target"] < 0
+    assert same.orders == []
+
+
+def test_one_day_or_a_flat_peer_does_not_block_the_breakout():
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    broker = FakeBroker()
+    store = MemoryStore()
+    _ready(store, _quiet_bars(start, 5))
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=1, pnl=1500))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    signal = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert signal["phase"] == "signal"
+    assert signal["target"] > 0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["phase"] == "order"
+    assert filled["order"]["signed"] == 10
+
+
+def test_a_stop_still_orders_while_a_senior_peer_is_in_profit():
+    broker = FakeBroker()
+    broker.lots = 12
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    book = _FillBook("CRZ6", 50_000.0)
+    book.held = 12
+    book.target = 12
+    book.avg = 10.0
+    book.stop_dist = 0.2
+    book.stop_px = 9.8
+    book.base = 12
+    book.entry_i = 1
+    _ready(store, _quiet_bars(start, 5), export_book(book))
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=3, pnl=4000))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.0, high=10.1, low=9.9))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert result["phase"] == "order"
+    assert result["order"]["signed"] == -10
+    assert result["order"]["reason"] == "stop"
+
+
+def test_a_fill_publishes_the_peer_and_a_flat_book_clears_it():
+    store = MemoryStore()
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = -4
+    book.target = -4
+    book.avg = 10.0
+    book.entry_i = 0
+    bars = [
+        {"t": "2026-09-28T10:00:00+03:00", "c": 10.0},
+        {"t": "2026-09-29T10:00:00+03:00", "c": 9.8},
+        {"t": "2026-09-30T10:00:00+03:00", "c": 9.5},
+    ]
+    publish_peer(store, "long", 12420, book, bars)
+    saved = store.load(peer_key("long"))
+    assert saved["held"] == -4
+    assert saved["target"] == -4
+    assert saved["held_days"] == 2
+    assert saved["channel"] == 12420
+    assert saved["pnl"] == pytest.approx((9.5 - 10.0) * -4 * 1000)
+    book.held = 0
+    publish_peer(store, "long", 12420, book, bars)
+    cleared = store.load(peer_key("long"))
+    assert cleared["held"] == 0
+    assert cleared["pnl"] == 0
+    publish_peer(store, "missing", 10, book, bars)
+    assert store.load(peer_key("missing")) is None
+    publish_peer(store, "long", 12420, None, bars)
+
+
 def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
     import zipfile
 
@@ -1541,7 +1695,7 @@ def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
         assert "boto3" in text
         assert "backtrader" not in text and "pandas" not in text
         readme = stored.read("README.txt").decode("utf-8")
-        for word in ("reconcile", "probe", "fill_per_minute", "secret_id", "halted", "VK_TOKEN"):
+        for word in ("reconcile", "probe", "fill_per_minute", "secret_id", "halted", "VK_TOKEN", "veto", "peers/"):
             assert word in readme
         for name in PRESETS:
             assert name in readme

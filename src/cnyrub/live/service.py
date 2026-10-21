@@ -6,6 +6,8 @@
 проверяются на стоп, шаг считается только по последней закрытой свече, и на
 фьючерс уходит не больше одного рыночного ордера. В бакете остаётся окно
 индикаторов и десять сессий сверху, более старые минутки стираются.
+Свежий вход против старшего окна, которое уже два торговых дня в плюсе,
+снимается до заявки. Своя позиция, стоп и выход остаются.
 
 Сколько контрактов менять за минуту решает fill_per_minute. Пустое значение —
 авто: не больше половины видимого стакана с той стороны, которую съест заявка.
@@ -33,6 +35,7 @@ from cnyrub.live.broker import Candle, Instrument, book_lots, choose_front, half
 from cnyrub.live.config import RunRequest
 from cnyrub.live.indicators import bar_get, bar_levels
 from cnyrub.live.state import StateStore, state_key
+from cnyrub.live.veto import cancel_fresh_entry, publish_peer, veto_source
 
 MSK = ZoneInfo("Europe/Moscow")
 ZERO_FILL_LIMIT = 10
@@ -219,7 +222,17 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     front, trade_from = _resolve_front(state, broker, moment.date())
     result["secid"] = front.secid
     if _adopt_instrument(state, front, trade_from) == "halt":
-        return _halt(state, store, key, result, "контракт сменился, пока позиция ещё открыта", None, request.params)
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            "контракт сменился, пока позиция ещё открыта",
+            None,
+            request.params,
+            request.strategy,
+            request.params.channel,
+        )
 
     book = load_book(state.get("book") if isinstance(state.get("book"), dict) else None, front.secid, None)
     if not state.get("ready"):
@@ -236,10 +249,21 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
                 state["last_bar"] = str(bar_get(bars[-1], "t"))
         elif walked >= HISTORY_WALKS:
             state["book"] = export_book(book)
-            return _halt(state, store, key, result, "не хватает минуток, чтобы собрать окно", book, request.params)
+            return _halt(
+                state,
+                store,
+                key,
+                result,
+                "не хватает минуток, чтобы собрать окно",
+                book,
+                request.params,
+                request.strategy,
+                request.params.channel,
+            )
         _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
+        publish_peer(store, request.strategy, request.params.channel, book, list(state.get("bars") or []))
         result["phase"] = "history"
         result["bars"] = len(state.get("bars") or [])
         result["goal"] = goal
@@ -254,6 +278,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
+        publish_peer(store, request.strategy, request.params.channel, book, list(state.get("bars") or []))
         result["phase"] = "reconciled"
         result["held"] = book.held
         result["halted"] = None
@@ -267,13 +292,15 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             f"позиция на счёте {broker_lots}, в книге {book.held}",
             book,
             request.params,
+            request.strategy,
+            request.params.channel,
         )
 
     sync_before = state.get("sync_from")
     bars_before = len(state.get("bars") or [])
     fresh = _fresh_candles(state, broker, front.uid, moment, request.params.weekends)
     if fresh is None:
-        _save_trimmed(state, store, key, book, request.params)
+        _save_trimmed(state, store, key, book, request.params, request.strategy, request.params.channel)
         result["phase"] = "catchup"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
@@ -285,6 +312,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             if book_changed:
                 state["book"] = export_book(book)
             store.save(key, state)
+            publish_peer(store, request.strategy, request.params.channel, book, list(state.get("bars") or []))
         result["phase"] = "idle"
         result["bars"] = len(state.get("bars") or [])
         result["held"] = book.held
@@ -304,7 +332,17 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
 
     margin = _margin(state, broker, front.uid, moment.date(), refresh=True)
     if margin <= 0:
-        return _halt(state, store, key, result, "биржа не вернула гарантийное обеспечение", book, request.params)
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            "биржа не вернула гарантийное обеспечение",
+            book,
+            request.params,
+            request.strategy,
+            request.params.channel,
+        )
 
     last = fresh[-1]
     before = export_book(book)
@@ -374,6 +412,11 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         )
 
     advance(pace)
+    blocked_by = ""
+    if book.last_signed == 0 and book.held == 0 and book.target != 0:
+        blocked_by = veto_source(store, request.strategy, request.params.channel, book)
+        if blocked_by:
+            cancel_fresh_entry(book)
     stamp = _bar(last)["t"]
     signed = int(book.last_signed)
     if signed == 0:
@@ -381,7 +424,11 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
-        if request.fill_per_minute == 0:
+        publish_peer(store, request.strategy, request.params.channel, book, list(state.get("bars") or []))
+        if blocked_by:
+            result["phase"] = "veto"
+            result["veto"] = blocked_by
+        elif request.fill_per_minute == 0:
             result["phase"] = "paused"
         else:
             result["phase"] = "signal" if book.target != book.held else "hold"
@@ -396,7 +443,17 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
     except Exception:
         restore_book(book, before)
         state["last_bar"] = stamp
-        return _halt(state, store, key, result, "заявка не подтверждена", book, request.params)
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            "заявка не подтверждена",
+            book,
+            request.params,
+            request.strategy,
+            request.params.channel,
+        )
     wanted = abs(signed)
     if report.executed > wanted:
         restore_book(book, before)
@@ -409,6 +466,8 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
             f"исполнено больше заявленного: {report.executed} из {wanted}",
             book,
             request.params,
+            request.strategy,
+            request.params.channel,
         )
     if report.executed <= 0:
         restore_book(book, before)
@@ -424,11 +483,14 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
                 f"заявка не исполнена {misses} раз подряд",
                 book,
                 request.params,
+                request.strategy,
+                request.params.channel,
             )
         # last_bar остаётся прежним: следующая минута заново решит, нужна ли заявка.
         _trim_bars(state, book, request.params)
         state["book"] = export_book(book)
         store.save(key, state)
+        publish_peer(store, request.strategy, request.params.channel, book, list(state.get("bars") or []))
         result["phase"] = "unfilled"
         result["unfilled"] = misses
         result["held"] = book.held
@@ -470,6 +532,7 @@ def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | N
         result["order"]["pnl"] = pnl
     state["book"] = export_book(book)
     store.save(key, state)
+    publish_peer(store, request.strategy, request.params.channel, book, list(state.get("bars") or []))
     return result
 
 
@@ -747,10 +810,19 @@ def _trim_bars(state: dict[str, object], book: _FillBook | None, params) -> bool
     return True
 
 
-def _save_trimmed(state: dict[str, object], store: StateStore, key: str, book: _FillBook, params) -> None:
+def _save_trimmed(
+    state: dict[str, object],
+    store: StateStore,
+    key: str,
+    book: _FillBook,
+    params,
+    strategy: str,
+    channel: int,
+) -> None:
     if _trim_bars(state, book, params):
         state["book"] = export_book(book)
     store.save(key, state)
+    publish_peer(store, strategy, channel, book, list(state.get("bars") or []))
 
 
 def _halt(
@@ -761,6 +833,8 @@ def _halt(
     reason: str,
     book: _FillBook | None,
     params,
+    strategy: str,
+    channel: int,
 ) -> dict[str, object]:
     if not state.get("halted"):
         result["halt_new"] = True
@@ -769,6 +843,7 @@ def _halt(
     if book is not None:
         state["book"] = export_book(book)
     store.save(key, state)
+    publish_peer(store, strategy, channel, book, list(state.get("bars") or []))
     result["phase"] = "halted"
     result["halted"] = reason
     return result
