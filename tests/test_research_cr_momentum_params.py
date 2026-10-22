@@ -145,6 +145,7 @@ def test_report_contains_both_cost_models():
     assert "Удержание: деньги и риск" in text
     assert "Блок: деньги и риск" in text
     assert "Счёт 100 000" in text
+    assert "Фиксированное плечо" in text
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
@@ -170,3 +171,51 @@ def test_account_scales_linearly_and_margin_limit_matches_a_scan():
     cap = cp.max_contracts_by_margin(frame, series.level, 10_000, 0.1)
     assert cp.account_curve(frame, series.level, cap, cash=10_000, margin_rate=0.1)["free"].min() > 0
     assert cp.account_curve(frame, series.level, cap + 1, cash=10_000, margin_rate=0.1)["free"].min() < 0
+
+
+def _position_frame(position):
+    position = np.asarray(position, dtype=float)
+    return pd.DataFrame({"day": pd.bdate_range("2023-01-02", periods=len(position)), "position": position})
+
+
+def test_fixed_leverage_buys_the_floor_of_equity_over_notional_and_pays_to_resize():
+    frame = _position_frame([0.0, 1.0, 1.0])
+    level = np.array([10.0, 10.1, 10.1])
+    ret = np.array([0.0, 0.1, 0.0])
+    curve = cp.leverage_curve(frame, level, ret, np.zeros(3, dtype=bool), leverage=1, cash=100_000, margin_rate=0.1)
+    assert curve["contracts"].iloc[1] == 10
+    assert curve["gross"].iloc[1] == pytest.approx(1_000)
+    assert curve["cost"].iloc[1] == pytest.approx(10 * cp.side_cost())
+    assert curve["equity"].iloc[1] == pytest.approx(100_940)
+    # На последнем дне 10 контрактов сжимаются до 9 и тут же закрываются.
+    assert curve["contracts"].iloc[2] == 9
+    assert curve["cost"].iloc[2] == pytest.approx(10 * cp.side_cost())
+    assert curve["equity"].iloc[-1] == pytest.approx(100_940 - 10 * cp.side_cost())
+
+
+def test_roll_replaces_the_whole_book_and_a_margin_call_reopens_the_next_day():
+    frame = _position_frame([1.0, 1.0, 1.0])
+    level = np.array([10.0, 10.0, 10.0])
+    ret = np.array([0.0, 0.0, 0.0])
+    roll = np.array([False, True, False])
+    curve = cp.leverage_curve(frame, level, ret, roll, leverage=1, cash=100_000, margin_rate=0.1)
+    # Вход 10, на роллировке закрыть 10 и открыть 10, последний день закрывает остаток.
+    assert curve["contracts"].iloc[0] == 10
+    # Вход стоил 60 ₽, поэтому на роллировке уже 9 контрактов: закрыть 10 и открыть 9.
+    assert curve["contracts"].iloc[1] == 9
+    assert curve["cost"].iloc[1] == pytest.approx(19 * cp.side_cost())
+    drop = _position_frame([1.0, 1.0])
+    crashed = cp.leverage_curve(
+        drop,
+        np.array([9.7, 9.7]),
+        np.array([-0.3, 0.0]),
+        np.zeros(2, dtype=bool),
+        leverage=8,
+        cash=100_000,
+        margin_rate=0.1,
+    )
+    assert crashed["contracts"].iloc[0] == 80
+    assert bool(crashed["called"].iloc[0])
+    assert crashed["equity"].iloc[0] == pytest.approx(100_000 - 24_000 - 2 * 80 * cp.side_cost())
+    assert crashed["contracts"].iloc[1] > 0
+    assert not bool(crashed["called"].iloc[1])

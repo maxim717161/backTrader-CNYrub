@@ -212,6 +212,8 @@ EXCHANGE_MARGIN_RUB = 1200.40
 EXCHANGE_SETTLE = 12.532
 MARGIN_RATE = EXCHANGE_MARGIN_RUB / (EXCHANGE_SETTLE * 1000.0)
 ACCOUNT_GRID = (1, 2, 4, 5, 8, 10, 20, 40)
+# Плечо — номинал / счёт. Формула контрактов та же, что в минутном движке: floor(плечо × счёт / номинал).
+LEVERAGES = (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 def contracts_for_drawdown(max_dd: float, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> int:
@@ -379,6 +381,168 @@ def describe_account(
         go_min=float(margin_one.min()) if len(margin_one) else 0.0,
         go_max=float(margin_one.max()) if len(margin_one) else 0.0,
     )
+
+
+def _target_lots(sign: float, equity: float, notional: float, leverage: float, margin_rate: float) -> int:
+    """Контракты со знаком. Ноль, если нет сигнала, номинала или места под ГО на входе."""
+    if sign == 0.0 or equity <= 0 or notional <= 1e-9 or leverage <= 0:
+        return 0
+    raw = int(leverage * equity // notional)
+    room = int(equity // (margin_rate * notional)) if margin_rate > 0 else raw
+    count = min(raw, max(room, 0))
+    if count <= 0:
+        return 0
+    return int(np.sign(sign) * count)
+
+
+def _resize_sides(previous: int, target: int, roll: bool) -> int:
+    """Стороны за смену числа контрактов. Роллировка закрывает всё старое и открывает всё новое, даже при смене знака."""
+    if roll:
+        return abs(previous) + abs(target)
+    if previous == target:
+        return 0
+    if previous == 0 or target == 0 or (previous > 0) == (target > 0):
+        return abs(abs(target) - abs(previous))
+    return abs(previous) + abs(target)
+
+
+def leverage_curve(
+    frame: pd.DataFrame,
+    level: np.ndarray,
+    ret: np.ndarray,
+    roll: np.ndarray,
+    leverage: float,
+    cash: float = ACCOUNT_CASH,
+    margin_rate: float = MARGIN_RATE,
+    unit: float | None = None,
+) -> pd.DataFrame:
+    """Счёт с постоянным плечом. Каждый день контрактов floor(плечо × счёт / номинал на закрытии предыдущего дня).
+
+    Дневной ход зарабатывает уже новое число. Издержки — за изменение числа и за роллировку. Если к закрытию
+    счёт ниже ГО по цене закрытия, позиция закрывается в этот же день и на следующий набирается заново.
+    На последнем дне открытый остаток закрывается одной стороной. Счёт, упавший до нуля, дальше не торгует.
+    """
+    if not len(frame) == len(level) == len(ret) == len(roll):
+        raise ValueError("длина ряда, цены и позиции не совпадает")
+    if leverage <= 0:
+        raise ValueError(leverage)
+    cost_unit = side_cost() if unit is None else unit
+    sign = frame["position"].to_numpy(dtype=float)
+    level = np.asarray(level, dtype=float)
+    ret = np.asarray(ret, dtype=float)
+    roll = np.asarray(roll, dtype=bool)
+    n = len(frame)
+    equity = np.empty(n)
+    net = np.empty(n)
+    gross_out = np.empty(n)
+    cost_out = np.empty(n)
+    lots = np.empty(n)
+    free = np.empty(n)
+    called = np.zeros(n, dtype=bool)
+    balance = cash
+    previous = 0
+    dead = False
+    for t in range(n):
+        if dead or balance <= 0:
+            dead = True
+            balance = 0.0
+            equity[t] = net[t] = gross_out[t] = cost_out[t] = lots[t] = free[t] = 0.0
+            previous = 0
+            continue
+        price_in = level[t] - ret[t]
+        notional = price_in * core.MULTIPLIER
+        target = _target_lots(sign[t], balance, notional, leverage, margin_rate)
+        sides = _resize_sides(previous, target, bool(roll[t]))
+        cost = sides * cost_unit
+        gross = target * ret[t] * core.MULTIPLIER
+        balance_after = balance + gross - cost
+        required = abs(target) * margin_rate * level[t] * core.MULTIPLIER
+        margin_call = target != 0 and balance_after < required
+        carry = target
+        if margin_call:
+            balance_after -= abs(target) * cost_unit
+            cost += abs(target) * cost_unit
+            carry = 0
+            required = 0.0
+            called[t] = True
+        if t == n - 1 and carry and balance_after > 0:
+            balance_after -= abs(carry) * cost_unit
+            cost += abs(carry) * cost_unit
+            carry = 0
+            required = 0.0
+        if balance_after <= 0:
+            dead = True
+            balance_after = 0.0
+            carry = 0
+            required = 0.0
+        net[t] = balance_after - balance
+        gross_out[t] = gross
+        cost_out[t] = cost
+        lots[t] = target
+        free[t] = balance_after - required
+        balance = balance_after
+        previous = carry
+        equity[t] = balance
+    peak = np.maximum.accumulate(equity) if n else equity
+    return pd.DataFrame(
+        {
+            "day": frame["day"].to_numpy(),
+            "leverage": float(leverage),
+            "contracts": lots,
+            "gross": gross_out,
+            "cost": cost_out,
+            "net": net,
+            "equity": equity,
+            "drawdown": peak - equity,
+            "free": free,
+            "called": called,
+        }
+    )
+
+
+def leverage_summary(curve: pd.DataFrame, cash: float = ACCOUNT_CASH) -> dict[str, float]:
+    equity = curve["equity"].to_numpy(dtype=float)
+    net = curve["net"].to_numpy(dtype=float)
+    drawdown = curve["drawdown"].to_numpy(dtype=float)
+    worst = int(drawdown.argmax()) if len(drawdown) else 0
+    dd = float(drawdown[worst]) if len(drawdown) else 0.0
+    peak = float(equity[worst] + dd) if len(equity) else cash
+    previous = np.r_[cash, equity[:-1]] if len(equity) else np.array([cash])
+    returns = np.divide(net, previous, out=np.zeros_like(net), where=previous > 0)
+    std = float(returns.std(ddof=1)) if len(returns) > 1 else float("nan")
+    held = curve["contracts"].to_numpy() != 0
+    return {
+        "leverage": float(curve["leverage"].iloc[0]) if len(curve) else 0.0,
+        "end": float(equity[-1]) if len(equity) else cash,
+        "net": float(net.sum()) if len(net) else 0.0,
+        "gross": float(curve["gross"].sum()) if len(curve) else 0.0,
+        "cost": float(curve["cost"].sum()) if len(curve) else 0.0,
+        "max_dd": dd,
+        "max_dd_pct_peak": dd / peak * 100.0 if peak else float("nan"),
+        "min_equity": float(equity.min()) if len(equity) else cash,
+        "min_free": float(curve["free"].min()) if len(curve) else cash,
+        "margin_calls": float(curve["called"].sum()) if len(curve) else 0.0,
+        "ruined": float((equity <= 0).any()) if len(equity) else 0.0,
+        "sharpe": float(returns.mean() / std * np.sqrt(252)) if std and std == std and std > 0 else float("nan"),
+        "avg_lots": float(np.abs(curve.loc[held, "contracts"]).mean()) if held.any() else 0.0,
+        "max_lots": float(np.abs(curve["contracts"]).max()) if len(curve) else 0.0,
+        "start_lots": float(abs(curve["contracts"].to_numpy()[np.flatnonzero(curve["contracts"].to_numpy())[0]])) if held.any() else 0.0,
+        "worst_day": float(net.min()) if len(net) else 0.0,
+    }
+
+
+def leverage_table(
+    frame: pd.DataFrame,
+    level: np.ndarray,
+    ret: np.ndarray,
+    roll: np.ndarray,
+    leverages: tuple[int, ...] = LEVERAGES,
+    cash: float = ACCOUNT_CASH,
+    margin_rate: float = MARGIN_RATE,
+) -> tuple[pd.DataFrame, dict[int, pd.DataFrame]]:
+    curves = {int(lev): leverage_curve(frame, level, ret, roll, lev, cash, margin_rate) for lev in leverages}
+    table = pd.DataFrame([leverage_summary(curve, cash) for curve in curves.values()])
+    return table, curves
 
 
 def financials(frame: pd.DataFrame, trips: pd.DataFrame, base: float) -> dict[str, float]:
@@ -867,6 +1031,112 @@ def _account_section(series: cm.Series, study: Study) -> list[str]:
     return ["\n" + body]
 
 
+def _leverage_view(table: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for _, row in table.sort_values("leverage").iterrows():
+        out.append(
+            {
+                "плечо": int(row["leverage"]),
+                "финиш, ₽": _rub(row["end"]),
+                "net, ₽": _rub(row["net"], signed=True),
+                "просадка, ₽": _rub(row["max_dd"]),
+                "просадка, % пика": _comma(row["max_dd_pct_peak"], 1),
+                "минимум, ₽": _rub(row["min_equity"]),
+                "мин. свободно, ₽": _rub(row["min_free"]),
+                "коллов": int(row["margin_calls"]),
+                "контрактов, среднее": _comma(row["avg_lots"], 1),
+                "худший день, ₽": _rub(row["worst_day"], signed=True),
+                "Шарп": _comma(row["sharpe"], 2, signed=True),
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def _leverage_years(curves: dict[int, pd.DataFrame], cash: float = ACCOUNT_CASH) -> pd.DataFrame:
+    nets: dict[int, list[float]] = {}
+    years: list[int] = []
+    for leverage, curve in curves.items():
+        previous = cash
+        column: list[float] = []
+        labels: list[int] = []
+        for year, part in curve.groupby(curve["day"].dt.year, sort=True):
+            end = float(part["equity"].iloc[-1])
+            labels.append(int(year))
+            column.append(end - previous)
+            previous = end
+        years = labels
+        nets[int(leverage)] = column
+    rows = []
+    for index, year in enumerate(years):
+        item: dict[str, object] = {"год": year}
+        for leverage in sorted(nets):
+            item[f"×{leverage}, ₽"] = _rub(nets[leverage][index], signed=True)
+        rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def _leverage_row(table: pd.DataFrame, leverage: int) -> pd.Series | None:
+    match = table[table["leverage"] == leverage]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def _leverage_section(series: cm.Series, study: Study) -> list[str]:
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    table, curves = leverage_table(frame, series.level, series.ret, series.roll)
+    one = _leverage_row(table, 1)
+    four = _leverage_row(table, 4)
+    five = _leverage_row(table, 5)
+    lines = [
+        "## 10. Фиксированное плечо от 1 до 8\n",
+        (
+            "Плечо — номинал позиции, делённый на текущий счёт. Каждый день контрактов "
+            "floor(плечо × счёт / номинал), номинал берётся по закрытию предыдущего дня. "
+            "Это та же формула, что у минутного движка в момент входа, только здесь размер обновляется ежедневно, "
+            "поэтому плечо не уезжает вместе с прибылью. Издержки — 6 ₽ на сторону за каждый добавленный или снятый контракт "
+            "и полная роллировка всего объёма. ГО — те же 9,6% номинала. Если к закрытию счёт ниже ГО, позиция закрывается "
+            "в этот день и на следующий набирается заново, пока на счёте есть деньги."
+        ),
+    ]
+    if one is not None:
+        lines.append(
+            f"Плечо 1 на первом входе — это {_rub(one['start_lots'], 0)} контрактов, не один. "
+            f"Четыре контракта из раздела 9 держат номинал около половины стартового счёта и не увеличивают его, когда счёт растёт. "
+            f"Здесь плечо 1 доводит счёт до {_rub(one['end'])} ₽, просадка {_rub(one['max_dd'])} ₽ "
+            f"({_comma(one['max_dd_pct_peak'], 1)}% пика), маржин-коллов {int(one['margin_calls'])}. "
+            f"В среднем в позиции {_comma(one['avg_lots'], 1)} контракта."
+        )
+    if four is not None and five is not None:
+        richest = table.loc[table["end"].idxmax()]
+        lines.append(
+            f"Плечо 4, как у минутных окон 30 и 45: финиш {_rub(four['end'])} ₽, "
+            f"просадка {_rub(four['max_dd'])} ₽ ({_comma(four['max_dd_pct_peak'], 1)}% пика), "
+            f"худший день {_rub(four['worst_day'], signed=True)} ₽, свободно в минимуме {_rub(four['min_free'])} ₽, "
+            f"коллов {int(four['margin_calls'])}. "
+            f"Самый высокий финиш на этой истории — плечо {int(richest['leverage'])}: {_rub(richest['end'])} ₽, "
+            f"просадка {_comma(richest['max_dd_pct_peak'], 1)}% пика, свободно в минимуме {_rub(richest['min_free'])} ₽."
+        )
+    called = table[table["margin_calls"] > 0].sort_values("leverage")
+    if len(called):
+        bits = ", ".join(f"×{int(row.leverage)} — {int(row.margin_calls)}" for row in called.itertuples())
+        first = int(called["leverage"].iloc[0])
+        lines.append(
+            f"Закрытия по ГО начинаются с плеча {first}: {bits} дней. "
+            "Дальше финиш уже ниже, чем у плеча без этих закрытий: залог обрезает позицию в просадке, и счёт не успевает восстановить тот же номинал."
+        )
+    sharpe_low = float(table["sharpe"].min()) if len(table) else float("nan")
+    sharpe_high = float(table["sharpe"].max()) if len(table) else float("nan")
+    lines.append(
+        f"Шарп дневной доходности счёта остаётся между {_comma(sharpe_low, 2, signed=True)} и {_comma(sharpe_high, 2, signed=True)}. "
+        "Плечо не делает сигнал лучше: оно растягивает рублёвый результат и просадку, пока ГО не начинает закрывать позицию."
+    )
+    lines.extend(["", report.md(_leverage_view(table), index=False), "", "Net по календарным годам, рубли на счёт.\n", report.md(_leverage_years(curves), index=False)])
+    lines.append("\nВ живую функцию плечо не переносится.")
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
 def _walk_view(table: pd.DataFrame) -> pd.DataFrame:
     out = []
     for _, row in table.iterrows():
@@ -1120,6 +1390,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         "## 8. Что из этого следует\n",
         _primary_blurb(rows, study),
         *_account_section(series, study),
+        *_leverage_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -1135,6 +1406,19 @@ def _json_value(value: object) -> object:
     if isinstance(value, pd.Timestamp):
         return str(value.date())
     return value
+
+
+def _month_end(frame: pd.DataFrame, months: list[str], column: str = "equity") -> list[float]:
+    """Значение на конец месяца. До первого месяца ряда — стартовое, дальше держится последнее."""
+    monthly = frame.groupby(frame["day"].dt.to_period("M"), sort=True)[column].last()
+    out: list[float] = []
+    last = ACCOUNT_CASH
+    for label in months:
+        period = pd.Period(label, freq="M")
+        if period in monthly.index:
+            last = float(monthly.loc[period])
+        out.append(round(last, 2))
+    return out
 
 
 def _aligned_equity(frame: pd.DataFrame, months: list[str]) -> list[float]:
@@ -1185,6 +1469,7 @@ def export_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "equity": equities,
         "coverage": [{key: _json_value(value) for key, value in row.items()} for _, row in study.coverage.iterrows()],
         "account": _account_payload(series, study),
+        "leverage": _leverage_payload(series, study),
     }
 
 
@@ -1209,6 +1494,17 @@ def _account_payload(series: cm.Series, study: Study) -> dict[str, object]:
     }
 
 
+def _leverage_payload(series: cm.Series, study: Study) -> dict[str, object]:
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    table, curves = leverage_table(frame, series.level, series.ret, series.roll)
+    months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
+    return {
+        "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
+        "months": months,
+        "equity": {str(leverage): _month_end(curve, months) for leverage, curve in curves.items()},
+    }
+
+
 def main() -> None:
     core.configure(1000.0, 0.001)
     series = cm.continuous()
@@ -1220,6 +1516,8 @@ def main() -> None:
     (report.OUT / "out" / "cr_momentum_params.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     account = describe_account(study.frames[("hold", PRIMARY[0], PRIMARY[1])], series.level)
     account.grid.to_csv(report.OUT / "out" / "cr_momentum_account.csv", index=False)
+    leverage, _ = leverage_table(study.frames[("hold", PRIMARY[0], PRIMARY[1])], series.level, series.ret, series.roll)
+    leverage.to_csv(report.OUT / "out" / "cr_momentum_leverage.csv", index=False)
 
 
 if __name__ == "__main__":
