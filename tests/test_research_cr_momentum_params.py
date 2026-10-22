@@ -152,7 +152,9 @@ def test_report_contains_both_cost_models():
     assert "Фильтры по громкости" in text
     assert "Фильтры по прямоте" in text
     assert "Другие фильтры" in text
-    assert cp.CHOSEN_FILTER == "пауза и без кульминации"
+    assert cp.CHOSEN_FILTER == "пауза, без кульминации и без широкого дня"
+    assert cp.PAUSE_NO_CLIMAX == "пауза и без кульминации"
+    assert "широкого дня" in text
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
@@ -266,6 +268,9 @@ def test_wide_day_uses_the_prior_range_and_clears_the_next_hold():
     positions = dict(cp.extra_filter_positions(series, volume, day_range, lookback=5, step=5))
     assert positions["без широкого дня"][21:26].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
     assert positions["без широкого дня"][26:31].tolist() == positions["без фильтра"][26:31].tolist()
+    locked = cp.chosen_account_position(series, volume, day_range, lookback=5, step=5)
+    assert locked[21:26].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert np.array_equal(locked, positions["выбранный и без широкого дня"])
     up, down = cp.same_sign_counts(series, 5)
     assert up[5] == 5
     assert down[5] == 0
@@ -283,9 +288,9 @@ def test_quiet_volume_clears_only_the_following_hold():
     volume[20] = 1.0
     volume[25] = 11.0
     positions = dict(cp.volume_filter_positions(series, volume, lookback=5, step=5))
-    assert np.array_equal(positions[cp.CHOSEN_FILTER], cp.position_schedule(series, 5, 5))
+    assert np.array_equal(positions[cp.PAUSE_NO_CLIMAX], cp.position_schedule(series, 5, 5))
     assert positions["громкое решение"][21:26].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
-    assert positions["громкое решение"][26:31].tolist() == positions[cp.CHOSEN_FILTER][26:31].tolist()
+    assert positions["громкое решение"][26:31].tolist() == positions[cp.PAUSE_NO_CLIMAX][26:31].tolist()
 
 
 def test_filters_keep_the_base_schedule_and_pause_only_the_next_day():
