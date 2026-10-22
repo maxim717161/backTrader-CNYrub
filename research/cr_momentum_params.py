@@ -2638,6 +2638,12 @@ def main() -> None:
         straight_table.to_csv(report.OUT / "out" / "cr_momentum_straight.csv", index=False)
         extra_table, _ = extra_book(series, volume, contract_daily_range(series))
         extra_table.to_csv(report.OUT / "out" / "cr_momentum_extra.csv", index=False)
+    from research.cr_momentum_mix import main as mix_main
+
+    mix_text = mix_main()
+    if mix_text:
+        path = report.OUT / "REPORT_cr_momentum_params.md"
+        path.write_text(path.read_text(encoding="utf-8").rstrip() + "\n" + mix_text, encoding="utf-8")
 
 
 if __name__ == "__main__":
