@@ -150,6 +150,8 @@ def test_report_contains_both_cost_models():
     assert "Выбранный фильтр" in text
     assert cp.CHOSEN_FILTER in text
     assert "Фильтры по громкости" in text
+    assert "Фильтры по прямоте" in text
+    assert cp.CHOSEN_FILTER == "пауза и без кульминации"
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
@@ -223,6 +225,24 @@ def test_roll_replaces_the_whole_book_and_a_margin_call_reopens_the_next_day():
     assert crashed["equity"].iloc[0] == pytest.approx(100_000 - 24_000 - 2 * 80 * cp.side_cost())
     assert crashed["contracts"].iloc[1] > 0
     assert not bool(crashed["called"].iloc[1])
+
+
+def test_path_efficiency_is_one_on_a_straight_move_and_a_third_on_a_reversal():
+    straight = make_series(np.array([0.0, 1.0, 1.0, 1.0]))
+    choppy = make_series(np.array([0.0, 1.0, -1.0, 1.0]))
+    assert cp.path_efficiency(straight, 3)[3] == pytest.approx(1.0)
+    assert cp.path_efficiency(choppy, 3)[3] == pytest.approx(1 / 3)
+
+
+def test_choppy_path_clears_only_the_following_hold():
+    ret = np.full(41, 0.02)
+    ret[16:21] = [0.02, -0.02, 0.02, -0.02, 0.02]
+    series = make_series(ret, level=10.0)
+    positions = dict(cp.straight_filter_positions(series, np.full(len(series), 10.0), lookback=5, step=5))
+    assert positions["прямее 0,25"][21:26].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert positions["пила ниже 0,25"][21:26].tolist() == positions["без фильтра"][21:26].tolist()
+    assert positions["коридор 0,15–0,5"][21:26].tolist() == positions["без фильтра"][21:26].tolist()
+    assert positions["прямее 0,25"][26:31].tolist() == positions["без фильтра"][26:31].tolist()
 
 
 def test_volume_pause_waits_until_the_next_day_and_ignores_today():

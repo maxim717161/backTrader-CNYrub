@@ -217,11 +217,17 @@ LEVERAGES = (1, 2, 3, 4, 5, 6, 7, 8)
 # Плечо и фильтр, которые оставляем. Остальные фильтры — сравнение, не новый отбор.
 CHOSEN_LEVERAGE = 3
 FILTER_SHOCK = 2.0
-CHOSEN_FILTER = f"пауза после {FILTER_SHOCK:.0f}σ"
+PRICE_PAUSE = f"пауза после {FILTER_SHOCK:.0f}σ"
+CHOSEN_FILTER = "пауза и без кульминации"
 FILTER_VOL_MULTIPLE = 1.5
 # Громкость — дневной объём активного контракта. Ориентир объявлен заранее: медиана предыдущих 20 дней, всплеск — 2 медианы.
 VOLUME_WINDOW = 20
 VOLUME_SPIKE = 2.0
+# Прямота — |чистый ход за L дней| / сумма модулей дневных ходов. Коридор взят из 30-минутного окна.
+# 0,25 — округление 1/sqrt(20), масштаб случайного блуждания за L дней, не подбор по счёту CR.
+STRAIGHT_LOW = 0.15
+STRAIGHT_HIGH = 0.5
+STRAIGHT_FLOOR = 0.25
 
 
 def contracts_for_drawdown(max_dd: float, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> int:
@@ -611,7 +617,7 @@ def filter_positions(series: cm.Series, lookback: int = 20, step: int = 5) -> li
     }
     positions = [(name, expand_decisions(values, lookback, step)) for name, values in decided.items()]
     bare = expand_decisions(base, lookback, step)
-    positions.append((CHOSEN_FILTER, pause_after_shock(bare, percent, vol, FILTER_SHOCK)))
+    positions.append((PRICE_PAUSE, pause_after_shock(bare, percent, vol, FILTER_SHOCK)))
     return positions
 
 
@@ -725,7 +731,7 @@ def volume_filter_positions(
     }
     bare = expand_decisions(base, lookback, step)
     chosen = pause_after_shock(bare, percent, price_vol)
-    positions = [(CHOSEN_FILTER, chosen)]
+    positions = [(PRICE_PAUSE, chosen)]
     for name, values in decided.items():
         held = pause_after_shock(expand_decisions(values, lookback, step), percent, price_vol)
         positions.append((f"пауза и {name}", held))
@@ -748,6 +754,81 @@ def volume_book(
     rows = []
     curves: dict[str, pd.DataFrame] = {}
     for name, position in volume_filter_positions(series, volume):
+        frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
+        curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
+        summary = leverage_summary(curve, cash)
+        summary.update(_path_rates(summary, cash, years))
+        summary["name"] = name
+        summary["in_market"] = float((position != 0).mean() * 100.0)
+        rows.append(summary)
+        curves[name] = curve
+    return pd.DataFrame(rows), curves
+
+
+def path_efficiency(series: cm.Series, lookback: int) -> np.ndarray:
+    """|Чистый ход за lookback дней| / сумма модулей дневных ходов. До lookback — NaN."""
+    out = np.full(len(series), np.nan)
+    if lookback <= 0 or lookback >= len(series):
+        return out
+    drift = np.abs(series.price[lookback:] - series.price[:-lookback])
+    cumulative = np.cumsum(np.abs(series.ret))
+    path = cumulative[lookback:] - cumulative[:-lookback]
+    out[lookback:] = np.divide(drift, path, out=np.zeros(len(drift)), where=path > 1e-12)
+    return out
+
+
+def _straight_rules(efficiency: np.ndarray) -> dict[str, np.ndarray]:
+    """Какие дни решения оставить. NaN в прямоте ни одно правило не выключает."""
+    known = efficiency == efficiency
+    return {
+        "коридор 0,15–0,5": known & (efficiency >= STRAIGHT_LOW) & (efficiency <= STRAIGHT_HIGH),
+        "прямее 0,5": known & (efficiency > STRAIGHT_HIGH),
+        "прямее 0,25": known & (efficiency >= STRAIGHT_FLOOR),
+        "пила ниже 0,25": known & (efficiency < STRAIGHT_FLOOR),
+    }
+
+
+def straight_filter_positions(
+    series: cm.Series,
+    volume: np.ndarray,
+    lookback: int = 20,
+    step: int = 5,
+) -> list[tuple[str, np.ndarray]]:
+    """Прямота хода за L дней. Сначала поверх выбранного фильтра, затем на позиции без него."""
+    base = signal_of(series, lookback, 0)
+    percent = daily_percent(series)
+    price_vol = trailing_vol(percent)
+    _, climax, _ = _volume_decision_masks(volume, lookback)
+    no_climax = np.where(climax, 0.0, base)
+    efficiency = path_efficiency(series, lookback)
+    known = efficiency == efficiency
+    rules = _straight_rules(efficiency)
+
+    def gated(mask: np.ndarray, decided: np.ndarray) -> np.ndarray:
+        return np.where(known & ~mask, 0.0, decided)
+
+    chosen = pause_after_shock(expand_decisions(no_climax, lookback, step), percent, price_vol)
+    positions = [(CHOSEN_FILTER, chosen)]
+    for name, mask in rules.items():
+        held = pause_after_shock(expand_decisions(gated(mask, no_climax), lookback, step), percent, price_vol)
+        positions.append((f"выбранный и {name}", held))
+    positions.append(("без фильтра", expand_decisions(base, lookback, step)))
+    for name, mask in rules.items():
+        positions.append((name, expand_decisions(gated(mask, base), lookback, step)))
+    return positions
+
+
+def straight_book(
+    series: cm.Series,
+    volume: np.ndarray,
+    leverage: float = CHOSEN_LEVERAGE,
+    cash: float = ACCOUNT_CASH,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Счёт с плечом для фильтров прямоты. Порядок строк — порядок объявления."""
+    years = max((pd.Timestamp(series.days[-1]) - pd.Timestamp(series.days[0])).days / 365.25, 1 / 365.25)
+    rows = []
+    curves: dict[str, pd.DataFrame] = {}
+    for name, position in straight_filter_positions(series, volume):
         frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
         curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
         summary = leverage_summary(curve, cash)
@@ -1420,8 +1501,8 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
     mild = _filter_named(table, "порог 50 б.п.")
     tight = _filter_named(table, "порог 100 б.п.")
     wide = _filter_named(table, "порог 200 б.п.")
-    pause = _filter_named(table, CHOSEN_FILTER)
-    focus = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", CHOSEN_FILTER)
+    pause = _filter_named(table, PRICE_PAUSE)
+    focus = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", PRICE_PAUSE)
     lines = [
         f"## 11. Фильтры при плече {CHOSEN_LEVERAGE}\n",
         (
@@ -1470,7 +1551,7 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
             f"в остальные дни в позиции — {_comma(_signed_mean(signed, kept) * 100, 2, signed=True)}%. "
             f"Та же пауза с порогом 3σ заканчивается на {_rub(shock3)} ₽, то есть ниже базы: годится не любая отсечка."
         )
-        others = table[~table["name"].isin(("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "порог 200 б.п.", CHOSEN_FILTER))]
+        others = table[~table["name"].isin(("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "порог 200 б.п.", PRICE_PAUSE))]
         weaker = others[others["end"] < base["end"]]
         if len(weaker):
             lines.append(
@@ -1487,7 +1568,7 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
             "Net отобранных для сравнения вариантов по календарным годам.\n",
             report.md(_filter_years(curves, focus), index=False),
             "",
-            f"Из этой таблицы оставляем фильтр «{CHOSEN_FILTER}». Счёт с ним — в следующем разделе.",
+            f"Из этой таблицы оставляем фильтр «{PRICE_PAUSE}». Вместе с отключением кульминации объёма он записан в следующем разделе.",
         ]
     )
     body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
@@ -1495,9 +1576,8 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
 
 
 def _chosen_section(series: cm.Series, study: Study) -> list[str]:
-    """Счёт, который оставляем: плечо 3 и пауза после хода больше 2σ."""
-    table, curves = filter_book(series)
-    row = _filter_named(table, CHOSEN_FILTER)
+    """Счёт, который оставляем: пауза после 2σ и без кульминации объёма."""
+    del study
     cash = f"{int(ACCOUNT_CASH):,}".replace(",", " ")
     lines = [
         "## 12. Выбранный фильтр\n",
@@ -1505,39 +1585,40 @@ def _chosen_section(series: cm.Series, study: Study) -> list[str]:
             f"Оставляем фильтр «{CHOSEN_FILTER}». Счёт {cash} ₽, плечо {CHOSEN_LEVERAGE}, "
             f"L = {PRIMARY[0]}, H = {PRIMARY[1]}, удержание. "
             f"Если модуль дневной доходности больше {FILTER_SHOCK:.0f} своих σ за 20 дней, "
-            "на следующий день позиция равна нулю. День самого хода фильтр не закрывает. "
-            "Пауза стоит одна, без порога 50 б.п."
+            "на следующий день позиция равна нулю. День самого хода эта пауза не закрывает. "
+            f"Если в день решения объём больше {VOLUME_SPIKE:.0f} медиан предыдущих {VOLUME_WINDOW} дней, "
+            "следующие H дней позиция не открывается. Порог 50 б.п. и остальные фильтры громкости в правило не входят."
         ),
     ]
-    if row is not None and CHOSEN_FILTER in curves:
-        positions = dict(filter_positions(series))
-        base = positions["без фильтра"]
-        chosen = positions[CHOSEN_FILTER]
-        off = int(((base != 0) & (chosen == 0)).sum())
-        shock3 = _finish_at_shock(series, 3.0)
+    volume = contract_daily_volume(series)
+    if not np.any(volume > 0):
+        lines.append("Для этого фильтра нужен дневной объём активного контракта, на этом ряду его нет.")
+        body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+        return ["\n" + body]
+    table, curves = volume_book(series, volume)
+    row = _filter_named(table, CHOSEN_FILTER)
+    if row is not None and CHOSEN_FILTER in curves and PRICE_PAUSE in curves:
+        positions = dict(volume_filter_positions(series, volume))
+        off = int(((positions[PRICE_PAUSE] != 0) & (positions[CHOSEN_FILTER] == 0)).sum())
         lines.append(
             f"Финиш {_rub(row['end'])} ₽, net {_rub(row['net'], signed=True)} ₽, "
             f"издержки {_rub(row['cost'])} ₽, {_comma(row['cagr'], 1)}% в год, "
             f"просадка {_comma(row['max_dd_pct_peak'], 1)}% пика, "
             f"Калмар {_comma(row['calmar'], 2)}, Шарп {_comma(row['sharpe'], 2, signed=True)}. "
-            f"В рынке {_comma(row['in_market'], 0)}% дней, пауза снимает позицию в {off} днях. "
+            f"В рынке {_comma(row['in_market'], 0)}% дней. Кульминация снимает ещё {off} дней сверх ценовой паузы. "
             f"Минимум счёта {_rub(row['min_equity'])} ₽, свободно после ГО не ниже {_rub(row['min_free'])} ₽, "
             f"маржин-коллов {int(row['margin_calls'])}. "
             f"Худший день {_rub(row['worst_day'], signed=True)} ₽. "
             f"В позиции в среднем {_comma(row['avg_lots'], 1)} контракта."
         )
-        lines.append(
-            f"Та же пауза с порогом 3σ заканчивается на {_rub(shock3)} ₽. "
-            f"Это ниже выбранного финиша, поэтому отсечка остаётся {FILTER_SHOCK:.0f}σ."
-        )
         lines.extend(
             [
                 "",
-                "Net выбранного фильтра и счёта без фильтра по календарным годам.\n",
-                report.md(_filter_years(curves, ("без фильтра", CHOSEN_FILTER)), index=False),
+                "Net выбранного фильтра, ценовой паузы и счёта без фильтра по календарным годам.\n",
+                report.md(_filter_years(curves, ("без фильтра", PRICE_PAUSE, CHOSEN_FILTER)), index=False),
             ]
         )
-    lines.append("В живую функцию фильтр не переносится: отсечка смотрелась на той же истории CR.")
+    lines.append("В живую функцию фильтр не переносится: и пауза, и кульминация смотрелись на той же истории CR.")
     body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
     return ["\n" + body]
 
@@ -1583,7 +1664,7 @@ def _volume_section(series: cm.Series, study: Study) -> list[str]:
         body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
         return ["\n" + body]
     table, curves = volume_book(series, volume)
-    base = _filter_named(table, CHOSEN_FILTER)
+    base = _filter_named(table, PRICE_PAUSE)
     overlays = ("пауза и громкое решение", "пауза и без кульминации", "пауза и растущий объём", "пауза и пауза объёма")
     alone = ("громкое решение", "без кульминации", "растущий объём", "пауза после 2× объёма")
     days = pd.to_datetime(series.days)
@@ -1615,17 +1696,17 @@ def _volume_section(series: cm.Series, study: Study) -> list[str]:
             )
         positions = dict(volume_filter_positions(series, volume))
         percent = daily_percent(series)
-        signed = positions[CHOSEN_FILTER] * percent
+        signed = positions[PRICE_PAUSE] * percent
         bare_signed = positions["без фильтра"] * percent
         volume_pause = positions["пауза и пауза объёма"]
-        dropped = (positions[CHOSEN_FILTER] != 0) & (volume_pause == 0)
-        kept = (positions[CHOSEN_FILTER] != 0) & (volume_pause != 0)
+        dropped = (positions[PRICE_PAUSE] != 0) & (volume_pause == 0)
+        kept = (positions[PRICE_PAUSE] != 0) & (volume_pause != 0)
         loud = positions["пауза и громкое решение"]
-        quiet_days = (positions[CHOSEN_FILTER] != 0) & (loud == 0)
-        loud_days = (positions[CHOSEN_FILTER] != 0) & (loud != 0)
+        quiet_days = (positions[PRICE_PAUSE] != 0) & (loud == 0)
+        loud_days = (positions[PRICE_PAUSE] != 0) & (loud != 0)
         climax_off = (positions["без фильтра"] != 0) & (positions["без кульминации"] == 0)
         climax_on = (positions["без фильтра"] != 0) & (positions["без кульминации"] != 0)
-        both_off = (positions[CHOSEN_FILTER] != 0) & (positions["пауза и без кульминации"] == 0)
+        both_off = (positions[PRICE_PAUSE] != 0) & (positions[CHOSEN_FILTER] == 0)
         lines.append(
             f"Без ценовой паузы дни, которые «без кульминации» выключает, в среднем дают {_comma(_signed_mean(bare_signed, climax_off) * 100, 2, signed=True)}% со знаком позиции, "
             f"остальные дни в позиции — {_comma(_signed_mean(bare_signed, climax_on) * 100, 2, signed=True)}%. "
@@ -1656,9 +1737,118 @@ def _volume_section(series: cm.Series, study: Study) -> list[str]:
             report.md(_filter_view(table), index=False),
             "",
             "Net выбранной паузы и фильтров громкости поверх неё по календарным годам.\n",
+            report.md(_filter_years(curves, (PRICE_PAUSE, *overlays)), index=False),
+            "",
+            f"Из фильтров громкости оставляем «{CHOSEN_FILTER}». В живую функцию он не переносится.",
+        ]
+    )
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
+def _straight_section(series: cm.Series, study: Study) -> list[str]:
+    """Прямота L-дневного хода на выбранном фильтре и отдельно на позиции без него."""
+    del study
+    lines = [
+        "## 14. Фильтры по прямоте\n",
+        (
+            "Прямота — модуль чистого хода за L дней, делённый на сумму модулей дневных ходов за те же дни. "
+            "Единица — ход без единого отката, ноль — путь съел весь чистый сдвиг. "
+            f"Считается на закрытии дня решения и держится H дней. "
+            f"Коридор {_comma(STRAIGHT_LOW, 2)}–{_comma(STRAIGHT_HIGH, 1)} — тот же, что у 30-минутного окна. "
+            f"Порог {_comma(STRAIGHT_FLOOR, 2)} — округление 1/√{PRIMARY[0]}, масштаб случайного блуждания за L дней. "
+            "Пила — дни ниже этого порога. Граница 0,25 остаётся у «прямее 0,25»."
+        ),
+    ]
+    volume = contract_daily_volume(series)
+    if not np.any(volume > 0):
+        lines.append("Для сравнения с выбранным фильтром нужен дневной объём, на этом ряду его нет.")
+        body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+        return ["\n" + body]
+    table, curves = straight_book(series, volume)
+    base = _filter_named(table, CHOSEN_FILTER)
+    overlays = (
+        "выбранный и коридор 0,15–0,5",
+        "выбранный и прямее 0,5",
+        "выбранный и прямее 0,25",
+        "выбранный и пила ниже 0,25",
+    )
+    alone = ("коридор 0,15–0,5", "прямее 0,5", "прямее 0,25", "пила ниже 0,25")
+    efficiency = path_efficiency(series, PRIMARY[0])
+    known = efficiency == efficiency
+    if np.any(known):
+        lines.append(
+            f"Медиана прямоты за {PRIMARY[0]} дней — {_comma(float(np.median(efficiency[known])), 2)}. "
+            f"Ниже {_comma(STRAIGHT_FLOOR, 2)} оказывается {_comma(float((efficiency[known] < STRAIGHT_FLOOR).mean() * 100), 0)}% дней, "
+            f"в коридоре {_comma(STRAIGHT_LOW, 2)}–{_comma(STRAIGHT_HIGH, 1)} — {_comma(float(((efficiency[known] >= STRAIGHT_LOW) & (efficiency[known] <= STRAIGHT_HIGH)).mean() * 100), 0)}%, "
+            f"прямее {_comma(STRAIGHT_HIGH, 1)} — {_comma(float((efficiency[known] > STRAIGHT_HIGH).mean() * 100), 0)}%."
+        )
+    lines.append(
+        f"Счёт тот же: {_lots(ACCOUNT_CASH)} ₽, плечо {CHOSEN_LEVERAGE}, фильтр «{CHOSEN_FILTER}». "
+        "Каждое правило прямоты смотрится отдельно и с другими не складывается."
+    )
+    if base is not None:
+        helped = [name for name in overlays if (row := _filter_named(table, name)) is not None and _volume_helps(row, base)]
+        if helped:
+            lines.append(
+                "На выбранном фильтре счёт улучшают: "
+                + ", ".join(f"«{name}»" for name in helped)
+                + ". Улучшение — финиш выше без более глубокой просадки, либо просадка меньше хотя бы на 2 пункта при финише не ниже 98% выбранного счёта."
+            )
+        else:
+            lines.append(
+                "На выбранном фильтре ни одно из четырёх правил прямоты счёт не улучшает: "
+                "финиш не растёт без более глубокой просадки, и просадка не становится меньше хотя бы на 2 пункта при близком финише."
+            )
+        band = _filter_named(table, overlays[0])
+        if band is not None and base is not None:
+            band_2024 = _year_changes(curves[overlays[0]]).get(2024, float("nan"))
+            lines.append(
+                f"Коридор 0,15–0,5 снижает просадку до {_comma(band['max_dd_pct_peak'], 1)}% пика и поднимает Калмар до {_comma(band['calmar'], 2)}, "
+                f"финиш при этом {_rub(band['end'])} ₽. В 2024 году коридор даёт {_rub(band_2024, signed=True)} ₽."
+            )
+        positions = dict(straight_filter_positions(series, volume))
+        percent = daily_percent(series)
+        signed = positions[CHOSEN_FILTER] * percent
+        bare_signed = positions["без фильтра"] * percent
+        bits = []
+        for label, stacked, plain in (
+            ("коридор 0,15–0,5", overlays[0], alone[0]),
+            ("прямее 0,5", overlays[1], alone[1]),
+            ("прямее 0,25", overlays[2], alone[2]),
+            ("пила ниже 0,25", overlays[3], alone[3]),
+        ):
+            off = (positions[CHOSEN_FILTER] != 0) & (positions[stacked] == 0)
+            kept = (positions[CHOSEN_FILTER] != 0) & (positions[stacked] != 0)
+            bare_off = (positions["без фильтра"] != 0) & (positions[plain] == 0)
+            bare_on = (positions["без фильтра"] != 0) & (positions[plain] != 0)
+            bits.append(
+                f"«{label}» снимает с выбранной позиции дни со средним {_comma(_signed_mean(signed, off) * 100, 2, signed=True)}% "
+                f"против {_comma(_signed_mean(signed, kept) * 100, 2, signed=True)}% у оставшихся. "
+                f"Без фильтра те же дни дают {_comma(_signed_mean(bare_signed, bare_off) * 100, 2, signed=True)}% "
+                f"против {_comma(_signed_mean(bare_signed, bare_on) * 100, 2, signed=True)}%."
+            )
+        lines.append(" ".join(bits))
+        bare = _filter_named(table, "без фильтра")
+        if bare is not None:
+            alone_helped = [name for name in alone if (row := _filter_named(table, name)) is not None and _volume_helps(row, bare)]
+            if alone_helped:
+                lines.append(
+                    "Без выбранного фильтра относительно позиции без фильтра счёт улучшают: "
+                    + ", ".join(f"«{name}»" for name in alone_helped)
+                    + "."
+                )
+            else:
+                lines.append("Без выбранного фильтра те же четыре правила относительно позиции без фильтра счёт не улучшают.")
+    lines.extend(
+        [
+            "",
+            report.md(_filter_view(table), index=False),
+            "",
+            "Net выбранного фильтра и правил прямоты поверх него по календарным годам.\n",
             report.md(_filter_years(curves, (CHOSEN_FILTER, *overlays)), index=False),
             "",
-            "В живую функцию фильтр по объёму не переносится.",
+            "В живую функцию фильтр по прямоте не переносится.",
         ]
     )
     body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
@@ -1922,6 +2112,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         *_filter_section(series, study),
         *_chosen_section(series, study),
         *_volume_section(series, study),
+        *_straight_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -2003,6 +2194,7 @@ def export_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "leverage": _leverage_payload(series, study),
         "filters": _filter_payload(series, study),
         "volume": _volume_payload(series, study),
+        "straight": _straight_payload(series, study),
     }
 
 
@@ -2042,10 +2234,11 @@ def _filter_payload(series: cm.Series, study: Study) -> dict[str, object]:
     table, curves = filter_book(series)
     frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
     months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
-    shown = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", CHOSEN_FILTER)
+    shown = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", PRICE_PAUSE)
     return {
         "leverage": CHOSEN_LEVERAGE,
         "chosen": CHOSEN_FILTER,
+        "price_pause": PRICE_PAUSE,
         "shock": FILTER_SHOCK,
         "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
         "months": months,
@@ -2061,9 +2254,9 @@ def _volume_payload(series: cm.Series, study: Study) -> dict[str, object]:
     frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
     months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
     shown = (
-        CHOSEN_FILTER,
+        PRICE_PAUSE,
         "пауза и громкое решение",
-        "пауза и без кульминации",
+        CHOSEN_FILTER,
         "пауза и растущий объём",
         "пауза и пауза объёма",
     )
@@ -2072,6 +2265,32 @@ def _volume_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "leverage": CHOSEN_LEVERAGE,
         "window": VOLUME_WINDOW,
         "spike": VOLUME_SPIKE,
+        "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
+        "months": months,
+        "equity": {name: _month_end(curves[name], months) for name in shown if name in curves},
+    }
+
+
+def _straight_payload(series: cm.Series, study: Study) -> dict[str, object]:
+    volume = contract_daily_volume(series)
+    if not np.any(volume > 0):
+        return {"available": False}
+    table, curves = straight_book(series, volume)
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
+    shown = (
+        CHOSEN_FILTER,
+        "выбранный и коридор 0,15–0,5",
+        "выбранный и прямее 0,5",
+        "выбранный и прямее 0,25",
+        "выбранный и пила ниже 0,25",
+    )
+    return {
+        "available": True,
+        "leverage": CHOSEN_LEVERAGE,
+        "low": STRAIGHT_LOW,
+        "high": STRAIGHT_HIGH,
+        "floor": STRAIGHT_FLOOR,
         "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
         "months": months,
         "equity": {name: _month_end(curves[name], months) for name in shown if name in curves},
@@ -2097,6 +2316,8 @@ def main() -> None:
     if np.any(volume > 0):
         volume_table, _ = volume_book(series, volume)
         volume_table.to_csv(report.OUT / "out" / "cr_momentum_volume.csv", index=False)
+        straight_table, _ = straight_book(series, volume)
+        straight_table.to_csv(report.OUT / "out" / "cr_momentum_straight.csv", index=False)
 
 
 if __name__ == "__main__":
