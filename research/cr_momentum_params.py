@@ -214,9 +214,10 @@ MARGIN_RATE = EXCHANGE_MARGIN_RUB / (EXCHANGE_SETTLE * 1000.0)
 ACCOUNT_GRID = (1, 2, 4, 5, 8, 10, 20, 40)
 # Плечо — номинал / счёт. Формула контрактов та же, что в минутном движке: floor(плечо × счёт / номинал).
 LEVERAGES = (1, 2, 3, 4, 5, 6, 7, 8)
-# Плечо, которое оставляем. Фильтры ниже с фиксированными порогами, без подбора по этому счёту.
+# Плечо и фильтр, которые оставляем. Остальные фильтры — сравнение, не новый отбор.
 CHOSEN_LEVERAGE = 3
 FILTER_SHOCK = 2.0
+CHOSEN_FILTER = f"пауза после {FILTER_SHOCK:.0f}σ"
 FILTER_VOL_MULTIPLE = 1.5
 
 
@@ -607,7 +608,7 @@ def filter_positions(series: cm.Series, lookback: int = 20, step: int = 5) -> li
     }
     positions = [(name, expand_decisions(values, lookback, step)) for name, values in decided.items()]
     bare = expand_decisions(base, lookback, step)
-    positions.append(("пауза после 2σ", pause_after_shock(bare, percent, vol)))
+    positions.append((CHOSEN_FILTER, pause_after_shock(bare, percent, vol, FILTER_SHOCK)))
     return positions
 
 
@@ -1302,8 +1303,8 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
     mild = _filter_named(table, "порог 50 б.п.")
     tight = _filter_named(table, "порог 100 б.п.")
     wide = _filter_named(table, "порог 200 б.п.")
-    pause = _filter_named(table, "пауза после 2σ")
-    focus = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "пауза после 2σ")
+    pause = _filter_named(table, CHOSEN_FILTER)
+    focus = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", CHOSEN_FILTER)
     lines = [
         f"## 11. Фильтры при плече {CHOSEN_LEVERAGE}\n",
         (
@@ -1352,7 +1353,7 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
             f"в остальные дни в позиции — {_comma(_signed_mean(signed, kept) * 100, 2, signed=True)}%. "
             f"Та же пауза с порогом 3σ заканчивается на {_rub(shock3)} ₽, то есть ниже базы: годится не любая отсечка."
         )
-        others = table[~table["name"].isin(("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "порог 200 б.п.", "пауза после 2σ"))]
+        others = table[~table["name"].isin(("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "порог 200 б.п.", CHOSEN_FILTER))]
         weaker = others[others["end"] < base["end"]]
         if len(weaker):
             lines.append(
@@ -1369,9 +1370,57 @@ def _filter_section(series: cm.Series, study: Study) -> list[str]:
             "Net отобранных для сравнения вариантов по календарным годам.\n",
             report.md(_filter_years(curves, focus), index=False),
             "",
-            "В живую функцию фильтр не переносится: и порог, и пауза смотрелись на той же истории CR.",
+            f"Из этой таблицы оставляем фильтр «{CHOSEN_FILTER}». Счёт с ним — в следующем разделе.",
         ]
     )
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
+def _chosen_section(series: cm.Series, study: Study) -> list[str]:
+    """Счёт, который оставляем: плечо 3 и пауза после хода больше 2σ."""
+    table, curves = filter_book(series)
+    row = _filter_named(table, CHOSEN_FILTER)
+    cash = f"{int(ACCOUNT_CASH):,}".replace(",", " ")
+    lines = [
+        "## 12. Выбранный фильтр\n",
+        (
+            f"Оставляем фильтр «{CHOSEN_FILTER}». Счёт {cash} ₽, плечо {CHOSEN_LEVERAGE}, "
+            f"L = {PRIMARY[0]}, H = {PRIMARY[1]}, удержание. "
+            f"Если модуль дневной доходности больше {FILTER_SHOCK:.0f} своих σ за 20 дней, "
+            "на следующий день позиция равна нулю. День самого хода фильтр не закрывает. "
+            "Пауза стоит одна, без порога 50 б.п."
+        ),
+    ]
+    if row is not None and CHOSEN_FILTER in curves:
+        positions = dict(filter_positions(series))
+        base = positions["без фильтра"]
+        chosen = positions[CHOSEN_FILTER]
+        off = int(((base != 0) & (chosen == 0)).sum())
+        shock3 = _finish_at_shock(series, 3.0)
+        lines.append(
+            f"Финиш {_rub(row['end'])} ₽, net {_rub(row['net'], signed=True)} ₽, "
+            f"издержки {_rub(row['cost'])} ₽, {_comma(row['cagr'], 1)}% в год, "
+            f"просадка {_comma(row['max_dd_pct_peak'], 1)}% пика, "
+            f"Калмар {_comma(row['calmar'], 2)}, Шарп {_comma(row['sharpe'], 2, signed=True)}. "
+            f"В рынке {_comma(row['in_market'], 0)}% дней, пауза снимает позицию в {off} днях. "
+            f"Минимум счёта {_rub(row['min_equity'])} ₽, свободно после ГО не ниже {_rub(row['min_free'])} ₽, "
+            f"маржин-коллов {int(row['margin_calls'])}. "
+            f"Худший день {_rub(row['worst_day'], signed=True)} ₽. "
+            f"В позиции в среднем {_comma(row['avg_lots'], 1)} контракта."
+        )
+        lines.append(
+            f"Та же пауза с порогом 3σ заканчивается на {_rub(shock3)} ₽. "
+            f"Это ниже выбранного финиша, поэтому отсечка остаётся {FILTER_SHOCK:.0f}σ."
+        )
+        lines.extend(
+            [
+                "",
+                "Net выбранного фильтра и счёта без фильтра по календарным годам.\n",
+                report.md(_filter_years(curves, ("без фильтра", CHOSEN_FILTER)), index=False),
+            ]
+        )
+    lines.append("В живую функцию фильтр не переносится: отсечка смотрелась на той же истории CR.")
     body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
     return ["\n" + body]
 
@@ -1631,6 +1680,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         *_account_section(series, study),
         *_leverage_section(series, study),
         *_filter_section(series, study),
+        *_chosen_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -1750,9 +1800,11 @@ def _filter_payload(series: cm.Series, study: Study) -> dict[str, object]:
     table, curves = filter_book(series)
     frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
     months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
-    shown = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "пауза после 2σ")
+    shown = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", CHOSEN_FILTER)
     return {
         "leverage": CHOSEN_LEVERAGE,
+        "chosen": CHOSEN_FILTER,
+        "shock": FILTER_SHOCK,
         "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
         "months": months,
         "equity": {name: _month_end(curves[name], months) for name in shown if name in curves},

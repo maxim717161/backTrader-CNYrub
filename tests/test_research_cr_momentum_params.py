@@ -147,6 +147,8 @@ def test_report_contains_both_cost_models():
     assert "Счёт 100 000" in text
     assert "Фиксированное плечо" in text
     assert "Фильтры при плече" in text
+    assert "Выбранный фильтр" in text
+    assert cp.CHOSEN_FILTER in text
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
