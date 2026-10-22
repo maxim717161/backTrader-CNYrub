@@ -219,6 +219,9 @@ CHOSEN_LEVERAGE = 3
 FILTER_SHOCK = 2.0
 CHOSEN_FILTER = f"пауза после {FILTER_SHOCK:.0f}σ"
 FILTER_VOL_MULTIPLE = 1.5
+# Громкость — дневной объём активного контракта. Ориентир объявлен заранее: медиана предыдущих 20 дней, всплеск — 2 медианы.
+VOLUME_WINDOW = 20
+VOLUME_SPIKE = 2.0
 
 
 def contracts_for_drawdown(max_dd: float, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> int:
@@ -631,6 +634,120 @@ def filter_book(
     rows = []
     curves: dict[str, pd.DataFrame] = {}
     for name, position in filter_positions(series):
+        frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
+        curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
+        summary = leverage_summary(curve, cash)
+        summary.update(_path_rates(summary, cash, years))
+        summary["name"] = name
+        summary["in_market"] = float((position != 0).mean() * 100.0)
+        rows.append(summary)
+        curves[name] = curve
+    return pd.DataFrame(rows), curves
+
+
+def contract_daily_volume(series: cm.Series, bars_dir=None) -> np.ndarray:
+    """Сумма минутного volume активного контракта за день. На роллировке — объём нового контракта."""
+    out = np.zeros(len(series))
+    bars_dir = core.BARS_DIR if bars_dir is None else bars_dir
+    meta = bars_dir.parent / "contracts.json"
+    if not meta.exists():
+        return out
+    document = json.loads(meta.read_text(encoding="utf-8"))
+    index = {
+        (pd.Timestamp(day).normalize(), str(series.contract[i])): i
+        for i, day in enumerate(series.days)
+    }
+    for row in document["contracts"]:
+        start, end = row.get("window_start"), row.get("window_end")
+        path = bars_dir / f"{row['secid']}.parquet"
+        if not start or not end or not path.exists():
+            continue
+        frame = pd.read_parquet(path, columns=["datetime", "volume"])
+        frame["datetime"] = pd.to_datetime(frame["datetime"])
+        frame = frame[frame["datetime"].dt.dayofweek < 5]
+        daily = frame.groupby(frame["datetime"].dt.normalize())["volume"].sum()
+        window = daily[(daily.index >= pd.Timestamp(start)) & (daily.index <= pd.Timestamp(end))]
+        for day, value in window.items():
+            slot = index.get((pd.Timestamp(day).normalize(), row["secid"]))
+            if slot is not None:
+                out[slot] = float(value)
+    return out
+
+
+def prior_volume_median(volume: np.ndarray, window: int = VOLUME_WINDOW) -> np.ndarray:
+    """Медиана объёма предыдущих window дней. Сегодняшний день в медиану не входит."""
+    return pd.Series(volume).rolling(window, min_periods=window).median().shift(1).to_numpy()
+
+
+def pause_after_volume(
+    position: np.ndarray,
+    volume: np.ndarray,
+    multiple: float = VOLUME_SPIKE,
+    window: int = VOLUME_WINDOW,
+) -> np.ndarray:
+    """Следующий день без позиции, если сегодняшний объём больше multiple медиан прошлого. Сегодняшний день не трогает."""
+    prior = prior_volume_median(volume, window)
+    raw = (prior > 0) & (volume > multiple * prior)
+    pause = np.zeros(len(position), dtype=bool)
+    pause[1:] = raw[:-1]
+    out = np.array(position, dtype=float, copy=True)
+    out[pause] = 0.0
+    return out
+
+
+def _volume_decision_masks(volume: np.ndarray, lookback: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Маски решения на закрытии дня: тихий день, кульминация, объём окна не выше предыдущего окна."""
+    prior = prior_volume_median(volume)
+    known = prior == prior
+    quiet = known & ~(volume > prior)
+    climax = known & (prior > 0) & (volume > VOLUME_SPIKE * prior)
+    recent = pd.Series(volume).rolling(lookback, min_periods=lookback).sum()
+    rising = (recent > recent.shift(lookback)).to_numpy()
+    fading = (rising == rising) & ~rising
+    return quiet, climax, fading
+
+
+def volume_filter_positions(
+    series: cm.Series,
+    volume: np.ndarray,
+    lookback: int = 20,
+    step: int = 5,
+) -> list[tuple[str, np.ndarray]]:
+    """Фильтры громкости по одному. Сначала выбранная ценовая пауза, затем те же правила без неё."""
+    base = signal_of(series, lookback, 0)
+    percent = daily_percent(series)
+    price_vol = trailing_vol(percent)
+    quiet, climax, fading = _volume_decision_masks(volume, lookback)
+    decided = {
+        "громкое решение": np.where(quiet, 0.0, base),
+        "без кульминации": np.where(climax, 0.0, base),
+        "растущий объём": np.where(fading, 0.0, base),
+    }
+    bare = expand_decisions(base, lookback, step)
+    chosen = pause_after_shock(bare, percent, price_vol)
+    positions = [(CHOSEN_FILTER, chosen)]
+    for name, values in decided.items():
+        held = pause_after_shock(expand_decisions(values, lookback, step), percent, price_vol)
+        positions.append((f"пауза и {name}", held))
+    positions.append(("пауза и пауза объёма", pause_after_volume(chosen, volume)))
+    positions.append(("без фильтра", bare))
+    for name, values in decided.items():
+        positions.append((name, expand_decisions(values, lookback, step)))
+    positions.append(("пауза после 2× объёма", pause_after_volume(bare, volume)))
+    return positions
+
+
+def volume_book(
+    series: cm.Series,
+    volume: np.ndarray,
+    leverage: float = CHOSEN_LEVERAGE,
+    cash: float = ACCOUNT_CASH,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Счёт с плечом для фильтров громкости. Порядок строк — порядок объявления."""
+    years = max((pd.Timestamp(series.days[-1]) - pd.Timestamp(series.days[0])).days / 365.25, 1 / 365.25)
+    rows = []
+    curves: dict[str, pd.DataFrame] = {}
+    for name, position in volume_filter_positions(series, volume):
         frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
         curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
         summary = leverage_summary(curve, cash)
@@ -1425,6 +1542,129 @@ def _chosen_section(series: cm.Series, study: Study) -> list[str]:
     return ["\n" + body]
 
 
+def _lots(value: float) -> str:
+    """Целое с пробелом между тысячами. Для объёма в контрактах, не для рублей."""
+    if value != value:
+        return "—"
+    return f"{int(round(abs(value))):,}".replace(",", " ")
+
+
+def _volume_year_medians(series: cm.Series, volume: np.ndarray) -> str:
+    days = pd.to_datetime(series.days)
+    bits = []
+    for year, part in pd.Series(volume).groupby(days.year):
+        bits.append(f"{int(year)} — {_lots(float(part.median()))}")
+    return ", ".join(bits)
+
+
+def _volume_helps(row: pd.Series, base: pd.Series) -> bool:
+    """Выше финиш без более глубокой просадки, либо просадка меньше хотя бы на 2 пункта при финише не ниже 98% базы."""
+    higher = float(row["end"]) > float(base["end"]) and float(row["max_dd_pct_peak"]) <= float(base["max_dd_pct_peak"]) + 0.05
+    calmer = float(row["end"]) >= float(base["end"]) * 0.98 and float(row["max_dd_pct_peak"]) <= float(base["max_dd_pct_peak"]) - 2.0
+    return bool(higher or calmer)
+
+
+def _volume_section(series: cm.Series, study: Study) -> list[str]:
+    """Громкость на выбранном счёте: дневной объём, фильтры по одному, отдельно от ценовой паузы и поверх неё."""
+    del study
+    volume = contract_daily_volume(series)
+    lines = [
+        "## 13. Фильтры по громкости\n",
+        (
+            "Громкость — дневной объём активного контракта, сумма минутного volume. "
+            "На роллировке берётся объём нового контракта. "
+            f"Порог объявлен заранее: медиана предыдущих {VOLUME_WINDOW} дней, сегодняшний день в неё не входит. "
+            f"Всплеск — объём больше {VOLUME_SPIKE:.0f} таких медиан, та же отсечка, что у ценовой паузы. "
+            "Решение на закрытии дня держится H дней. Пауза по объёму, как и ценовая, снимает только следующий день."
+        ),
+    ]
+    if not np.any(volume > 0):
+        lines.append("Для этого ряда дневной объём активного контракта не собран.")
+        body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+        return ["\n" + body]
+    table, curves = volume_book(series, volume)
+    base = _filter_named(table, CHOSEN_FILTER)
+    overlays = ("пауза и громкое решение", "пауза и без кульминации", "пауза и растущий объём", "пауза и пауза объёма")
+    alone = ("громкое решение", "без кульминации", "растущий объём", "пауза после 2× объёма")
+    days = pd.to_datetime(series.days)
+    yearly = pd.Series(volume).groupby(days.year).median()
+    growth = ""
+    if len(yearly) >= 2 and float(yearly.iloc[0]) > 0 and float(yearly.iloc[-1]) > 5 * float(yearly.iloc[0]):
+        growth = " Объём от начала ряда к концу вырос в несколько раз, поэтому медиана всей истории почти всегда называет поздние дни громкими."
+    lines.append(
+        f"Медиана дня по годам, контрактов: {_volume_year_medians(series, volume)}.{growth} "
+        f"Счёт тот же: {_lots(ACCOUNT_CASH)} ₽, плечо {CHOSEN_LEVERAGE}, L = {PRIMARY[0]}, H = {PRIMARY[1]}. "
+        "Каждый фильтр смотрится отдельно. Поверх выбранной ценовой паузы фильтры громкости не складываются друг с другом."
+    )
+    if base is not None:
+        helped = []
+        for name in overlays:
+            row = _filter_named(table, name)
+            if row is not None and _volume_helps(row, base):
+                helped.append(name)
+        if helped:
+            lines.append(
+                "На выбранной паузе после 2σ счёт улучшают: "
+                + ", ".join(f"«{name}»" for name in helped)
+                + ". Улучшение здесь — финиш выше без более глубокой просадки, либо просадка меньше хотя бы на 2 пункта при финише не ниже 98% этой паузы."
+            )
+        else:
+            lines.append(
+                "На выбранной паузе после 2σ ни один из четырёх фильтров громкости счёт не улучшает: "
+                "финиш не растёт без более глубокой просадки, и просадка не становится меньше хотя бы на 2 пункта при близком финише."
+            )
+        positions = dict(volume_filter_positions(series, volume))
+        percent = daily_percent(series)
+        signed = positions[CHOSEN_FILTER] * percent
+        bare_signed = positions["без фильтра"] * percent
+        volume_pause = positions["пауза и пауза объёма"]
+        dropped = (positions[CHOSEN_FILTER] != 0) & (volume_pause == 0)
+        kept = (positions[CHOSEN_FILTER] != 0) & (volume_pause != 0)
+        loud = positions["пауза и громкое решение"]
+        quiet_days = (positions[CHOSEN_FILTER] != 0) & (loud == 0)
+        loud_days = (positions[CHOSEN_FILTER] != 0) & (loud != 0)
+        climax_off = (positions["без фильтра"] != 0) & (positions["без кульминации"] == 0)
+        climax_on = (positions["без фильтра"] != 0) & (positions["без кульминации"] != 0)
+        both_off = (positions[CHOSEN_FILTER] != 0) & (positions["пауза и без кульминации"] == 0)
+        lines.append(
+            f"Без ценовой паузы дни, которые «без кульминации» выключает, в среднем дают {_comma(_signed_mean(bare_signed, climax_off) * 100, 2, signed=True)}% со знаком позиции, "
+            f"остальные дни в позиции — {_comma(_signed_mean(bare_signed, climax_on) * 100, 2, signed=True)}%. "
+            f"Дни, которые пауза объёма снимает уже с выбранной ценовой паузы, в среднем дают {_comma(_signed_mean(signed, dropped) * 100, 2, signed=True)}%, "
+            f"остальные дни этой позиции — {_comma(_signed_mean(signed, kept) * 100, 2, signed=True)}%. "
+            f"Дни, которые «без кульминации» снимает с той же паузы, в среднем дают {_comma(_signed_mean(signed, both_off) * 100, 2, signed=True)}%. "
+            "Поверх ценовой паузы средний день, который убирает громкость, почти нулевой: добавка к финишу здесь идёт от другого пути плеча, а не от большого минуса этих дней. "
+            f"Тихие решения дают {_comma(_signed_mean(signed, quiet_days) * 100, 2, signed=True)}%, громкие — {_comma(_signed_mean(signed, loud_days) * 100, 2, signed=True)}%."
+        )
+        bare = _filter_named(table, "без фильтра")
+        if bare is not None:
+            alone_helped = []
+            for name in alone:
+                row = _filter_named(table, name)
+                if row is not None and _volume_helps(row, bare):
+                    alone_helped.append(name)
+            if alone_helped:
+                lines.append(
+                    "Без ценовой паузы относительно позиции без фильтра счёт улучшают: "
+                    + ", ".join(f"«{name}»" for name in alone_helped)
+                    + "."
+                )
+            else:
+                lines.append("Без ценовой паузы те же четыре правила относительно позиции без фильтра счёт не улучшают.")
+    lines.extend(
+        [
+            "",
+            report.md(_filter_view(table), index=False),
+            "",
+            "Net выбранной паузы и фильтров громкости поверх неё по календарным годам.\n",
+            report.md(_filter_years(curves, (CHOSEN_FILTER, *overlays)), index=False),
+            "",
+            "В живую функцию фильтр по объёму не переносится.",
+        ]
+    )
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
 def _walk_view(table: pd.DataFrame) -> pd.DataFrame:
     out = []
     for _, row in table.iterrows():
@@ -1681,6 +1921,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         *_leverage_section(series, study),
         *_filter_section(series, study),
         *_chosen_section(series, study),
+        *_volume_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -1761,6 +2002,7 @@ def export_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "account": _account_payload(series, study),
         "leverage": _leverage_payload(series, study),
         "filters": _filter_payload(series, study),
+        "volume": _volume_payload(series, study),
     }
 
 
@@ -1811,6 +2053,31 @@ def _filter_payload(series: cm.Series, study: Study) -> dict[str, object]:
     }
 
 
+def _volume_payload(series: cm.Series, study: Study) -> dict[str, object]:
+    volume = contract_daily_volume(series)
+    if not np.any(volume > 0):
+        return {"available": False}
+    table, curves = volume_book(series, volume)
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
+    shown = (
+        CHOSEN_FILTER,
+        "пауза и громкое решение",
+        "пауза и без кульминации",
+        "пауза и растущий объём",
+        "пауза и пауза объёма",
+    )
+    return {
+        "available": True,
+        "leverage": CHOSEN_LEVERAGE,
+        "window": VOLUME_WINDOW,
+        "spike": VOLUME_SPIKE,
+        "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
+        "months": months,
+        "equity": {name: _month_end(curves[name], months) for name in shown if name in curves},
+    }
+
+
 def main() -> None:
     core.configure(1000.0, 0.001)
     series = cm.continuous()
@@ -1826,6 +2093,10 @@ def main() -> None:
     leverage.to_csv(report.OUT / "out" / "cr_momentum_leverage.csv", index=False)
     filters, _ = filter_book(series)
     filters.to_csv(report.OUT / "out" / "cr_momentum_filters.csv", index=False)
+    volume = contract_daily_volume(series)
+    if np.any(volume > 0):
+        volume_table, _ = volume_book(series, volume)
+        volume_table.to_csv(report.OUT / "out" / "cr_momentum_volume.csv", index=False)
 
 
 if __name__ == "__main__":

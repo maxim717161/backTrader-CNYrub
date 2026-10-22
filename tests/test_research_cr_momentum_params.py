@@ -149,6 +149,7 @@ def test_report_contains_both_cost_models():
     assert "Фильтры при плече" in text
     assert "Выбранный фильтр" in text
     assert cp.CHOSEN_FILTER in text
+    assert "Фильтры по громкости" in text
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
@@ -222,6 +223,23 @@ def test_roll_replaces_the_whole_book_and_a_margin_call_reopens_the_next_day():
     assert crashed["equity"].iloc[0] == pytest.approx(100_000 - 24_000 - 2 * 80 * cp.side_cost())
     assert crashed["contracts"].iloc[1] > 0
     assert not bool(crashed["called"].iloc[1])
+
+
+def test_volume_pause_waits_until_the_next_day_and_ignores_today():
+    volume = np.array([10.0, 10.0, 10.0, 10.0, 100.0, 10.0])
+    paused = cp.pause_after_volume(np.ones(6), volume, multiple=2.0, window=3)
+    assert paused.tolist() == [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+
+
+def test_quiet_volume_clears_only_the_following_hold():
+    series = make_series(np.full(41, 0.02), level=10.0)
+    volume = np.full(len(series), 10.0)
+    volume[20] = 1.0
+    volume[25] = 11.0
+    positions = dict(cp.volume_filter_positions(series, volume, lookback=5, step=5))
+    assert np.array_equal(positions[cp.CHOSEN_FILTER], cp.position_schedule(series, 5, 5))
+    assert positions["громкое решение"][21:26].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert positions["громкое решение"][26:31].tolist() == positions[cp.CHOSEN_FILTER][26:31].tolist()
 
 
 def test_filters_keep_the_base_schedule_and_pause_only_the_next_day():
