@@ -44,6 +44,7 @@ from cnyrub.live.service import (
 )
 from cnyrub.live.vk import status_text, trade_text
 from cnyrub.live.state import MemoryStore, state_key
+from cnyrub.live.veto import held_trading_days, peer_key, publish_peer, veto_source
 
 MSK = ZoneInfo("Europe/Moscow")
 ACCOUNT = "acc-short"
@@ -1524,6 +1525,159 @@ def test_fill_price_accepts_points_and_rejects_wrong_scale():
     assert fill_price(0.0, 10.75) == 10.75
 
 
+def _peer(name: str, *, channel: int, held: int, days: int, pnl: float) -> dict[str, object]:
+    return {
+        "strategy": name,
+        "channel": channel,
+        "held": held,
+        "target": held,
+        "held_days": days,
+        "pnl": pnl,
+    }
+
+
+def test_held_days_count_dates_after_the_entry_and_add_one_when_it_fell_out():
+    bars = [
+        {"t": "2026-09-28T10:00:00+03:00", "c": 10},
+        {"t": "2026-09-28T10:01:00+03:00", "c": 10},
+        {"t": "2026-09-29T10:00:00+03:00", "c": 10},
+        {"t": "2026-09-30T10:00:00+03:00", "c": 10},
+    ]
+    assert held_trading_days(bars, 0) == 2
+    assert held_trading_days(bars, 2) == 1
+    assert held_trading_days(bars, -1) == 3
+    assert held_trading_days(bars[:2], -1) == 1
+    assert held_trading_days([], 0) == 0
+
+
+def test_only_a_longer_green_position_blocks_the_opposite_entry():
+    store = MemoryStore()
+    book = _FillBook("CRZ6", 100_000.0)
+    book.target = 10
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    store.save(peer_key("thirty"), _peer("thirty", channel=30, held=-8, days=2, pnl=1500))
+    assert veto_source(store, "short", 525, book) == "long"
+    book.target = -10
+    assert veto_source(store, "short", 525, book) == ""
+    book.held = -1
+    book.target = 10
+    assert veto_source(store, "short", 525, book) == ""
+    book.held = 0
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=1, pnl=1500))
+    assert veto_source(store, "short", 525, book) == ""
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=0))
+    assert veto_source(store, "short", 525, book) == ""
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    store.save(peer_key("fortyfive"), {"strategy": "other", "channel": 45, "held": -8, "target": -8, "held_days": 2, "pnl": 1})
+    assert veto_source(store, "short", 525, book) == "long"
+
+    class Broken:
+        def load(self, key: str):
+            raise RuntimeError(key)
+
+    assert veto_source(Broken(), "short", 525, book) == ""
+
+
+def test_a_senior_short_in_profit_blocks_a_fresh_long_and_keeps_a_short():
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    broker = FakeBroker()
+    store = MemoryStore()
+    _ready(store, _quiet_bars(start, 5))
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    blocked = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert blocked["phase"] == "veto"
+    assert blocked["veto"] == "long"
+    assert blocked["order"] is None
+    assert blocked["target"] == 0
+    assert broker.orders == []
+    assert store.load(state_key("short", ACCOUNT))["book"]["target"] == 0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    still = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert still["phase"] == "veto"
+    assert broker.orders == []
+
+    same = FakeBroker()
+    same_store = MemoryStore()
+    _ready(same_store, _quiet_bars(start, 5))
+    same_store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    same._candles.append(_candle(start + timedelta(minutes=5), 9.8, high=9.9, low=9.7))
+    opened = run_minute(request, same, same_store, now=start + timedelta(minutes=6))
+    assert opened["phase"] == "signal"
+    assert opened["target"] < 0
+    assert same.orders == []
+
+
+def test_one_day_or_a_flat_peer_does_not_block_the_breakout():
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    broker = FakeBroker()
+    store = MemoryStore()
+    _ready(store, _quiet_bars(start, 5))
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=1, pnl=1500))
+    request = _request()
+    broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
+    signal = run_minute(request, broker, store, now=start + timedelta(minutes=6))
+    assert signal["phase"] == "signal"
+    assert signal["target"] > 0
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.5, high=10.55, low=10.4))
+    filled = run_minute(request, broker, store, now=start + timedelta(minutes=7))
+    assert filled["phase"] == "order"
+    assert filled["order"]["signed"] == 10
+
+
+def test_a_stop_still_orders_while_a_senior_peer_is_in_profit():
+    broker = FakeBroker()
+    broker.lots = 12
+    store = MemoryStore()
+    start = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    book = _FillBook("CRZ6", 50_000.0)
+    book.held = 12
+    book.target = 12
+    book.avg = 10.0
+    book.stop_dist = 0.2
+    book.stop_px = 9.8
+    book.base = 12
+    book.entry_i = 1
+    _ready(store, _quiet_bars(start, 5), export_book(book))
+    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=3, pnl=4000))
+    broker._candles.append(_candle(start + timedelta(minutes=5), 9.4, high=9.6, low=9.0))
+    broker._candles.append(_candle(start + timedelta(minutes=6), 10.0, high=10.1, low=9.9))
+    result = run_minute(_request(), broker, store, now=start + timedelta(minutes=7))
+    assert result["phase"] == "order"
+    assert result["order"]["signed"] == -10
+    assert result["order"]["reason"] == "stop"
+
+
+def test_a_fill_publishes_the_peer_and_a_flat_book_clears_it():
+    store = MemoryStore()
+    book = _FillBook("CRZ6", 100_000.0)
+    book.held = -4
+    book.target = -4
+    book.avg = 10.0
+    book.entry_i = 0
+    bars = [
+        {"t": "2026-09-28T10:00:00+03:00", "c": 10.0},
+        {"t": "2026-09-29T10:00:00+03:00", "c": 9.8},
+        {"t": "2026-09-30T10:00:00+03:00", "c": 9.5},
+    ]
+    publish_peer(store, "long", 12420, book, bars)
+    saved = store.load(peer_key("long"))
+    assert saved["held"] == -4
+    assert saved["target"] == -4
+    assert saved["held_days"] == 2
+    assert saved["channel"] == 12420
+    assert saved["pnl"] == pytest.approx((9.5 - 10.0) * -4 * 1000)
+    book.held = 0
+    publish_peer(store, "long", 12420, book, bars)
+    cleared = store.load(peer_key("long"))
+    assert cleared["held"] == 0
+    assert cleared["pnl"] == 0
+    publish_peer(store, "missing", 10, book, bars)
+    assert store.load(peer_key("missing")) is None
+    publish_peer(store, "long", 12420, None, bars)
+
+
 def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
     import zipfile
 
@@ -1541,10 +1695,11 @@ def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
         assert "boto3" in text
         assert "backtrader" not in text and "pandas" not in text
         readme = stored.read("README.txt").decode("utf-8")
-        for word in ("reconcile", "probe", "fill_per_minute", "secret_id", "halted", "VK_TOKEN"):
+        for word in ("reconcile", "probe", "fill_per_minute", "secret_id", "halted", "VK_TOKEN", "veto", "peers/"):
             assert word in readme
         for name in PRESETS:
             assert name in readme
+        assert "momentum" in readme
         stored.extractall(extract)
     code = (
         "import function.index, sys; "
@@ -1553,6 +1708,194 @@ def test_yandex_zip_contains_only_the_cloud_function(tmp_path):
         "assert 'pandas' not in sys.modules"
     )
     subprocess.check_call([sys.executable, "-c", code], cwd=extract)
+
+
+def test_momentum_sign_matches_the_chosen_account_where_the_window_fits():
+    """Живой знак совпадает с выбранным счётом, пока окну хватает пяти дней до конца ряда."""
+    import numpy as np
+
+    from research.cr_momentum import Series
+    from research.cr_momentum_params import chosen_account_position
+    from cnyrub.live.momentum import HISTORY_DAYS, HOLD, LOOKBACK, sign_for_today
+
+    assert HISTORY_DAYS == LOOKBACK + 1
+
+    count = 90
+    up = (0.004, -0.001, 0.003, -0.002, 0.005)
+    down = (-0.004, 0.001, -0.003, 0.002, -0.005)
+    level = np.zeros(count)
+    level[0] = 10.0
+    for index in range(1, count):
+        factor = 1.0 + (up if index < 60 else down)[(index - 1) % 5]
+        if index == 33:
+            factor = 1.08
+        level[index] = level[index - 1] * factor
+    volume = np.full(count, 100.0)
+    volume[40] = 5_000.0
+    day_range = np.full(count, 0.002)
+    day_range[25] = 0.2
+    ret = np.zeros(count)
+    ret[1:] = np.diff(level)
+    series = Series(
+        days=np.arange(count),
+        contract=np.array(["CR"] * count),
+        ret=ret,
+        roll=np.zeros(count, dtype=bool),
+        level=level,
+    )
+    position = chosen_account_position(series, volume, day_range)
+    days = [
+        {
+            "d": f"2026-01-{index + 1:02d}",
+            "o": float(level[index]),
+            "h": float(level[index] * (1 + day_range[index] / 2)),
+            "l": float(level[index] * (1 - day_range[index] / 2)),
+            "c": float(level[index]),
+            "v": float(volume[index]),
+        }
+        for index in range(count)
+    ]
+    matched = 0
+    for today in range(count):
+        decision = LOOKBACK + ((today - (LOOKBACK + 1)) // HOLD) * HOLD if today >= LOOKBACK + 1 else None
+        if decision is not None and decision + HOLD >= count:
+            continue
+        assert sign_for_today(days[:today]) == int(position[today])
+        matched += 1
+    assert matched == 86
+    assert int(position[21]) == 1
+    assert int(position[27]) == 0
+    assert int(position[33]) == 1
+    assert int(position[34]) == 0
+    assert int(position[35]) == 1
+    assert int(position[42]) == 0
+    assert int(position[71]) == -1
+    tail = count - 1
+    assert int(position[tail]) == 0
+    assert sign_for_today(days[:tail]) == -1
+
+
+def _momentum_days(count: int, end: date) -> list[dict[str, float | str]]:
+    cursor = end
+    found: list[date] = []
+    while len(found) < count:
+        if cursor.weekday() < 5:
+            found.append(cursor)
+        cursor -= timedelta(days=1)
+    found.reverse()
+    days: list[dict[str, float | str]] = []
+    for index, day in enumerate(found):
+        close = 10.05 if index == 40 else 10.0
+        days.append({"d": day.isoformat(), "o": close, "h": close + 0.01, "l": close - 0.01, "c": close, "v": 100.0})
+    return days
+
+
+def test_momentum_orders_on_its_own_account_and_does_not_publish_a_peer():
+    broker = FakeBroker()
+    broker.margin_value = 100.0
+    store = MemoryStore()
+    account = "acc-momentum"
+    days = _momentum_days(45, date(2026, 9, 29))
+    store.save(
+        state_key("momentum", account),
+        {
+            "version": 1,
+            "strategy": "momentum",
+            "account_id": account,
+            "instrument": {
+                "secid": "CRZ6",
+                "uid": "uid-1",
+                "figi": "FUT",
+                "frsttrade": "2026-06-16",
+                "lsttrade": "2026-12-15",
+                "trade_from": "2026-06-16",
+            },
+            "days": days,
+            "today": None,
+            "bars": [],
+            "ready": True,
+            "last_bar": "2026-09-29T23:00:00+03:00",
+            "sized_day": None,
+            "history_before": "2026-09-29",
+            "history_walked": 45,
+            "halted": None,
+            "book": None,
+        },
+    )
+    moment = datetime(2026, 9, 30, 10, 0, tzinfo=MSK)
+    broker._candles = [_candle(moment, 10.0)]
+    request = _request(strategy="momentum", account_id=account, channel=None)
+    first = run_minute(request, broker, store, now=datetime(2026, 9, 30, 10, 5, tzinfo=MSK))
+    assert first["phase"] == "order"
+    assert first["target"] == 30
+    assert first["held"] == 10
+    assert first["order"]["signed"] == 10
+    assert broker.orders == [{"signed": 10, "order_id": first["order"]["id"], "account": account, "uid": "uid-1"}]
+    assert peer_key("momentum") not in store.data
+    assert not any(key.startswith("peers/") for key in store.data)
+    broker._candles.append(_candle(datetime(2026, 9, 30, 10, 5, tzinfo=MSK), 10.0))
+    second = run_minute(request, broker, store, now=datetime(2026, 9, 30, 10, 6, tzinfo=MSK))
+    assert second["phase"] == "order"
+    assert second["target"] == 30
+    assert second["held"] == 20
+    assert second["order"]["signed"] == 10
+    assert peer_key("momentum") not in store.data
+
+
+def test_momentum_is_outside_the_five_window_exchange():
+    request = parse_event({"strategy": "momentum", "account_id": "acc-momentum", "token": "t"})
+    assert request.strategy == "momentum"
+    assert request.params.leverage == 3.0
+    assert request.params.channel == 0
+    assert "momentum" not in PRESETS
+    store = MemoryStore()
+    book = _FillBook("CRZ6", None)
+    book.held = -3
+    book.target = -3
+    book.avg = 10.0
+    publish_peer(store, "momentum", 0, book, [{"t": "2026-09-30T10:00:00+03:00", "c": 10.0}])
+    assert store.load(peer_key("momentum")) is None
+    fresh = _FillBook("CRZ6", None)
+    fresh.target = 2
+    store.save(
+        peer_key("momentum"),
+        {
+            "strategy": "momentum",
+            "channel": 10**9,
+            "held": -8,
+            "target": -8,
+            "held_days": 9,
+            "pnl": 50_000.0,
+        },
+    )
+    assert veto_source(store, "short", 525, fresh) == ""
+    assert veto_source(store, "long", 12_420, fresh) == ""
+
+
+def test_momentum_history_does_not_order_or_write_a_peer():
+    broker = FakeBroker()
+    store = MemoryStore()
+    yesterday = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    today = datetime(2026, 9, 29, 10, 0, tzinfo=MSK)
+    broker._candles = [_candle(yesterday + timedelta(minutes=i), 10.0) for i in range(3)]
+    broker._candles += [_candle(today + timedelta(minutes=i), 10.0) for i in range(2)]
+    request = _request(strategy="momentum", account_id="acc-momentum", channel=None)
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=MSK)
+    first = run_minute(request, broker, store, now=now)
+    assert first["phase"] == "history"
+    assert first["order"] is None
+    assert broker.orders == []
+    opened = store.load(state_key("momentum", "acc-momentum"))
+    assert opened["days"] == []
+    assert opened["today"]["d"] == "2026-09-29"
+    second = run_minute(request, broker, store, now=now)
+    assert second["phase"] == "history"
+    assert second["order"] is None
+    assert broker.orders == []
+    assert not any(key.startswith("peers/") for key in store.data)
+    saved = store.load(state_key("momentum", "acc-momentum"))
+    assert [day["d"] for day in saved["days"]] == ["2026-09-28"]
+    assert saved["ready"] is False
 
 
 def test_live_package_does_not_import_backtrader_or_pandas():
