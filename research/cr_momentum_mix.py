@@ -45,6 +45,20 @@ def clamp_target(target: int, allowed: int | None) -> int:
     return target
 
 
+def block_new_entry(before_held: int, before_target: int, after_target: int, senior: int | None) -> int:
+    """Новая цель из плоского состояния не ставится против старшего. Уже открытую позицию не трогает.
+
+    senior None — правила нет. senior 0 — старший без позиции, младший открывается в любую сторону.
+    """
+    if senior is None or senior == 0 or after_target == 0:
+        return after_target
+    if before_held != 0 or before_target != 0:
+        return after_target
+    if (after_target > 0) == (senior > 0):
+        return after_target
+    return 0
+
+
 def _window(name: str) -> backtest.Window:
     return backtest.WINDOWS[NAMES.index(name)]
 
@@ -71,6 +85,9 @@ def _replay_contract(
     trade_from: date | None,
     day_sign: dict[date, int] | None,
     view: pd.DataFrame | None = None,
+    entry_senior: np.ndarray | None = None,
+    held_out: np.ndarray | None = None,
+    blocked_box: list[int] | None = None,
 ) -> tuple[float, list[dict[str, float | date | int]]]:
     """Один контракт. Дни до trade_from только прогревают окно и в таблицу не попадают."""
     if view is None:
@@ -102,6 +119,8 @@ def _replay_contract(
     held_minutes = 0
     last_equity = cash
     last_held = 0
+    blocked = 0
+    blocking = False
 
     def close_day() -> None:
         if current is None:
@@ -128,6 +147,8 @@ def _replay_contract(
             exposure = 0
             minutes = 0
             held_minutes = 0
+        before_held = int(book.held)
+        before_target = int(book.target)
         allowed = None if day_sign is None else day_sign.get(day, None)
         book.target = clamp_target(int(book.target), allowed)
         step_minute(
@@ -175,6 +196,17 @@ def _replay_contract(
             min_stop=None,
             skip_flat=False,
         )
+        senior = None if entry_senior is None else int(entry_senior[i])
+        adjusted = block_new_entry(before_held, before_target, int(book.target), senior)
+        if adjusted != int(book.target):
+            if not blocking:
+                blocked += 1
+                blocking = True
+            book.target = adjusted
+        else:
+            blocking = False
+        if held_out is not None:
+            held_out[i] = int(book.held)
         if not trading:
             continue
         last_equity = marked_equity(book, float(close[i]))
@@ -184,6 +216,8 @@ def _replay_contract(
         if last_held:
             held_minutes += 1
     close_day()
+    if blocked_box is not None:
+        blocked_box.append(blocked)
     settled = marked_equity(book, float(close[-1])) if len(view) else cash
     return settled, rows
 
