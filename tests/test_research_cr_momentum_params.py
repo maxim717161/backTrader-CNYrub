@@ -151,6 +151,7 @@ def test_report_contains_both_cost_models():
     assert cp.CHOSEN_FILTER in text
     assert "Фильтры по громкости" in text
     assert "Фильтры по прямоте" in text
+    assert "Другие фильтры" in text
     assert cp.CHOSEN_FILTER == "пауза и без кульминации"
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
@@ -243,6 +244,31 @@ def test_choppy_path_clears_only_the_following_hold():
     assert positions["пила ниже 0,25"][21:26].tolist() == positions["без фильтра"][21:26].tolist()
     assert positions["коридор 0,15–0,5"][21:26].tolist() == positions["без фильтра"][21:26].tolist()
     assert positions["прямее 0,25"][26:31].tolist() == positions["без фильтра"][26:31].tolist()
+
+
+def test_roll_day_is_flat_and_pullback_keeps_only_the_opposing_hold():
+    rolled = np.ones(4)
+    assert cp.flat_on_roll(rolled, np.array([False, False, True, False])).tolist() == [1.0, 1.0, 0.0, 1.0]
+    ret = np.array([0.0, 0.02, 0.02, 0.02, 0.02, -0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    series = make_series(ret, level=10.0)
+    volume = np.full(len(series), 10.0)
+    day_range = np.full(len(series), 0.001)
+    positions = dict(cp.extra_filter_positions(series, volume, day_range, lookback=5, step=5))
+    assert positions["откат"][6:11].tolist() == [1.0, 1.0, 1.0, 1.0, 1.0]
+    assert positions["продолжение"][6:11].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def test_wide_day_uses_the_prior_range_and_clears_the_next_hold():
+    series = make_series(np.full(41, 0.02), level=10.0)
+    volume = np.full(len(series), 10.0)
+    day_range = np.full(len(series), 0.01)
+    day_range[20] = 0.05
+    positions = dict(cp.extra_filter_positions(series, volume, day_range, lookback=5, step=5))
+    assert positions["без широкого дня"][21:26].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert positions["без широкого дня"][26:31].tolist() == positions["без фильтра"][26:31].tolist()
+    up, down = cp.same_sign_counts(series, 5)
+    assert up[5] == 5
+    assert down[5] == 0
 
 
 def test_volume_pause_waits_until_the_next_day_and_ignores_today():

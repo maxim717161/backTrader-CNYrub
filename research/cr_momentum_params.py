@@ -228,6 +228,10 @@ VOLUME_SPIKE = 2.0
 STRAIGHT_LOW = 0.15
 STRAIGHT_HIGH = 0.5
 STRAIGHT_FLOOR = 0.25
+# Доля дней окна с тем же знаком, что у сигнала. Для L = 20 это 12 дней. Не подбор по счёту.
+DAY_SHARE = 0.60
+# Широкий день — диапазон high–low больше стольких медиан предыдущих 20 дней. Та же отсечка, что у объёма.
+RANGE_SPIKE = 2.0
 
 
 def contracts_for_drawdown(max_dd: float, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> int:
@@ -829,6 +833,145 @@ def straight_book(
     rows = []
     curves: dict[str, pd.DataFrame] = {}
     for name, position in straight_filter_positions(series, volume):
+        frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
+        curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
+        summary = leverage_summary(curve, cash)
+        summary.update(_path_rates(summary, cash, years))
+        summary["name"] = name
+        summary["in_market"] = float((position != 0).mean() * 100.0)
+        rows.append(summary)
+        curves[name] = curve
+    return pd.DataFrame(rows), curves
+
+
+def contract_daily_range(series: cm.Series, bars_dir=None) -> np.ndarray:
+    """(high − low) / close активного контракта за день. На роллировке — диапазон нового контракта."""
+    out = np.zeros(len(series))
+    bars_dir = core.BARS_DIR if bars_dir is None else bars_dir
+    meta = bars_dir.parent / "contracts.json"
+    if not meta.exists():
+        return out
+    document = json.loads(meta.read_text(encoding="utf-8"))
+    index = {
+        (pd.Timestamp(day).normalize(), str(series.contract[i])): i
+        for i, day in enumerate(series.days)
+    }
+    for row in document["contracts"]:
+        start, end = row.get("window_start"), row.get("window_end")
+        path = bars_dir / f"{row['secid']}.parquet"
+        if not start or not end or not path.exists():
+            continue
+        frame = pd.read_parquet(path, columns=["datetime", "high", "low", "close"])
+        frame["datetime"] = pd.to_datetime(frame["datetime"])
+        frame = frame[frame["datetime"].dt.dayofweek < 5]
+        last = frame.groupby(frame["datetime"].dt.normalize()).agg(high=("high", "max"), low=("low", "min"), close=("close", "last"))
+        span = (last["high"] - last["low"]) / last["close"].where(last["close"].abs() > 1e-9)
+        window = span[(span.index >= pd.Timestamp(start)) & (span.index <= pd.Timestamp(end))]
+        for day, value in window.items():
+            slot = index.get((pd.Timestamp(day).normalize(), row["secid"]))
+            if slot is not None and value == value:
+                out[slot] = float(value)
+    return out
+
+
+def flat_on_roll(position: np.ndarray, roll: np.ndarray) -> np.ndarray:
+    """В день смены контракта позиция ноль. Календарь ролла известен до этого дня."""
+    out = np.array(position, dtype=float, copy=True)
+    out[np.asarray(roll, dtype=bool)] = 0.0
+    return out
+
+
+def same_sign_counts(series: cm.Series, lookback: int) -> tuple[np.ndarray, np.ndarray]:
+    """Сколько дней окна закрылись вверх и вниз. Окно то же, что у чистого хода за lookback дней."""
+    sign = np.sign(series.ret)
+    up = np.cumsum(sign > 0)
+    down = np.cumsum(sign < 0)
+    up_count = np.full(len(series), np.nan)
+    down_count = np.full(len(series), np.nan)
+    if lookback <= 0 or lookback >= len(series):
+        return up_count, down_count
+    up_count[lookback:] = up[lookback:] - up[:-lookback]
+    down_count[lookback:] = down[lookback:] - down[:-lookback]
+    return up_count, down_count
+
+
+def _chosen_position(
+    series: cm.Series,
+    volume: np.ndarray,
+    lookback: int,
+    step: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Базовый сигнал, сигнал без кульминации, голая позиция, выбранная позиция и дневная доходность."""
+    base = signal_of(series, lookback, 0)
+    percent = daily_percent(series)
+    _, climax, _ = _volume_decision_masks(volume, lookback)
+    no_climax = np.where(climax, 0.0, base)
+    bare = expand_decisions(base, lookback, step)
+    chosen = pause_after_shock(expand_decisions(no_climax, lookback, step), percent, trailing_vol(percent))
+    return base, no_climax, bare, chosen, percent
+
+
+def extra_filter_positions(
+    series: cm.Series,
+    volume: np.ndarray,
+    day_range: np.ndarray,
+    lookback: int = 20,
+    step: int = 5,
+) -> list[tuple[str, np.ndarray]]:
+    """Откат, продолжение, пропуск ролла, 60% дней окна и широкий день. По одному, поверх выбранного фильтра и без него."""
+    base, no_climax, bare, chosen, percent = _chosen_position(series, volume, lookback, step)
+    price_vol = trailing_vol(percent)
+    day = np.sign(series.ret)
+    pullback = (base != 0) & (day != 0) & (day != base)
+    continuation = (base != 0) & (day != 0) & (day == base)
+    up_count, down_count = same_sign_counts(series, lookback)
+    need = int(np.ceil(DAY_SHARE * lookback))
+    majority = ((base > 0) & (up_count >= need)) | ((base < 0) & (down_count >= need))
+    majority_known = up_count == up_count
+    prior_range = prior_volume_median(day_range)
+    wide = (prior_range > 0) & (day_range > RANGE_SPIKE * prior_range)
+
+    def hold(decided: np.ndarray, on_chosen: bool) -> np.ndarray:
+        held = expand_decisions(decided, lookback, step)
+        if on_chosen:
+            return pause_after_shock(held, percent, price_vol)
+        return held
+
+    on_chosen = {
+        "откат": np.where(pullback, no_climax, 0.0),
+        "продолжение": np.where(continuation, no_climax, 0.0),
+        "60% дней": np.where(majority_known & (no_climax != 0) & ~majority, 0.0, no_climax),
+        "без широкого дня": np.where(wide, 0.0, no_climax),
+    }
+    alone = {
+        "откат": np.where(pullback, base, 0.0),
+        "продолжение": np.where(continuation, base, 0.0),
+        "60% дней": np.where(majority_known & (base != 0) & ~majority, 0.0, base),
+        "без широкого дня": np.where(wide, 0.0, base),
+    }
+    positions = [(CHOSEN_FILTER, chosen)]
+    for name, decided in on_chosen.items():
+        positions.append((f"выбранный и {name}", hold(decided, True)))
+    positions.append(("выбранный и без ролла", flat_on_roll(chosen, series.roll)))
+    positions.append(("без фильтра", bare))
+    for name, decided in alone.items():
+        positions.append((name, hold(decided, False)))
+    positions.append(("без ролла", flat_on_roll(bare, series.roll)))
+    return positions
+
+
+def extra_book(
+    series: cm.Series,
+    volume: np.ndarray,
+    day_range: np.ndarray,
+    leverage: float = CHOSEN_LEVERAGE,
+    cash: float = ACCOUNT_CASH,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Счёт с плечом для ещё не смотренных фильтров. Порядок строк — порядок объявления."""
+    years = max((pd.Timestamp(series.days[-1]) - pd.Timestamp(series.days[0])).days / 365.25, 1 / 365.25)
+    rows = []
+    curves: dict[str, pd.DataFrame] = {}
+    for name, position in extra_filter_positions(series, volume, day_range):
         frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
         curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
         summary = leverage_summary(curve, cash)
@@ -1855,6 +1998,94 @@ def _straight_section(series: cm.Series, study: Study) -> list[str]:
     return ["\n" + body]
 
 
+def _extra_section(series: cm.Series, study: Study) -> list[str]:
+    """Фильтры, которых ещё не было: откат, продолжение, ролл, доля дней и широкий день."""
+    del study
+    need = int(np.ceil(DAY_SHARE * PRIMARY[0]))
+    lines = [
+        "## 15. Другие фильтры\n",
+        (
+            "Порог хода, знак 5/60/120 дней, волатильность, пауза после 2σ, громкость и прямота уже смотрелись. "
+            "Здесь пять правил, которых в тех таблицах не было. "
+            "Откат — в день решения дневной ход против знака L, следующие H дней берётся этот знак. "
+            "Продолжение — дневной ход в тот же знак. "
+            "Без ролла — в день смены контракта позиция ноль: дата ролла известна заранее, контанго в доходность и так не входит, но круг на ролле списывается. "
+            f"60% дней — не меньше {need} дней из {PRIMARY[0]} закрылись в знак сигнала. "
+            f"Без широкого дня — (high − low) / close дня решения больше {RANGE_SPIKE:.0f} медиан предыдущих {VOLUME_WINDOW} дней, и следующие H дней позиция не открывается. "
+            "Пороги заданы заранее: 60% и та же двойка, что у всплеска объёма. Правила друг с другом не складываются."
+        ),
+    ]
+    volume = contract_daily_volume(series)
+    day_range = contract_daily_range(series)
+    if not np.any(volume > 0):
+        lines.append("Для сравнения с выбранным фильтром нужен дневной объём, на этом ряду его нет.")
+        body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+        return ["\n" + body]
+    table, curves = extra_book(series, volume, day_range)
+    base = _filter_named(table, CHOSEN_FILTER)
+    overlays = (
+        "выбранный и откат",
+        "выбранный и продолжение",
+        "выбранный и 60% дней",
+        "выбранный и без широкого дня",
+        "выбранный и без ролла",
+    )
+    alone = ("откат", "продолжение", "60% дней", "без широкого дня", "без ролла")
+    lines.append(
+        f"Счёт тот же: {_lots(ACCOUNT_CASH)} ₽, плечо {CHOSEN_LEVERAGE}, фильтр «{CHOSEN_FILTER}». "
+        "Знак Si и Eu в отдельный фильтр не добавлялся: в первом отчёте он совпадает со знаком CR на 97% и 90%."
+    )
+    if base is not None:
+        helped = [name for name in overlays if (row := _filter_named(table, name)) is not None and _volume_helps(row, base)]
+        if helped:
+            lines.append(
+                "На выбранном фильтре счёт улучшают: "
+                + ", ".join(f"«{name}»" for name in helped)
+                + ". Улучшение — финиш выше без более глубокой просадки, либо просадка меньше хотя бы на 2 пункта при финише не ниже 98% выбранного счёта."
+            )
+        else:
+            lines.append(
+                "На выбранном фильтре ни одно из пяти правил счёт не улучшает: "
+                "финиш не растёт без более глубокой просадки, и просадка не становится меньше хотя бы на 2 пункта при близком финише."
+            )
+        positions = dict(extra_filter_positions(series, volume, day_range))
+        percent = daily_percent(series)
+        signed = positions[CHOSEN_FILTER] * percent
+        bits = []
+        for name in overlays:
+            off = (positions[CHOSEN_FILTER] != 0) & (positions[name] == 0)
+            kept = (positions[CHOSEN_FILTER] != 0) & (positions[name] != 0)
+            bits.append(
+                f"«{name}» снимает дни со средним {_comma(_signed_mean(signed, off) * 100, 2, signed=True)}% "
+                f"против {_comma(_signed_mean(signed, kept) * 100, 2, signed=True)}% у оставшихся"
+            )
+        lines.append("На выбранной позиции " + "; ".join(bits) + ".")
+        bare = _filter_named(table, "без фильтра")
+        if bare is not None:
+            alone_helped = [name for name in alone if (row := _filter_named(table, name)) is not None and _volume_helps(row, bare)]
+            if alone_helped:
+                lines.append(
+                    "Без выбранного фильтра относительно позиции без фильтра счёт улучшают: "
+                    + ", ".join(f"«{name}»" for name in alone_helped)
+                    + "."
+                )
+            else:
+                lines.append("Без выбранного фильтра те же пять правил относительно позиции без фильтра счёт не улучшают.")
+    lines.extend(
+        [
+            "",
+            report.md(_filter_view(table), index=False),
+            "",
+            "Net выбранного фильтра и новых правил поверх него по календарным годам.\n",
+            report.md(_filter_years(curves, (CHOSEN_FILTER, *overlays)), index=False),
+            "",
+            "В живую функцию эти фильтры не переносятся.",
+        ]
+    )
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
 def _walk_view(table: pd.DataFrame) -> pd.DataFrame:
     out = []
     for _, row in table.iterrows():
@@ -2113,6 +2344,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         *_chosen_section(series, study),
         *_volume_section(series, study),
         *_straight_section(series, study),
+        *_extra_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -2195,6 +2427,7 @@ def export_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "filters": _filter_payload(series, study),
         "volume": _volume_payload(series, study),
         "straight": _straight_payload(series, study),
+        "extra": _extra_payload(series, study),
     }
 
 
@@ -2297,6 +2530,33 @@ def _straight_payload(series: cm.Series, study: Study) -> dict[str, object]:
     }
 
 
+def _extra_payload(series: cm.Series, study: Study) -> dict[str, object]:
+    volume = contract_daily_volume(series)
+    day_range = contract_daily_range(series)
+    if not np.any(volume > 0):
+        return {"available": False}
+    table, curves = extra_book(series, volume, day_range)
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
+    shown = (
+        CHOSEN_FILTER,
+        "выбранный и откат",
+        "выбранный и продолжение",
+        "выбранный и 60% дней",
+        "выбранный и без широкого дня",
+        "выбранный и без ролла",
+    )
+    return {
+        "available": True,
+        "leverage": CHOSEN_LEVERAGE,
+        "day_share": DAY_SHARE,
+        "range_spike": RANGE_SPIKE,
+        "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
+        "months": months,
+        "equity": {name: _month_end(curves[name], months) for name in shown if name in curves},
+    }
+
+
 def main() -> None:
     core.configure(1000.0, 0.001)
     series = cm.continuous()
@@ -2318,6 +2578,8 @@ def main() -> None:
         volume_table.to_csv(report.OUT / "out" / "cr_momentum_volume.csv", index=False)
         straight_table, _ = straight_book(series, volume)
         straight_table.to_csv(report.OUT / "out" / "cr_momentum_straight.csv", index=False)
+        extra_table, _ = extra_book(series, volume, contract_daily_range(series))
+        extra_table.to_csv(report.OUT / "out" / "cr_momentum_extra.csv", index=False)
 
 
 if __name__ == "__main__":
