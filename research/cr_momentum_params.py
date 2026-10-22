@@ -214,6 +214,10 @@ MARGIN_RATE = EXCHANGE_MARGIN_RUB / (EXCHANGE_SETTLE * 1000.0)
 ACCOUNT_GRID = (1, 2, 4, 5, 8, 10, 20, 40)
 # Плечо — номинал / счёт. Формула контрактов та же, что в минутном движке: floor(плечо × счёт / номинал).
 LEVERAGES = (1, 2, 3, 4, 5, 6, 7, 8)
+# Плечо, которое оставляем. Фильтры ниже с фиксированными порогами, без подбора по этому счёту.
+CHOSEN_LEVERAGE = 3
+FILTER_SHOCK = 2.0
+FILTER_VOL_MULTIPLE = 1.5
 
 
 def contracts_for_drawdown(max_dd: float, cash: float = ACCOUNT_CASH, risk: float = ACCOUNT_RISK) -> int:
@@ -543,6 +547,98 @@ def leverage_table(
     curves = {int(lev): leverage_curve(frame, level, ret, roll, lev, cash, margin_rate) for lev in leverages}
     table = pd.DataFrame([leverage_summary(curve, cash) for curve in curves.values()])
     return table, curves
+
+
+def daily_percent(series: cm.Series) -> np.ndarray:
+    """Доходность дня к закрытию предыдущего дня. В первый день ряда — ноль."""
+    previous = series.level - series.ret
+    return np.divide(series.ret, previous, out=np.zeros(len(series)), where=np.abs(previous) > 1e-9)
+
+
+def trailing_vol(percent: np.ndarray, window: int = 20) -> np.ndarray:
+    return pd.Series(percent).rolling(window).std(ddof=1).to_numpy()
+
+
+def expand_decisions(decided: np.ndarray, lookback: int = 20, step: int = 5) -> np.ndarray:
+    """Решение на закрытии дня d держится следующие step дней. Короткое окно в конце ряда не открывается."""
+    position = np.zeros(len(decided))
+    decision = lookback
+    while decision + step < len(decided):
+        position[decision + 1 : decision + 1 + step] = decided[decision]
+        decision += step
+    return position
+
+
+def pause_after_shock(position: np.ndarray, percent: np.ndarray, vol: np.ndarray, multiple: float = FILTER_SHOCK) -> np.ndarray:
+    """Следующий день без позиции, если сегодняшний ход больше multiple своих σ. Сегодняшний день фильтр не трогает."""
+    raw = (vol > 0) & (np.abs(percent) > multiple * vol)
+    pause = np.zeros(len(position), dtype=bool)
+    pause[1:] = raw[:-1]
+    out = np.array(position, dtype=float, copy=True)
+    out[pause] = 0.0
+    return out
+
+
+def filter_positions(series: cm.Series, lookback: int = 20, step: int = 5) -> list[tuple[str, np.ndarray]]:
+    """Позиции с заранее фиксированными фильтрами. Порог и окна взяты из уже посчитанной сетки, не из счёта с плечом."""
+    base = signal_of(series, lookback, 0)
+    slow60 = signal_of(series, 60, 0)
+    slow120 = signal_of(series, 120, 0)
+    fast5 = signal_of(series, 5, 0)
+    percent = daily_percent(series)
+    vol = trailing_vol(percent)
+    past_median = pd.Series(vol).expanding(min_periods=60).median().shift(1).to_numpy()
+    high_vol = (vol > FILTER_VOL_MULTIPLE * past_median) & (past_median == past_median)
+    move = move_bps(series, lookback)
+    noise = vol * np.sqrt(lookback) * 1e4
+    strong = (noise > 0) & (move == move) & (np.abs(move) >= noise)
+    decided = {
+        "без фильтра": base,
+        "порог 50 б.п.": signal_of(series, lookback, 50),
+        "порог 100 б.п.": signal_of(series, lookback, 100),
+        "порог 200 б.п.": signal_of(series, lookback, 200),
+        "знак как у 60 дней": np.where((slow60 != 0) & (base == slow60), base, 0.0),
+        "знак как у 120 дней": np.where((slow120 != 0) & (base == slow120), base, 0.0),
+        "без спора с 5 днями": np.where((fast5 != 0) & (base != 0) & (fast5 != base), 0.0, base),
+        "без высокой волатильности": np.where(high_vol, 0.0, base),
+        "ход сильнее своей σ": np.where(strong, base, 0.0),
+        "только лонг": np.where(base > 0, base, 0.0),
+        "только шорт": np.where(base < 0, base, 0.0),
+    }
+    positions = [(name, expand_decisions(values, lookback, step)) for name, values in decided.items()]
+    bare = expand_decisions(base, lookback, step)
+    positions.append(("пауза после 2σ", pause_after_shock(bare, percent, vol)))
+    return positions
+
+
+def _path_rates(summary: dict[str, float], cash: float, years: float) -> dict[str, float]:
+    end = summary["end"]
+    growth = end / cash if cash else float("nan")
+    cagr = growth ** (1 / years) - 1 if growth > 0 and years > 0 else float("nan")
+    dd = summary["max_dd_pct_peak"]
+    calmar = cagr / (dd / 100.0) if dd and dd == dd and dd > 0 else float("nan")
+    return {"cagr": cagr * 100.0, "calmar": calmar}
+
+
+def filter_book(
+    series: cm.Series,
+    leverage: float = CHOSEN_LEVERAGE,
+    cash: float = ACCOUNT_CASH,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Счёт с фиксированным плечом для каждого фильтра. Порядок строк — порядок объявления, не порядок удачности."""
+    years = max((pd.Timestamp(series.days[-1]) - pd.Timestamp(series.days[0])).days / 365.25, 1 / 365.25)
+    rows = []
+    curves: dict[str, pd.DataFrame] = {}
+    for name, position in filter_positions(series):
+        frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
+        curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage, cash)
+        summary = leverage_summary(curve, cash)
+        summary.update(_path_rates(summary, cash, years))
+        summary["name"] = name
+        summary["in_market"] = float((position != 0).mean() * 100.0)
+        rows.append(summary)
+        curves[name] = curve
+    return pd.DataFrame(rows), curves
 
 
 def financials(frame: pd.DataFrame, trips: pd.DataFrame, base: float) -> dict[str, float]:
@@ -1137,6 +1233,149 @@ def _leverage_section(series: cm.Series, study: Study) -> list[str]:
     return ["\n" + body]
 
 
+def _year_changes(curve: pd.DataFrame, cash: float = ACCOUNT_CASH) -> dict[int, float]:
+    previous = cash
+    out: dict[int, float] = {}
+    for year, part in curve.groupby(curve["day"].dt.year, sort=True):
+        end = float(part["equity"].iloc[-1])
+        out[int(year)] = end - previous
+        previous = end
+    return out
+
+
+def _filter_view(table: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for _, row in table.iterrows():
+        out.append(
+            {
+                "фильтр": row["name"],
+                "финиш, ₽": _rub(row["end"]),
+                "год, %": _comma(row["cagr"], 1),
+                "просадка, % пика": _comma(row["max_dd_pct_peak"], 1),
+                "Калмар": _comma(row["calmar"], 2),
+                "Шарп": _comma(row["sharpe"], 2, signed=True),
+                "в рынке, %": _comma(row["in_market"], 0),
+                "минимум, ₽": _rub(row["min_equity"]),
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def _filter_years(curves: dict[str, pd.DataFrame], names: tuple[str, ...]) -> pd.DataFrame:
+    changes = {name: _year_changes(curves[name]) for name in names if name in curves}
+    years = sorted({year for column in changes.values() for year in column})
+    rows = []
+    for year in years:
+        item: dict[str, object] = {"год": year}
+        for name in names:
+            if name in changes:
+                item[name] = _rub(changes[name].get(year, float("nan")), signed=True)
+        rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def _filter_named(table: pd.DataFrame, name: str) -> pd.Series | None:
+    match = table[table["name"] == name]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def _signed_mean(signed: np.ndarray, mask: np.ndarray) -> float:
+    if not np.any(mask):
+        return float("nan")
+    return float(signed[mask].mean())
+
+
+def _finish_at_shock(series: cm.Series, multiple: float, leverage: float = CHOSEN_LEVERAGE) -> float:
+    bare = dict(filter_positions(series))["без фильтра"]
+    percent = daily_percent(series)
+    position = pause_after_shock(bare, percent, trailing_vol(percent), multiple)
+    frame = pd.DataFrame({"day": pd.to_datetime(series.days), "position": position})
+    curve = leverage_curve(frame, series.level, series.ret, series.roll, leverage)
+    return float(curve["equity"].iloc[-1]) if len(curve) else float("nan")
+
+
+def _filter_section(series: cm.Series, study: Study) -> list[str]:
+    table, curves = filter_book(series)
+    base = _filter_named(table, "без фильтра")
+    mild = _filter_named(table, "порог 50 б.п.")
+    tight = _filter_named(table, "порог 100 б.п.")
+    wide = _filter_named(table, "порог 200 б.п.")
+    pause = _filter_named(table, "пауза после 2σ")
+    focus = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "пауза после 2σ")
+    lines = [
+        f"## 11. Фильтры при плече {CHOSEN_LEVERAGE}\n",
+        (
+            f"Счёт тот же, {f'{int(ACCOUNT_CASH):,}'.replace(',', ' ')} ₽, плечо {CHOSEN_LEVERAGE} фиксировано. "
+            f"Сигнал по-прежнему L = {PRIMARY[0]}, H = {PRIMARY[1]}. "
+            "Фильтр либо гасит решение на закрытии дня решения и держит это H дней, "
+            "либо, в случае паузы, снимает позицию только на следующий день после большого хода. "
+            "Пороги 50, 100 и 200 б.п. уже были в сетке одного контракта. Остальные пороги тоже заданы заранее: "
+            "согласие со знаком 60 и 120 дней, спор со знаком 5 дней, волатильность выше 1,5 своей расширяющейся медианы, "
+            "ход за 20 дней больше своей σ, пауза после хода больше 2σ, только лонг и только шорт."
+        ),
+    ]
+    if base is not None and mild is not None and tight is not None and wide is not None and pause is not None:
+        base_2024 = _year_changes(curves["без фильтра"]).get(2024, float("nan"))
+        tight_2024 = _year_changes(curves["порог 100 б.п."]).get(2024, float("nan"))
+        shock3 = _finish_at_shock(series, 3.0)
+        lines.append(
+            f"Без фильтра финиш {_rub(base['end'])} ₽, просадка {_comma(base['max_dd_pct_peak'], 1)}% пика, "
+            f"Шарп {_comma(base['sharpe'], 2, signed=True)}, Калмар {_comma(base['calmar'], 2)}."
+        )
+        positions = dict(filter_positions(series))
+        percent = daily_percent(series)
+        signed = positions["без фильтра"] * percent
+        weak = (positions["без фильтра"] != 0) & (positions["порог 100 б.п."] == 0)
+        other = (positions["без фильтра"] != 0) & ~weak
+        vol = trailing_vol(percent)
+        raw = (vol > 0) & (np.abs(percent) > FILTER_SHOCK * vol)
+        after = np.zeros(len(series), dtype=bool)
+        after[1:] = raw[:-1]
+        paused = (positions["без фильтра"] != 0) & after
+        kept = (positions["без фильтра"] != 0) & ~after
+        lines.append(
+            f"Порог 50 б.п. оставляет финиш {_rub(mild['end'])} ₽ и снижает просадку до {_comma(mild['max_dd_pct_peak'], 1)}% пика, "
+            f"Калмар {_comma(mild['calmar'], 2)}, Шарп {_comma(mild['sharpe'], 2, signed=True)}. "
+            f"Порог 100 б.п. режет просадку до {_comma(tight['max_dd_pct_peak'], 1)}% и поднимает Калмар до {_comma(tight['calmar'], 2)}, "
+            f"финиш при этом {_rub(tight['end'])} ₽. В 2024 году этот порог даёт {_rub(tight_2024, signed=True)} ₽ "
+            f"против {_rub(base_2024, signed=True)} ₽ без фильтра. "
+            f"Дни, которые порог 100 б.п. выключает, в среднем дают {_comma(_signed_mean(signed, weak) * 100, 2, signed=True)}% со знаком позиции, "
+            f"остальные дни в позиции — {_comma(_signed_mean(signed, other) * 100, 2, signed=True)}%. "
+            f"Порог 200 б.п. уже снижает и финиш ({_rub(wide['end'])} ₽), и Шарп ({_comma(wide['sharpe'], 2, signed=True)})."
+        )
+        lines.append(
+            f"Пауза на следующий день после хода больше 2σ поднимает финиш до {_rub(pause['end'])} ₽ "
+            f"и Шарп до {_comma(pause['sharpe'], 2, signed=True)}. Просадка {_comma(pause['max_dd_pct_peak'], 1)}% пика. "
+            f"В день после такого хода знак позиции в среднем даёт {_comma(_signed_mean(signed, paused) * 100, 2, signed=True)}%, "
+            f"в остальные дни в позиции — {_comma(_signed_mean(signed, kept) * 100, 2, signed=True)}%. "
+            f"Та же пауза с порогом 3σ заканчивается на {_rub(shock3)} ₽, то есть ниже базы: годится не любая отсечка."
+        )
+        others = table[~table["name"].isin(("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "порог 200 б.п.", "пауза после 2σ"))]
+        weaker = others[others["end"] < base["end"]]
+        if len(weaker):
+            lines.append(
+                "Согласие с длинным знаком, запрет спора с 5 днями, отключение высокой волатильности, "
+                "фильтр «ход сильнее своей σ», только лонг и только шорт финиш не поднимают. "
+                "Лонг и шорт по отдельности оба слабее базы: на этом плече работают обе стороны. "
+                "Фильтры в новое правило не складывались."
+            )
+    lines.extend(
+        [
+            "",
+            report.md(_filter_view(table), index=False),
+            "",
+            "Net отобранных для сравнения вариантов по календарным годам.\n",
+            report.md(_filter_years(curves, focus), index=False),
+            "",
+            "В живую функцию фильтр не переносится: и порог, и пауза смотрелись на той же истории CR.",
+        ]
+    )
+    body = "\n\n".join(part.strip("\n") for part in lines if part.strip())
+    return ["\n" + body]
+
+
 def _walk_view(table: pd.DataFrame) -> pd.DataFrame:
     out = []
     for _, row in table.iterrows():
@@ -1391,6 +1630,7 @@ def build_report(series: cm.Series, study: Study | None = None, reps: int = 1000
         _primary_blurb(rows, study),
         *_account_section(series, study),
         *_leverage_section(series, study),
+        *_filter_section(series, study),
     ]
     return "\n".join(parts) + "\n"
 
@@ -1470,6 +1710,7 @@ def export_payload(series: cm.Series, study: Study) -> dict[str, object]:
         "coverage": [{key: _json_value(value) for key, value in row.items()} for _, row in study.coverage.iterrows()],
         "account": _account_payload(series, study),
         "leverage": _leverage_payload(series, study),
+        "filters": _filter_payload(series, study),
     }
 
 
@@ -1505,6 +1746,19 @@ def _leverage_payload(series: cm.Series, study: Study) -> dict[str, object]:
     }
 
 
+def _filter_payload(series: cm.Series, study: Study) -> dict[str, object]:
+    table, curves = filter_book(series)
+    frame = study.frames[("hold", PRIMARY[0], PRIMARY[1])]
+    months = [str(period) for period in frame.groupby(frame["day"].dt.to_period("M"), sort=True).groups]
+    shown = ("без фильтра", "порог 50 б.п.", "порог 100 б.п.", "пауза после 2σ")
+    return {
+        "leverage": CHOSEN_LEVERAGE,
+        "rows": [{key: _json_value(value) for key, value in row.items()} for _, row in table.iterrows()],
+        "months": months,
+        "equity": {name: _month_end(curves[name], months) for name in shown if name in curves},
+    }
+
+
 def main() -> None:
     core.configure(1000.0, 0.001)
     series = cm.continuous()
@@ -1518,6 +1772,8 @@ def main() -> None:
     account.grid.to_csv(report.OUT / "out" / "cr_momentum_account.csv", index=False)
     leverage, _ = leverage_table(study.frames[("hold", PRIMARY[0], PRIMARY[1])], series.level, series.ret, series.roll)
     leverage.to_csv(report.OUT / "out" / "cr_momentum_leverage.csv", index=False)
+    filters, _ = filter_book(series)
+    filters.to_csv(report.OUT / "out" / "cr_momentum_filters.csv", index=False)
 
 
 if __name__ == "__main__":

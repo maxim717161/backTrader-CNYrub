@@ -146,6 +146,7 @@ def test_report_contains_both_cost_models():
     assert "Блок: деньги и риск" in text
     assert "Счёт 100 000" in text
     assert "Фиксированное плечо" in text
+    assert "Фильтры при плече" in text
     assert "p = " in text
     hold = cp._cell(study.rows, "hold", 20, 5)
     block = cp._cell(study.rows, "block", 20, 5)
@@ -219,3 +220,11 @@ def test_roll_replaces_the_whole_book_and_a_margin_call_reopens_the_next_day():
     assert crashed["equity"].iloc[0] == pytest.approx(100_000 - 24_000 - 2 * 80 * cp.side_cost())
     assert crashed["contracts"].iloc[1] > 0
     assert not bool(crashed["called"].iloc[1])
+
+
+def test_filters_keep_the_base_schedule_and_pause_only_the_next_day():
+    series = make_series(np.r_[0.0, np.resize([0.01, -0.02, 0.03, 0.01], 40)])
+    positions = dict(cp.filter_positions(series, lookback=5, step=5))
+    assert np.array_equal(positions["без фильтра"], cp.position_schedule(series, 5, 5))
+    paused = cp.pause_after_shock(np.ones(5), np.array([0.0, 0.0, 0.05, 0.0, 0.0]), np.full(5, 0.01), 2.0)
+    assert paused.tolist() == [1.0, 1.0, 1.0, 0.0, 1.0]
