@@ -105,6 +105,8 @@ def _run(
     rule,
     listeners: frozenset[str],
     watch: dict[date, OpenState],
+    on_day_open=None,
+    on_day_close=None,
 ) -> dict[str, object]:
     """Пять счетов. listeners дополнительно глушат свежий вход по позиции моментума."""
     names = NAMES
@@ -153,6 +155,8 @@ def _run(
             trading = front is None or days[i] >= front
             if trading and days[i] != current:
                 flush()
+                if on_day_open is not None:
+                    on_day_open(days[i])
                 current = days[i]
                 start_equity = dict(last_mark)
                 minutes = dict.fromkeys(names, 0)
@@ -238,6 +242,8 @@ def _run(
                     if book.held:
                         held_minutes[name] += 1
             if i + 1 == count or days[i + 1] != days[i]:
+                if on_day_close is not None:
+                    on_day_close(days[i], list(states))
                 for name in names:
                     book = books[name]
                     prev2_pnl[name] = prev_pnl[name]
@@ -544,7 +550,15 @@ def append_report(text: str) -> None:
     current = path.read_text(encoding="utf-8") if path.exists() else ""
     marker = "## 18."
     if marker in current:
-        current = current[: current.index(marker)].rstrip()
+        start = current.index(marker)
+        rest = current[start + len(marker) :]
+        nxt = rest.find("\n## ")
+        head = current[:start].rstrip()
+        if nxt == -1:
+            current = head
+        else:
+            path.write_text(head + "\n" + text.strip() + "\n" + rest[nxt + 1 :], encoding="utf-8")
+            return
     path.write_text(current.rstrip() + "\n" + text.strip() + "\n", encoding="utf-8")
 
 

@@ -2638,6 +2638,7 @@ def main() -> None:
         straight_table.to_csv(report.OUT / "out" / "cr_momentum_straight.csv", index=False)
         extra_table, _ = extra_book(series, volume, contract_daily_range(series))
         extra_table.to_csv(report.OUT / "out" / "cr_momentum_extra.csv", index=False)
+    from research.cr_momentum_cross import main as cross_main
     from research.cr_momentum_mix import main as mix_main
     from research.cr_momentum_senior import main as senior_main
     from research.cr_momentum_veto import main as veto_main
@@ -2648,6 +2649,7 @@ def main() -> None:
         path.write_text(path.read_text(encoding="utf-8").rstrip() + "\n" + mix_text, encoding="utf-8")
     senior_main()
     veto_main()
+    cross_main()
 
 
 if __name__ == "__main__":
