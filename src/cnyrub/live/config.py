@@ -52,6 +52,9 @@ COOLDOWN = 15
 # Окно 30 минут — прямота 0,15–0,5, плечо 4 и объём тише трёх медиан за 300 минут.
 # Окно 45 минут — стоп 8, плечо 4, без фильтра прямоты и без потолка громкости.
 # Окно 60 минут — те же правила, плечо 5.
+# Окно 1 760 минут — стоп 22 медианы, плечо 5, громкость не выше пяти медиан
+# за 300 минут, пауза 60 минуток после стопа. Выхода по каналу нет.
+# Окно 2 160 минут — то же, но плечо 4 и потолок громкости восемь медиан.
 PRESETS: dict[str, StrategyParams] = {
     "short": StrategyParams(
         channel=525,
@@ -140,6 +143,44 @@ PRESETS: dict[str, StrategyParams] = {
         cooldown=COOLDOWN,
         skip_flat=True,
     ),
+    "m1760": StrategyParams(
+        channel=1_760,
+        exit_channel=0,
+        stop_mult=22.0,
+        clock_cap=None,
+        size_mode="flat",
+        loss_bars=None,
+        risk_fraction=None,
+        stop_rub=None,
+        breakout_span=None,
+        scale_step=None,
+        scale_back=None,
+        scale_floor=0.5,
+        surge_cap=5.0,
+        leverage=5.0,
+        min_stop=MIN_STOP,
+        cooldown=60,
+        skip_flat=True,
+    ),
+    "m2160": StrategyParams(
+        channel=2_160,
+        exit_channel=0,
+        stop_mult=22.0,
+        clock_cap=None,
+        size_mode="flat",
+        loss_bars=None,
+        risk_fraction=None,
+        stop_rub=None,
+        breakout_span=None,
+        scale_step=None,
+        scale_back=None,
+        scale_floor=0.5,
+        surge_cap=8.0,
+        leverage=4.0,
+        min_stop=MIN_STOP,
+        cooldown=60,
+        skip_flat=True,
+    ),
 }
 
 _OPTIONAL_FLOATS = (
@@ -175,7 +216,7 @@ class RunRequest:
 
 def preset(strategy: str) -> StrategyParams:
     if strategy not in PRESETS:
-        raise ValueError("strategy должен быть short, long, thirty, fortyfive или sixty")
+        raise ValueError("strategy должен быть short, long, thirty, fortyfive, sixty, m1760 или m2160")
     return PRESETS[strategy]
 
 

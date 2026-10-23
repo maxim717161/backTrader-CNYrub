@@ -1,6 +1,6 @@
 """Стратегии видят чужую многодневную позицию и пропускают пробой против неё.
 
-Пять окон из backtest.py остаются раздельными счетами. Меняется только вход:
+Семь окон из backtest.py остаются раздельными счетами. Меняется только вход:
 если другая стратегия уже держит позицию несколько торговых дней и плюс по ней
 растёт, новый сигнал в обратную сторону считается ложным и не открывается.
 Выходы, стопы и размер своих сделок не трогаются. Живой счёт этот модуль не
@@ -37,7 +37,7 @@ from backtest import (
 from cnyrub.engine import MULTIPLIER, _FillBook, marked_equity, step_minute
 
 
-NAMES = ("short", "long", "thirty", "fortyfive", "sixty")
+NAMES = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160")
 
 
 @dataclass(frozen=True)
@@ -409,7 +409,6 @@ def run_consensus(
                     clock_vol=float(pack["clock_vol"][i]),
                     entry_ready=float(pack["entry_ready"][i]),
                     clearance=0.0,
-                    cooldown=0,
                     clock_volume=False,
                     clock_cap=window.clock_cap,
                     size_mode=window.size_mode,
@@ -431,6 +430,9 @@ def run_consensus(
                     eff_high=window.eff_high,
                     surge_cap=window.surge_cap,
                     leverage=window.leverage,
+                    cooldown=window.cooldown,
+                    min_stop=window.min_stop,
+                    skip_flat=window.skip_flat,
                 )
             states = []
             for name, window in zip(names, windows, strict=True):
@@ -567,7 +569,7 @@ def report(results: list[ConsensusResult]) -> str:
     base = next((item for item in results if item.rule.id == "base"), results[0])
     base_by_name = {stats.name: stats for stats in base.strategies}
     lines = [
-        "Пять счетов торгуют свои окна как раньше. Общий только запрет входа.",
+        "Семь счетов торгуют свои окна как раньше. Общий только запрет входа.",
         "Если чужая позиция живёт столько торговых дней и плюс по ней растёт,",
         "сигнал в обратную сторону на этой минуте не открывается.",
         "Свой стоп, канал и размер позиции не меняются. Счета не складываются в один.",
@@ -575,7 +577,7 @@ def report(results: list[ConsensusResult]) -> str:
         "«Только плюс» — открытый результат больше нуля, даже если сегодня он меньше вчерашнего.",
         "«Выше вчера» — плюс больше закрытия прошлого торгового дня.",
         "«Растёт» — вчера плюс был больше позавчерашнего, а сегодня позиция всё ещё в плюсе.",
-        "«Старшее» — запрет ставит только окно длиннее того, которое хочет войти. 30 минут не глушит 45, 60, 525 и 12420.",
+        "«Старшее» — запрет ставит только окно длиннее того, которое хочет войти. 30 минут не глушит 45, 60, 525, 1760, 2160 и 12420.",
         "",
         f"{'ПРАВИЛО':<42} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'ФАКТОР':>7} {'ПРОСАДКА':>14} {'К БАЗЕ':>14}",
     ]
@@ -588,8 +590,8 @@ def report(results: list[ConsensusResult]) -> str:
             f"{_money(item.combined_drawdown):>14} {_signed(dd_delta):>14}"
         )
     lines.extend(["", conclusion(results), ""])
-    lines.append("Просадка — худшее падение суммы пяти счетов от её пика. К базе: больше нуля — просадка меньше.")
-    lines.append("Части истории, сумма пяти счетов: " + "  ".join(f"{secids[0]}–{secids[-1]}" for secids in PARTS))
+    lines.append("Просадка — худшее падение суммы семи счетов от её пика. К базе: больше нуля — просадка меньше.")
+    lines.append("Части истории, сумма семи счетов: " + "  ".join(f"{secids[0]}–{secids[-1]}" for secids in PARTS))
     lines.append(f"{'ПРАВИЛО':<42} " + " ".join(f"{'Ч' + str(index):>12}" for index in range(1, 6)))
     for item in results:
         parts = _part_nets(item.trades)

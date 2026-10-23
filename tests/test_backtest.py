@@ -576,6 +576,16 @@ def test_entry_lots_step_down_as_the_breakout_grows():
     assert WINDOWS[4].stop_mult == 8 and WINDOWS[4].clock_cap == 5
     assert WINDOWS[4].eff_low is None and WINDOWS[4].surge_cap is None
     assert WINDOWS[4].leverage == 5 and WINDOWS[4].cash == 100_000
+    assert WINDOWS[4].cooldown == 0 and WINDOWS[4].skip_flat is False
+    assert WINDOWS[5].channel == 1760 and WINDOWS[5].exit_channel == 0
+    assert WINDOWS[5].stop_mult == 22 and WINDOWS[5].clock_cap is None
+    assert WINDOWS[5].surge_cap == 5 and WINDOWS[5].leverage == 5
+    assert WINDOWS[5].cooldown == 60 and WINDOWS[5].min_stop == pytest.approx(0.008)
+    assert WINDOWS[5].skip_flat is True and WINDOWS[5].cash == 100_000
+    assert WINDOWS[6].channel == 2160 and WINDOWS[6].exit_channel == 0
+    assert WINDOWS[6].stop_mult == 22 and WINDOWS[6].surge_cap == 8
+    assert WINDOWS[6].leverage == 4 and WINDOWS[6].cooldown == 60
+    assert WINDOWS[6].skip_flat is True and WINDOWS[6].cash == 100_000
 
 
 def test_refine_does_not_go_below_480_and_looks_past_the_upper_edge():

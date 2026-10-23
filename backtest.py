@@ -14,7 +14,7 @@
 позиция в нём не открывается. После экспирации следующий контракт торгуется
 сразу: окно к этому дню уже собрано.
 
-В работе пять окон, и правила у них разные. Короткое окно 525 минут
+В работе семь окон, и правила у них разные. Короткое окно 525 минут
 закрывается каналом той же длины. Минута сигнала не громче пяти медиан
 той же минуты суток за пять дней. Счёт 100 000 руб., залог 1 000 руб.
 Стоп — 285 руб. на контракт. Контрактов столько, чтобы этот стоп забирал
@@ -39,6 +39,12 @@
 Окно 60 минут повторяет окно 45: стоп 8 медиан, потолок пяти медиан той же
 минуты суток, без фильтра прямоты и без потолка громкости. Счёт 100 000 руб.,
 плечо 5.
+Окно 1 760 минут по каналу не выходит, стоп стоит в 22 медианах минутного
+диапазона и не короче 0,008. Минута сигнала не тише медианы окна и не громче
+пяти медиан объёма предыдущих 300 минут. После стопа 60 минут новых входов нет.
+Нулевой медианный диапазон вход не открывает. Счёт 100 000 руб., плечо 5.
+Окно 2 160 минут устроено так же, но потолок громкости — восемь медиан
+и плечо 4.
 """
 
 from __future__ import annotations
@@ -116,6 +122,23 @@ SIXTY_CLOCK_CAP = 5.0
 SIXTY_CASH = 100_000.0
 SIXTY_MARGIN = 1_000.0
 SIXTY_LEVERAGE = 5.0
+# 1760 и 2160: выход по каналу выключен, стоп 22 медианы, размер от плеча.
+# Пауза после стопа 60 минут. Потолок — медиана объёма предыдущих 300 минут.
+M1760_WINDOW = 1_760
+M1760_STOP = 22.0
+M1760_CASH = 100_000.0
+M1760_MARGIN = 1_000.0
+M1760_SURGE_CAP = 5.0
+M1760_LEVERAGE = 5.0
+M1760_COOLDOWN = 60
+M2160_WINDOW = 2_160
+M2160_STOP = 22.0
+M2160_CASH = 100_000.0
+M2160_MARGIN = 1_000.0
+M2160_SURGE_CAP = 8.0
+M2160_LEVERAGE = 4.0
+M2160_COOLDOWN = 60
+PLATEAU_MIN_STOP = 0.008
 LONG_CANDIDATES = (12_480, 12_960)
 
 
@@ -150,6 +173,9 @@ class Window(NamedTuple):
     eff_high: float | None = None
     surge_cap: float | None = None
     leverage: float | None = None
+    cooldown: int = 0
+    min_stop: float | None = None
+    skip_flat: bool = False
 
 
 WINDOWS = (
@@ -241,6 +267,52 @@ WINDOWS = (
         None,
         SIXTY_LEVERAGE,
     ),
+    Window(
+        M1760_WINDOW,
+        0,
+        M1760_STOP,
+        None,
+        "flat",
+        None,
+        None,
+        M1760_CASH,
+        M1760_MARGIN,
+        None,
+        None,
+        None,
+        None,
+        LONG_SCALE_FLOOR,
+        None,
+        None,
+        M1760_SURGE_CAP,
+        M1760_LEVERAGE,
+        M1760_COOLDOWN,
+        PLATEAU_MIN_STOP,
+        True,
+    ),
+    Window(
+        M2160_WINDOW,
+        0,
+        M2160_STOP,
+        None,
+        "flat",
+        None,
+        None,
+        M2160_CASH,
+        M2160_MARGIN,
+        None,
+        None,
+        None,
+        None,
+        LONG_SCALE_FLOOR,
+        None,
+        None,
+        M2160_SURGE_CAP,
+        M2160_LEVERAGE,
+        M2160_COOLDOWN,
+        PLATEAU_MIN_STOP,
+        True,
+    ),
 )
 CHANNEL = SHORT_WINDOW
 STOP_MULT = 2.5
@@ -313,6 +385,9 @@ class MinuteDonchian(bt.Strategy):
         eff_high=0.0,
         surge_cap=0.0,
         leverage=0.0,
+        cooldown=0,
+        min_stop=0.0,
+        skip_flat=False,
     )
 
     def __init__(self) -> None:
@@ -346,7 +421,6 @@ class MinuteDonchian(bt.Strategy):
             clock_vol=float(self.data.clock_vol[0]),
             entry_ready=float(self.data.entry_ready[0]),
             clearance=0.0,
-            cooldown=0,
             clock_volume=False,
             clock_cap=None if self.p.clock_cap is None else float(self.p.clock_cap),
             size_mode=str(self.p.size_mode),
@@ -368,6 +442,9 @@ class MinuteDonchian(bt.Strategy):
             eff_high=None if float(self.p.eff_high) <= 0 else float(self.p.eff_high),
             surge_cap=float(self.p.surge_cap) or None,
             leverage=float(self.p.leverage) or None,
+            cooldown=int(self.p.cooldown),
+            min_stop=float(self.p.min_stop) or None,
+            skip_flat=bool(self.p.skip_flat),
         )
         if book.last_signed:
             self._fill_broker(book.last_signed, close)
@@ -871,6 +948,9 @@ def run_contract(
     eff_high: float | None = None,
     surge_cap: float | None = None,
     leverage: float | None = None,
+    cooldown: int = 0,
+    min_stop: float | None = None,
+    skip_flat: bool = False,
 ) -> MinuteDonchian:
     view = channel_view(_as_feed(frame), channel, exit_channel)
     view["clock_vol"] = view["clock_vol"].fillna(0.0)
@@ -898,6 +978,9 @@ def run_contract(
         eff_high=0.0 if eff_high is None else eff_high,
         surge_cap=0.0 if surge_cap is None else surge_cap,
         leverage=0.0 if leverage is None else leverage,
+        cooldown=cooldown,
+        min_stop=0.0 if min_stop is None else min_stop,
+        skip_flat=skip_flat,
     )
     cerebro.adddata(SignalData(dataname=view))
     cerebro.broker.setcash(cash)
@@ -993,6 +1076,9 @@ def run_account(
             eff_high=window.eff_high,
             surge_cap=window.surge_cap,
             leverage=window.leverage,
+            cooldown=window.cooldown,
+            min_stop=window.min_stop,
+            skip_flat=window.skip_flat,
         )
         equity = float(strategy.broker.getvalue())
         gross = sum(float(trade["pnl"]) for trade in strategy.trades)
@@ -1027,6 +1113,9 @@ def run_account(
         "eff_high": window.eff_high,
         "surge_cap": window.surge_cap,
         "leverage": window.leverage,
+        "cooldown": window.cooldown,
+        "min_stop": window.min_stop,
+        "skip_flat": window.skip_flat,
         "cash": window.cash,
         "equity": equity,
         "margin": window.margin,
@@ -1367,7 +1456,7 @@ def _exit_decision(
 
 
 def _run_adopted(frames: dict[str, pd.DataFrame], starts: dict[str, date]) -> int:
-    """Пять счетов со стартом 100 000 руб. и запретом «старшее, 2 дня, только плюс»."""
+    """Семь счетов со стартом 100 000 руб. и запретом «старшее, 2 дня, только плюс»."""
     from consensus import ADOPTED_RULE, RULES, build_views, report as consensus_report, run_consensus
 
     base = next(rule for rule in RULES if rule.id == "base")
@@ -1384,7 +1473,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Канал по закрытиям минуток CNY/RUB")
     parser.add_argument("--grid", action="store_true", help="Прогнать сетку окон и выбрать N")
     parser.add_argument("--exits", action="store_true", help="Сравнить выходы на двух окнах по общему итогу")
-    parser.add_argument("--solo", action="store_true", help="Пять счетов по отдельности, без запрета старшего окна")
+    parser.add_argument("--solo", action="store_true", help="Семь счетов по отдельности, без запрета старшего окна")
     parser.add_argument("--bars", type=Path, default=BARS_DIR, help="Каталог parquet по контрактам")
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)

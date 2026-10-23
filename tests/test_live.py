@@ -51,7 +51,7 @@ ACCOUNT = "acc-short"
 
 
 def test_presets_match_the_researched_windows():
-    short, long, thirty, fortyfive, sixty = WINDOWS
+    short, long, thirty, fortyfive, sixty, m1760, m2160 = WINDOWS
     assert PRESETS["short"].channel == short.channel == 525
     assert PRESETS["short"].exit_channel == short.exit_channel
     assert PRESETS["short"].stop_mult is None and short.stop_mult is None
@@ -95,6 +95,25 @@ def test_presets_match_the_researched_windows():
     assert PRESETS["sixty"].surge_cap is None and sixty.surge_cap is None
     assert PRESETS["sixty"].leverage == sixty.leverage == 5
     assert sixty.cash == 100_000
+    assert PRESETS["m1760"].channel == m1760.channel == 1760
+    assert PRESETS["m1760"].exit_channel == 0
+    assert PRESETS["m1760"].stop_mult == m1760.stop_mult == 22
+    assert PRESETS["m1760"].clock_cap is None and m1760.clock_cap is None
+    assert PRESETS["m1760"].surge_cap == m1760.surge_cap == 5
+    assert PRESETS["m1760"].leverage == m1760.leverage == 5
+    assert PRESETS["m1760"].cooldown == m1760.cooldown == 60
+    assert PRESETS["m1760"].min_stop == m1760.min_stop == pytest.approx(0.008)
+    assert PRESETS["m1760"].skip_flat is True and m1760.skip_flat is True
+    assert m1760.cash == 100_000
+    assert PRESETS["m2160"].channel == m2160.channel == 2160
+    assert PRESETS["m2160"].exit_channel == 0
+    assert PRESETS["m2160"].stop_mult == m2160.stop_mult == 22
+    assert PRESETS["m2160"].surge_cap == m2160.surge_cap == 8
+    assert PRESETS["m2160"].leverage == m2160.leverage == 4
+    assert PRESETS["m2160"].cooldown == m2160.cooldown == 60
+    assert PRESETS["m2160"].min_stop == pytest.approx(0.008)
+    assert PRESETS["m2160"].skip_flat is True and m2160.skip_flat is True
+    assert m2160.cash == 100_000
     assert parse_event(
         {"strategy": "sixty", "account_id": "1", "token": "t"}
     ).fill_per_minute is None
@@ -554,6 +573,12 @@ def test_thin_market_guards_are_on_for_the_stop_windows():
     assert PRESETS["long"].skip_flat is True
     assert PRESETS["long"].cooldown == 0
     assert PRESETS["short"].min_stop is None and PRESETS["short"].cooldown == 0
+    for name in ("m1760", "m2160"):
+        params = PRESETS[name]
+        assert params.min_stop == pytest.approx(0.008)
+        assert params.cooldown == 60
+        assert params.skip_flat is True
+        assert params.weekends is False
     request = parse_event(
         {
             "strategy": "sixty",
@@ -575,7 +600,10 @@ def test_every_window_keeps_ten_sessions_past_its_own_goal():
     extra = 10 * 18 * 60
     for params in PRESETS.values():
         assert bars_to_keep(params) == history_goal(params) + extra
-    assert bars_to_keep(PRESETS["long"]) > bars_to_keep(PRESETS["sixty"])
+    assert bars_to_keep(PRESETS["long"]) > bars_to_keep(PRESETS["short"])
+    assert bars_to_keep(PRESETS["m2160"]) == 2_160 + extra
+    assert bars_to_keep(PRESETS["m1760"]) == 1_760 + extra
+    assert bars_to_keep(PRESETS["m2160"]) > bars_to_keep(PRESETS["m1760"])
     assert bars_to_keep(PRESETS["short"]) == bars_to_keep(PRESETS["sixty"])
 
 
@@ -1576,6 +1604,13 @@ def test_only_a_longer_green_position_blocks_the_opposite_entry():
             raise RuntimeError(key)
 
     assert veto_source(Broken(), "short", 525, book) == ""
+    store.save(peer_key("m1760"), _peer("m1760", channel=1760, held=-8, days=2, pnl=1500))
+    store.save(peer_key("m2160"), _peer("m2160", channel=2160, held=-8, days=2, pnl=1500))
+    book.target = 10
+    assert veto_source(store, "sixty", 60, book) == "long, m1760, m2160"
+    assert veto_source(store, "m1760", 1760, book) == "long, m2160"
+    assert veto_source(store, "m2160", 2160, book) == "long"
+    assert veto_source(store, "long", 12420, book) == ""
 
 
 def test_a_senior_short_in_profit_blocks_a_fresh_long_and_keeps_a_short():
