@@ -19,6 +19,7 @@ from cnyrub.live.broker import (
     TinkoffClient,
     FillReport,
     Instrument,
+    BOOK_DEPTH,
     book_lots,
     choose_front,
     half_book,
@@ -651,7 +652,10 @@ def test_api_error_text_prefers_the_exchange_message():
         "instrument not available for trading"
     )
     assert api_error_text(400, "") == "HTTP 400"
-    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 10
+    assert BOOK_DEPTH == 1
+    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 3
+    assert book_lots({"asks": [{"quantity": "nope"}]}, "asks") == 0
+    assert book_lots({"asks": ["bad"]}, "asks") == 0
     assert book_lots({"asks": []}, "bids") == 0
     assert half_book(10) == 5
     assert half_book(1) == 0
