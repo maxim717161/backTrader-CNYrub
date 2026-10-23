@@ -9,11 +9,12 @@
 смотрит против, счёт только закрывается. Длинное окно не глушится коротким,
 пока в правиле включено «только старшее».
 
-Команда по умолчанию пишет trend.txt, trend_equity.csv и trend_equity.png:
-сумма восьми счетов без взаимодействия, с общим правилом «четверо старших,
-1 день в плюсе» и с раздельными ролями. Мини-окна остаются на «старшее, 2 дня,
-только плюс», короткое окно — на четырёх старших. Средние и моментум
-подбираются отдельно. Сетка общего правила остаётся через --family grid.
+Команда по умолчанию пишет trend.txt, trend_equity.csv и trend_equity.png.
+Мини-окна остаются на «старшее, 2 дня, только плюс», короткое окно — на
+четырёх старших. Окно 2 160 не входит против моментума, который уже два
+торговых дня в плюсе. Окно 1 760 и моментум своего запрета не имеют.
+Полная сетка ролей остаётся через --family roles, сетка общего правила —
+через --family grid.
 """
 
 from __future__ import annotations
@@ -182,18 +183,54 @@ class SplitSpec:
         raise KeyError(name)
 
 
-def split_spec(medium: RoleRule, momentum: RoleRule, spec_id: str, title: str, legend: str, medium_id: str, momentum_id: str) -> SplitSpec:
+def split_spec(
+    medium: RoleRule,
+    momentum: RoleRule,
+    spec_id: str,
+    title: str,
+    legend: str,
+    medium_id: str,
+    momentum_id: str,
+    m2160: RoleRule | None = None,
+) -> SplitSpec:
+    rule_2160 = medium if m2160 is None else m2160
     roles = tuple(
         (name, rule)
         for name, rule in (
             *((name, MINI_RULE) for name in MINI),
             ("short", SHORT_RULE),
             ("long", LONG_RULE),
-            *((name, medium) for name in MEDIUM),
+            ("m1760", medium),
+            ("m2160", rule_2160),
             (MOMENTUM, momentum),
         )
     )
     return SplitSpec(spec_id, title, legend, roles, medium_id, momentum_id)
+
+
+# Окно 2160 не покупает против моментума и не продаёт против него, если тот уже два дня в плюсе.
+M2160_MOMENTUM_RULE = RoleRule(
+    "quorum",
+    quorum=1,
+    hold_days=2,
+    slower_only=False,
+    profit=True,
+    voters=frozenset({MOMENTUM}),
+)
+
+
+def kept_split() -> SplitSpec:
+    """1760 без своего запрета. 2160 уступает моментуму, который два дня в плюсе."""
+    return split_spec(
+        NONE_RULE,
+        NONE_RULE,
+        "roles-m2160-mom2",
+        "мини 2 дня, короткое четверо; 2160 — моментум 2 дня в плюсе",
+        "2160 — моментум 2 дня в плюсе",
+        "none",
+        "none",
+        m2160=M2160_MOMENTUM_RULE,
+    )
 
 
 @dataclass
@@ -1155,6 +1192,167 @@ def run_role_study(
     return results
 
 
+def _pick(results: list[EightResult], spec_id: str) -> EightResult:
+    return next(item for item in results if item.spec.id == spec_id)
+
+
+def report_kept(results: list[EightResult]) -> str:
+    """База, прежние роли и то же самое с запретом моментума для окна 2160."""
+    base = _pick(results, "base")
+    anchor = _pick(results, "roles-fixed")
+    kept = _pick(results, "roles-m2160-mom2")
+    base_names = _by_name(base)
+    anchor_names = _by_name(anchor)
+    kept_names = _by_name(kept)
+    shown = [base, anchor, kept]
+    for spec_id in ("legacy", "q4-d1"):
+        if any(item.spec.id == spec_id for item in results):
+            shown.insert(-1, _pick(results, spec_id))
+    width = max(len(item.spec.title) for item in shown)
+    lines = [
+        "Восемь счетов, каждый со 100 000 руб. Сумма старта "
+        f"{_money(START_SUM)} руб. Счета не складываются в один.",
+        "Мини-окна 30, 45 и 60: «старшее, 2 дня, только плюс».",
+        "Короткое окно 525: «четверо старших, 1 день в плюсе» — 1 760, 2 160, 12 420 и моментум.",
+        "Окно 2 160 не входит против моментума, который уже два торговых дня в плюсе.",
+        "Окно 1 760, длинное окно и сам моментум этим запретом не глушатся.",
+        "Своя позиция против запрета закрывается и не переворачивается.",
+        "",
+        f"{'ПРАВИЛО':<{width}} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'К РОЛЯМ':>14} {'ФАКТОР':>7} {'ПРОСАДКА':>14}",
+    ]
+    for item in shown:
+        mark = "  ←" if item.spec.id == kept.spec.id else ""
+        lines.append(
+            f"{item.spec.title:<{width}} {len(item.trades):>7} {item.blocked_setups:>7} "
+            f"{_money(item.net):>14} {_signed(item.net - base.net):>14} "
+            f"{_signed(item.net - anchor.net):>14} {_factor(item):>7} "
+            f"{_money(item.combined_drawdown):>14}{mark}"
+        )
+    lines.extend(
+        [
+            "",
+            f"Окно 2 160 с запретом моментума: итог {_money(kept.net)} руб., "
+            f"{_signed(kept.net - base.net)} к базе, {_signed(kept.net - anchor.net)} к ролям без этого запрета.",
+            "Счета к ролям без запрета на 2 160: "
+            + ", ".join(
+                f"{name} {_signed(kept_names[name].net - anchor_names[name].net)}"
+                for name in ("m2160", "m1760", MOMENTUM, "short", "thirty", "fortyfive", "sixty", "long")
+            )
+            + ".",
+            f"Своя просадка окна 2 160: {_money(anchor_names['m2160'].drawdown)} руб. без запрета, "
+            f"{_money(kept_names['m2160'].drawdown)} руб. с запретом. "
+            f"Просадка суммы {_money(kept.combined_drawdown)} руб. "
+            f"Частей слабее базы: {_weaker_parts(kept, base)} из 5.",
+            "",
+            "Части истории, сумма восьми счетов: " + "  ".join(f"{secids[0]}–{secids[-1]}" for secids in PARTS),
+            f"{'ПРАВИЛО':<{width}} " + " ".join(f"{'Ч' + str(index):>12}" for index in range(1, 6)),
+        ]
+    )
+    for item in (base, anchor, kept):
+        parts = _part_nets(item.trades)
+        lines.append(f"{item.spec.title:<{width}} " + " ".join(f"{_money(part):>12}" for part in parts))
+    for item in (base, anchor, kept):
+        lines.extend(["", item.spec.title])
+        lines.append(
+            f"{'СТРАТЕГИЯ':<12} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'К РОЛЯМ':>14} {'ПРОСАДКА':>14} {'СЧЁТ':>14}"
+        )
+        names = _by_name(item)
+        for name in ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", MOMENTUM):
+            stats = names[name]
+            lines.append(
+                f"{stats.name:<12} {len(stats.trades):>7} {stats.blocked_setups:>7} "
+                f"{_money(stats.net):>14} {_signed(stats.net - base_names[name].net):>14} "
+                f"{_signed(stats.net - anchor_names[name].net):>14} "
+                f"{_money(stats.drawdown):>14} {_money(stats.end_equity):>14}"
+            )
+    lines.append("")
+    lines.append("На графике три суммы: без взаимодействия, роли без запрета на 2 160 и роли с этим запретом.")
+    lines.append("Нижняя панель — разница запрета на 2 160 с ролями, где его ещё нет.")
+    return "\n".join(lines)
+
+
+def plot_kept(results: list[EightResult], output: Path) -> Path:
+    """Три линии. Нижняя панель — что добавляет запрет моментума на окне 2160."""
+    base = _pick(results, "base")
+    anchor = _pick(results, "roles-fixed")
+    kept = _pick(results, "roles-m2160-mom2")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig, (ax_equity, ax_gap) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(12, 7.2),
+        height_ratios=(3, 1.4),
+        layout="constrained",
+    )
+    dates = [pd.Timestamp(day) for day in base.dates]
+    series = (
+        (base, "#6b6258", 1.6),
+        (anchor, "#1f4e79", 1.6),
+        (kept, "#9a3412", 1.8),
+    )
+    anchor_curve = np.asarray(anchor.curve, dtype=float)
+    for item, color, width in series:
+        ax_equity.plot(dates, item.curve, color=color, linewidth=width, label=_legend(item.spec))
+    ax_gap.plot(
+        dates,
+        np.asarray(kept.curve) - anchor_curve,
+        color="#9a3412",
+        linewidth=1.8,
+        label=_legend(kept.spec),
+    )
+    ax_gap.axhline(0.0, color="#6b6258", linewidth=0.8)
+    ax_equity.set_title("Сумма восьми счетов")
+    ax_equity.set_ylabel("руб.")
+    ax_gap.set_ylabel("к ролям без запрета 2160, руб.")
+    ax_gap.set_xlabel("день истекающего контракта")
+    ax_equity.legend(frameon=False, loc="upper left")
+    ax_equity.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f} млн"))
+    ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.2f} млн"))
+    ax_equity.xaxis.set_major_locator(mdates.YearLocator())
+    ax_equity.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.savefig(output, dpi=140)
+    plt.close(fig)
+    return output
+
+
+def write_kept_curve(results: list[EightResult], output: Path) -> Path:
+    base = _pick(results, "base")
+    anchor = _pick(results, "roles-fixed")
+    kept = _pick(results, "roles-m2160-mom2")
+    frame = pd.DataFrame(
+        {
+            "date": [day.isoformat() for day in base.dates],
+            "base": base.curve,
+            "roles": anchor.curve,
+            "m2160_mom": kept.curve,
+        }
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output, index=False)
+    return output
+
+
+def run_kept_study(
+    frames: dict[str, pd.DataFrame],
+    starts: dict[str, date],
+    views: dict[str, dict[str, pd.DataFrame]],
+) -> list[EightResult]:
+    """База, старое общее правило, роли без запрета на 2160 и роли с ним."""
+    results: list[EightResult] = []
+    specs: list[TrendSpec | SplitSpec] = [
+        next(spec for spec in SPECS if spec.id == "base"),
+        next(spec for spec in SPECS if spec.id == "legacy"),
+        next(spec for spec in SPECS if spec.id == "q4-d1"),
+        make_split("none", "none"),
+        kept_split(),
+    ]
+    for spec in specs:
+        print(f"правило {spec.id}", flush=True)
+        results.append(run_eight(frames, spec, starts, views=views))
+    return results
+
+
 def specs_by_id(selected: str | None) -> tuple[TrendSpec, ...]:
     if not selected:
         return SPECS
@@ -1177,14 +1375,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path("trend.txt"))
     parser.add_argument("--chart", type=Path, default=Path("trend_equity.png"))
     parser.add_argument("--csv", type=Path, default=Path("trend_equity.csv"))
-    parser.add_argument("--family", choices=("roles", "grid"), default="roles")
+    parser.add_argument("--family", choices=("kept", "roles", "grid"), default="kept")
     parser.add_argument("--rules", help="Для сетки: идентификаторы через запятую. base и legacy добавляются сами")
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
     starts = load_trade_starts(args.bars)
     print("окна", flush=True)
     views = build_views(frames)
-    if args.family == "roles":
+    if args.family == "kept":
+        results = run_kept_study(frames, starts, views)
+        text = report_kept(results)
+        args.output.write_text(text + "\n", encoding="utf-8")
+        print(text, flush=True)
+        plot_kept(results, args.chart)
+        write_kept_curve(results, args.csv)
+    elif args.family == "roles":
         results = run_role_study(frames, starts, views)
         text = report_roles(results)
         args.output.write_text(text + "\n", encoding="utf-8")
