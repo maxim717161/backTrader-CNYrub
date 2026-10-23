@@ -18,10 +18,12 @@ from trend import (
     choose_roles,
     choose_spec,
     combine_veto,
+    choose_momentum,
     entry_veto,
     kept_split,
     make_split,
     m1760_spec,
+    momentum_spec,
     sixty_spec,
     RoleRule,
     plot_kept,
@@ -394,3 +396,52 @@ def test_roles_keep_four_seniors_on_the_short_window_and_two_days_on_the_minis()
     assert sum(stats.cash for stats in result.strategies) == pytest.approx(START_SUM)
     assert result.curve
     assert result.dates[0] == date(2024, 1, 8)
+
+
+def test_momentum_rule_leaves_1760_free_and_blocks_only_momentum():
+    spec = momentum_spec(
+        "long-d2",
+        "только длинное, 2 дня",
+        RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False, voters=frozenset({"long"})),
+    )
+    one_long = [_state("long", 12_420, -1, held_days=2)]
+    fresh_long = [_state("long", 12_420, -1, held_days=0)]
+    wide = [_state("m2160", 2160, -1, held_days=2)]
+    ripe_momentum = [_state("momentum", 0, -1, held_days=2)]
+    assert spec.role("m1760").mode == "none"
+    assert spec.role("momentum").voters == frozenset({"long"})
+    assert entry_veto("momentum", 0, one_long, one_long, spec, 0) == 1
+    assert entry_veto("momentum", 0, fresh_long, fresh_long, spec, 0) == 0
+    assert entry_veto("momentum", 0, wide, wide, spec, 0) == 0
+    assert entry_veto("m1760", 1760, one_long, one_long, spec, 0) == 0
+    assert entry_veto("m2160", 2160, ripe_momentum, [], spec, 0) == 1
+    assert entry_veto("sixty", 60, fresh_long, fresh_long, spec, 0) == 1
+    assert entry_veto("thirty", 30, fresh_long, fresh_long, spec, 0) == 0
+    alone = momentum_spec("none", "сам", RoleRule("none"))
+    assert entry_veto("momentum", 0, one_long, one_long, alone, 0) == 0
+
+
+def test_momentum_choice_refuses_a_gain_that_taxes_2160():
+    from trend import EightResult
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", "momentum")
+
+    def book(spec: object, nets: dict[str, float]) -> EightResult:
+        strategies = [
+            StrategyStats(name, [{"pnlcomm": nets[name], "secid": "CRM2"}], 0, 0, 0, 100_000 + nets[name], -1, 100_000)
+            for name in names
+        ]
+        return EightResult(spec, strategies, -10, [], [])  # type: ignore[arg-type]
+
+    flat = {name: 1_000.0 for name in names}
+    taxed = dict(flat)
+    taxed["momentum"] = 2_000.0
+    taxed["m2160"] = 500.0
+    safe = dict(flat)
+    safe["momentum"] = 1_400.0
+    base = next(spec for spec in SPECS if spec.id == "base")
+    anchor = momentum_spec("none", "сам", RoleRule("none"))
+    rich = momentum_spec("long-d2", "только длинное", RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False))
+    costly = momentum_spec("leg", "любое окно", RoleRule("legacy"))
+    results = [book(base, flat), book(anchor, flat), book(rich, safe), book(costly, taxed)]
+    assert choose_momentum(results).spec.id == "mom-long-d2"
