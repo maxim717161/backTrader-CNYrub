@@ -21,6 +21,7 @@ from trend import (
     entry_veto,
     kept_split,
     make_split,
+    m1760_spec,
     sixty_spec,
     RoleRule,
     plot_kept,
@@ -233,6 +234,52 @@ def test_sixty_choice_refuses_a_gain_that_taxes_the_other_minis():
     costly = sixty_spec("none", "само", RoleRule("none"))
     results = [book(base, flat), book(anchor, flat), book(rich, safe), book(costly, taxed)]
     assert choose_sixty(results).spec.id == "sixty-d1"
+
+
+def test_m1760_rule_does_not_move_the_other_roles():
+    spec = m1760_spec(
+        "long-d2",
+        "только длинное",
+        RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False, voters=frozenset({"long"})),
+    )
+    one_long = [_state("long", 12_420, -1, held_days=2)]
+    wide = [_state("m2160", 2160, -1, held_days=2)]
+    fresh = [_state("long", 12_420, -1, held_days=0)]
+    momentum = [_state("momentum", 0, -1, held_days=2)]
+    assert entry_veto("m1760", 1760, one_long, one_long, spec, 0) == 1
+    assert entry_veto("m1760", 1760, wide, wide, spec, 0) == 0
+    assert entry_veto("m1760", 1760, momentum, [], spec, 0) == 0
+    assert entry_veto("sixty", 60, fresh, fresh, spec, 0) == 1
+    assert entry_veto("thirty", 30, fresh, fresh, spec, 0) == 0
+    assert entry_veto("m2160", 2160, momentum, [], spec, 0) == 1
+    alone = m1760_spec("none", "само", RoleRule("none"))
+    assert entry_veto("m1760", 1760, one_long, one_long, alone, 0) == 0
+
+
+def test_m1760_choice_refuses_a_gain_that_taxes_the_short_window():
+    from trend import EightResult, choose_m1760
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", "momentum")
+
+    def book(spec: object, nets: dict[str, float]) -> EightResult:
+        strategies = [
+            StrategyStats(name, [{"pnlcomm": nets[name], "secid": "CRM2"}], 0, 0, 0, 100_000 + nets[name], -1, 100_000)
+            for name in names
+        ]
+        return EightResult(spec, strategies, -10, [], [])  # type: ignore[arg-type]
+
+    flat = {name: 1_000.0 for name in names}
+    taxed = dict(flat)
+    taxed["m1760"] = 2_000.0
+    taxed["short"] = 500.0
+    safe = dict(flat)
+    safe["m1760"] = 1_400.0
+    base = next(spec for spec in SPECS if spec.id == "base")
+    anchor = m1760_spec("none", "само", RoleRule("none"))
+    rich = m1760_spec("long-d2", "только длинное", RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False))
+    costly = m1760_spec("leg", "старшее", RoleRule("legacy"))
+    results = [book(base, flat), book(anchor, flat), book(rich, safe), book(costly, taxed)]
+    assert choose_m1760(results).spec.id == "m1760-long-d2"
 
 
 def test_kept_book_blocks_sixty_as_soon_as_a_longer_window_is_in_profit():
