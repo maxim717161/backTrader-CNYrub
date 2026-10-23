@@ -1,0 +1,175 @@
+"""Кворум чужих позиций и выбор правила для суммы восьми счетов."""
+
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from consensus import OpenState, StrategyStats
+from cnyrub.engine import _FillBook
+from trend import (
+    SPECS,
+    START_SUM,
+    TrendSpec,
+    _MomentumTape,
+    apply_momentum_target,
+    choose_spec,
+    combine_veto,
+    obvious_sources,
+    obvious_veto,
+    plot_equity,
+    run_eight,
+)
+
+
+def _state(name: str, channel: int, side: int, *, held_days: int = 2, pnl: float = 1_000.0) -> OpenState:
+    return OpenState(name, channel, side, held_days, pnl, pnl, None, 0.0)
+
+
+def _spec(**overrides: object) -> TrendSpec:
+    data: dict[str, object] = dict(id="probe", title="probe", enabled=True, quorum=2, hold_days=1)
+    data.update(overrides)
+    return TrendSpec(**data)  # type: ignore[arg-type]
+
+
+def test_two_longer_positions_block_the_opposite_entry_and_one_does_not():
+    peers = [
+        _state("m1760", 1760, -1),
+        _state("m2160", 2160, -1),
+        _state("thirty", 30, -1),
+    ]
+    spec = _spec()
+    assert obvious_veto(peers, spec, "short", 525, 0) == 1
+    assert obvious_sources(peers, spec, "short", 525, 1, 0) == ["m1760", "m2160"]
+    assert obvious_veto(peers[:1], spec, "short", 525, 0) == 0
+    assert obvious_veto(peers, spec, "long", 12_420, 0) == 0
+
+
+def test_disagreement_and_a_shield_leave_the_entry_open():
+    mixed = [_state("m1760", 1760, -1), _state("m2160", 2160, 1)]
+    spec = _spec()
+    assert obvious_veto(mixed, spec, "short", 525, 0) == 0
+    shielded = _spec(shield=frozenset({"short"}))
+    peers = [_state("m1760", 1760, -1), _state("long", 12_420, -1)]
+    assert obvious_veto(peers, shielded, "short", 525, 0) == 0
+
+
+def test_momentum_votes_without_a_channel_and_a_short_window_does_not_block_it():
+    peers = [_state("momentum", 0, -1), _state("long", 12_420, -1)]
+    assert obvious_veto(peers, _spec(), "short", 525, 0) == 1
+    assert obvious_veto(peers, _spec(momentum_votes=False), "short", 525, 0) == 0
+    voters = [_state("thirty", 30, 1), _state("fortyfive", 45, 1), _state("long", 12_420, 1)]
+    assert obvious_veto(voters, _spec(min_channel=1760), "momentum", 0, 0) == 0
+    assert obvious_veto(voters, _spec(min_channel=1760), "momentum", 0, 0) == 0
+    assert obvious_veto(
+        [_state("m1760", 1760, 1), _state("long", 12_420, 1)],
+        _spec(min_channel=1760),
+        "momentum",
+        0,
+        0,
+    ) == -1
+
+
+def test_price_move_has_to_agree_with_the_quorum():
+    peers = [_state("m1760", 1760, -1), _state("long", 12_420, -1)]
+    spec = _spec(price_days=10)
+    assert obvious_veto(peers, spec, "short", 525, -1) == 1
+    assert obvious_veto(peers, spec, "short", 525, 1) == 0
+    assert obvious_veto(peers, spec, "short", 525, 0) == 0
+
+
+def test_legacy_veto_stacks_with_the_quorum():
+    assert combine_veto(1, 0) == 1
+    assert combine_veto(1, -1) == 2
+    assert combine_veto(0, 0) == 0
+
+
+def test_momentum_flattens_instead_of_flipping_into_a_veto():
+    book = _FillBook("CRH4", 100_000.0)
+    book.held = 4
+    book.target = 4
+    assert apply_momentum_target(book, -6, veto=1) is False
+    assert book.target == -6
+    book.held = 4
+    assert apply_momentum_target(book, -6, veto=-1) is True
+    assert book.target == 0
+    flat = _FillBook("CRH4", 100_000.0)
+    assert apply_momentum_target(flat, 5, veto=1) is True
+    assert flat.target == 0
+    assert apply_momentum_target(flat, 5, veto=-1) is False
+    assert flat.target == 5
+
+
+def test_weekend_minutes_do_not_open_a_momentum_session():
+    tape = _MomentumTape()
+    friday = date(2024, 1, 5)
+    assert tape.see(friday, 10, 10.2, 9.8, 10.1, 5) is True
+    assert tape.see(friday, 10.1, 10.3, 10.0, 10.2, 1) is False
+    assert tape.see(date(2024, 1, 6), 10, 10, 10, 10, 1) is False
+    assert tape.see(date(2024, 1, 8), 10.2, 10.4, 10.1, 10.3, 2) is True
+    assert tape.closes == [10.2]
+    assert tape.price_sign(1) == 0
+
+
+def test_choice_keeps_the_long_window_and_then_the_sum():
+    def item(spec_id: str, long_net: float, other: float, part: str = "CRM2") -> object:
+        spec = next(spec for spec in SPECS if spec.id == spec_id) if spec_id in {"base", "legacy"} else _spec(id=spec_id, title=spec_id)
+        strategies = [
+            StrategyStats("long", [{"pnlcomm": long_net, "secid": part}], 0, 0, 0, 100_000 + long_net, -1, 100_000),
+            StrategyStats("short", [{"pnlcomm": other, "secid": part}], 0, 0, 0, 100_000 + other, -1, 100_000),
+        ]
+        from trend import EightResult
+
+        return EightResult(spec, strategies, -10, [], [])
+
+    base = item("base", 100, 50)
+    hurts = item("hurts", 90, 500)
+    calm = item("calm", 100, 80, "CRH6")
+    rich = item("rich", 110, 70)
+    chosen = choose_spec([base, item("legacy", 100, 60), hurts, calm, rich])  # type: ignore[list-item]
+    assert chosen.spec.id == "rich"
+    # У calm часть CRM2 пустая, у базы она 150: calm слабее в этой части, rich нет.
+    assert chosen is not calm
+
+
+def test_plot_writes_three_lines(tmp_path: Path):
+    from trend import EightResult
+
+    def result(spec_id: str, level: float) -> EightResult:
+        spec = TrendSpec(spec_id, spec_id, legacy=spec_id == "legacy")
+        stats = StrategyStats("long", [], 0, 0, 0, level, 0, 100_000)
+        return EightResult(spec, [stats], 0, [date(2024, 1, 2), date(2024, 1, 3)], [level, level + 10])
+
+    path = tmp_path / "equity.png"
+    results = [result("base", 800_000), result("legacy", 810_000), result("q2-d1", 820_000)]
+    plot_equity(results, path)
+    assert path.stat().st_size > 1000
+
+
+def test_eight_accounts_walk_a_short_contract():
+    index = pd.date_range("2024-01-08 10:00", periods=40, freq="min", tz="Europe/Moscow")
+    frame = pd.DataFrame(
+        {
+            "open": 10.0,
+            "high": 10.2,
+            "low": 9.8,
+            "close": 10.05,
+            "volume": 100.0,
+        },
+        index=index,
+    )
+    result = run_eight({"CRH4": frame}, SPECS[0], {"CRH4": date(2024, 1, 8)})
+    assert [stats.name for stats in result.strategies] == [
+        "short",
+        "long",
+        "thirty",
+        "fortyfive",
+        "sixty",
+        "m1760",
+        "m2160",
+        "momentum",
+    ]
+    assert sum(stats.cash for stats in result.strategies) == pytest.approx(START_SUM)
+    assert result.curve
+    assert result.dates[0] == date(2024, 1, 8)
