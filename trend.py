@@ -567,8 +567,15 @@ def run_eight(
     trade_from: dict[str, date] | None = None,
     *,
     views: dict[str, dict[str, pd.DataFrame]] | None = None,
+    audit: list[dict[str, object]] | None = None,
+    m1760_exit_when_2160_turns: bool = False,
 ) -> EightResult:
-    """Один проход. Восемь книг не смешиваются, запрет общий на минуту."""
+    """Один проход. Восемь книг не смешиваются, запрет общий на минуту.
+
+    m1760_exit_when_2160_turns закрывает 1760, если 2160 уже после входа
+    встаёт напротив и уходит в плюс. Полный прогон забирает у окна 350 227 руб.
+    Флаг выключен.
+    """
     if len(NAMES) != len(WINDOWS):
         raise ValueError("имён окон и окон должно быть поровну")
     channels = {name: window.channel for name, window in zip(NAMES, WINDOWS, strict=True)}
@@ -604,6 +611,10 @@ def run_eight(
         streak = dict.fromkeys(EIGHT, 0)
         front = None if trade_from is None else trade_from.get(secid)
         count = len(sample)
+        pending: list[dict[str, object]] = []
+        closed_seen = 0
+        m1760_armed = False
+        m2160_block_i: int | None = None
         for i in range(count):
             day = days[i]
             close = float(price["close"][i])
@@ -632,6 +643,80 @@ def run_eight(
                 if state is not None:
                     states.append(state)
             window_states = [state for state in states if state.name != MOMENTUM]
+            if audit is not None:
+                watched = books["m1760"]
+                while len(watched.trades) > closed_seen:
+                    trade = watched.trades[closed_seen]
+                    entry = pending.pop(0) if pending else None
+                    audit.append({"trade": trade, "entry": entry, "exit_day": day, "secid": secid})
+                    closed_seen += 1
+                if watched.entry_i == i and watched.held:
+                    side = 1 if watched.held > 0 else -1
+                    peers = []
+                    for name in EIGHT:
+                        if name == "m1760":
+                            continue
+                        other = books[name]
+                        if other.held == 0 or other.entry_i is None:
+                            continue
+                        peer_side = 1 if other.held > 0 else -1
+                        peers.append(
+                            {
+                                "name": name,
+                                "side": peer_side,
+                                "pnl": open_pnl(other, close),
+                                "held_days": int(day_index[i] - day_index[int(other.entry_i)]),
+                                "channel": channels[name],
+                            }
+                        )
+                    already = {peer["name"] for peer in peers if peer["side"] != side and peer["pnl"] > 0}
+                    pending.append(
+                        {"day": day, "side": side, "peers": peers, "secid": secid, "later": {}, "already": already}
+                    )
+                elif pending and watched.held and watched.entry_i is not None:
+                    side = int(pending[-1]["side"])
+                    later = pending[-1]["later"]
+                    already = pending[-1]["already"]
+                    for name in EIGHT:
+                        if name == "m1760" or name in later or name in already:
+                            continue
+                        other = books[name]
+                        if other.held == 0 or other.entry_i is None:
+                            continue
+                        peer_side = 1 if other.held > 0 else -1
+                        if peer_side == side:
+                            continue
+                        peer_pnl = open_pnl(other, close)
+                        if peer_pnl <= 0:
+                            continue
+                        later[name] = {
+                            "day": day,
+                            "pnl": peer_pnl,
+                            "held_days": int(day_index[i] - day_index[int(other.entry_i)]),
+                        }
+            if m1760_exit_when_2160_turns:
+                watched = books["m1760"]
+                peer = books["m2160"]
+
+                def peer_against(side: int) -> bool:
+                    if peer.held == 0 or peer.entry_i is None:
+                        return False
+                    peer_side = 1 if peer.held > 0 else -1
+                    return peer_side != side and open_pnl(peer, close) > 0
+
+                if watched.entry_i == i and watched.held:
+                    m1760_armed = not peer_against(1 if watched.held > 0 else -1)
+                if m1760_armed and watched.held and peer_against(1 if watched.held > 0 else -1):
+                    watched.target = 0
+                    watched.reason = "flat"
+                    m2160_block_i = int(peer.entry_i) if peer.entry_i is not None else None
+                    m1760_armed = False
+                if watched.held == 0 and watched.target and m2160_block_i is not None:
+                    fresh = 1 if watched.target > 0 else -1
+                    if peer.entry_i != m2160_block_i:
+                        m2160_block_i = None
+                    elif peer_against(fresh):
+                        watched.target = 0
             shared_sign = tape.price_sign(spec.price_days) if isinstance(spec, TrendSpec) else 0
             for name in NAMES:
                 book = books[name]
