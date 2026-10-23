@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-09-21",
+  "as_of": "2026-10-10",
   "front": "CRZ6",
   "contracts": [
     {
@@ -246,7 +246,7 @@
       "lotsize": 1000,
       "in_series": true,
       "window_start": "2026-09-18",
-      "window_end": "2026-09-21",
+      "window_end": "2026-10-10",
       "history_start": "2026-08-17"
     },
     {
