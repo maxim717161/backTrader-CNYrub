@@ -32,6 +32,7 @@ FILES = (
     "src/cnyrub/live/state.py",
     "src/cnyrub/live/trace.py",
     "src/cnyrub/live/veto.py",
+    "src/cnyrub/live/momentum.py",
 )
 
 # Исходник README лежит рядом с точкой входа, в архиве это README.txt в корне.
