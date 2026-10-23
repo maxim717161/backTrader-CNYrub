@@ -2148,6 +2148,12 @@ def report_momentum(results: list[EightResult]) -> str:
             + ".",
         ]
     )
+    if chosen.spec.id != anchor.spec.id:
+        lines.append(
+            "В книгу это правило не включено. Окно 1 760 и моментум остаются без своего запрета. "
+            f"Своя просадка моментума {_money(chosen_names[MOMENTUM].drawdown)} руб. "
+            f"против {_money(anchor_names[MOMENTUM].drawdown)} без запрета."
+        )
     if raw.spec.id != chosen.spec.id:
         lines.append(
             f"Самый высокий итог моментума даёт «{raw.spec.title}»: {_money(raw_names[MOMENTUM].net)} руб., "
