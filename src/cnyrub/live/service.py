@@ -8,10 +8,11 @@
 индикаторов и десять сессий сверху, более старые минутки стираются.
 Свежий вход против старшего окна, которое уже два торговых дня в плюсе,
 снимается до заявки. Своя позиция, стоп и выход остаются.
-Моментум — восьмая стратегия на своём субсчёте: дневной знак, без запрета семи окон.
+Моментум — восьмая стратегия на своём субсчёте: дневной знак. Пишет
+peers/momentum.json и чужие файлы не читает. Запрет семи окон его не касается.
 
 Сколько контрактов менять за минуту решает fill_per_minute. Пустое значение —
-авто: не больше половины видимого стакана с той стороны, которую съест заявка.
+авто: не больше половины контрактов на лучшей цене той стороны, которую съест заявка.
 0 ставит паузу: цель может смениться, но заявка не уходит. Положительное число —
 потолок контрактов в минуту, стакан при этом не смотрим.
 """
@@ -149,7 +150,7 @@ def move_side(
 
 
 def pace_for(request: RunRequest, broker, uid: str, side: int) -> int:
-    """Контрактов за эту минуту. Авто читает сторону стакана, которую съест заявка."""
+    """Контрактов за эту минуту. Авто читает лучшую цену стороны, которую съест заявка."""
     if request.fill_per_minute is not None:
         return request.fill_per_minute
     if side == 0:
@@ -207,7 +208,7 @@ def close_pnl(book: _FillBook, before: dict[str, object], signed: int) -> float 
 
 
 def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime | None = None) -> dict[str, object]:
-    """Дневной моментум. Чужой запрет не читает и свой файл peers/ не пишет."""
+    """Дневной моментум. Чужой запрет не читает. Свой файл peers/momentum.json пишет."""
     moment = _moscow(now)
     key = state_key(request.strategy, request.account_id)
     state = store.load(key) or _empty_state(request)
@@ -263,6 +264,7 @@ def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime |
             )
         state["book"] = export_book(book)
         store.save(key, state)
+        _publish_momentum(store, book, state)
         result["phase"] = "history"
         result["bars"] = len(days)
         result["goal"] = HISTORY_DAYS
@@ -278,6 +280,7 @@ def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime |
         state["zero_fills"] = 0
         state["book"] = export_book(book)
         store.save(key, state)
+        _publish_momentum(store, book, state)
         result["phase"] = "reconciled"
         result["held"] = book.held
         result["halted"] = None
@@ -298,6 +301,7 @@ def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime |
     fresh = _momentum_fresh(state, broker, front.uid, moment)
     if fresh is None:
         store.save(key, state)
+        _publish_momentum(store, book, state)
         result["phase"] = "catchup"
         result["held"] = book.held
         return result
@@ -392,6 +396,7 @@ def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime |
         state["last_bar"] = stamp
         state["book"] = export_book(book)
         store.save(key, state)
+        _publish_momentum(store, book, state)
         result["phase"] = "paused" if request.fill_per_minute == 0 else ("signal" if book.target != book.held else "hold")
         result["held"] = book.held
         result["target"] = book.target
@@ -439,6 +444,7 @@ def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime |
             )
         state["book"] = export_book(book)
         store.save(key, state)
+        _publish_momentum(store, book, state)
         result["phase"] = "unfilled"
         result["unfilled"] = misses
         result["held"] = book.held
@@ -454,6 +460,7 @@ def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime |
     state["last_bar"] = stamp
     state["book"] = export_book(book)
     store.save(key, state)
+    _publish_momentum(store, book, state)
     result["phase"] = "order"
     result["held"] = book.held
     result["target"] = book.target
@@ -1182,10 +1189,30 @@ def _halt(
     if book is not None:
         state["book"] = export_book(book)
     store.save(key, state)
-    publish_peer(store, strategy, channel, book, list(state.get("bars") or []))
+    if strategy == MOMENTUM:
+        publish_peer(store, strategy, channel, book, _momentum_peer_bars(state))
+    else:
+        publish_peer(store, strategy, channel, book, list(state.get("bars") or []))
     result["phase"] = "halted"
     result["halted"] = reason
     return result
+
+
+def _momentum_peer_bars(state: dict[str, object]) -> list[dict[str, object]]:
+    """Один бар на сессию: в peers/momentum.json дни удержания считаются по датам, не по минуткам."""
+    bars: list[dict[str, object]] = []
+    for day in list(state.get("days") or []):
+        if isinstance(day, dict) and day.get("d"):
+            bars.append({"t": f"{day['d']}T23:50:00+03:00", "c": float(day.get("c") or 0.0)})
+    today = state.get("today")
+    if isinstance(today, dict) and today.get("d"):
+        bars.append({"t": f"{today['d']}T12:00:00+03:00", "c": float(today.get("c") or 0.0)})
+    return bars
+
+
+def _publish_momentum(store: StateStore, book: _FillBook, state: dict[str, object]) -> None:
+    """Канал 0 — местодержатель, пока правила обмена с окнами не заданы."""
+    publish_peer(store, MOMENTUM, 0, book, _momentum_peer_bars(state))
 
 
 def _bar(candle: Candle) -> dict[str, object]:

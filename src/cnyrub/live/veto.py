@@ -1,7 +1,9 @@
 """Запрет входа от старшего окна на живом счёте.
 
-Правило то же, что «старшее, 2 дня, только плюс» в истории. Каждая стратегия
-пишет короткий файл peers/<имя>.json. Чужую книгу целиком не читаем: у длинного
+Правило то же, что «старшее, 2 дня, только плюс» в истории. Семь окон пишут
+короткий файл peers/<имя>.json и перед свежим входом читают только более длинные
+окна. Моментум пишет peers/momentum.json тем же составом, но в этот запрет не
+входит: ни он окна не глушит, ни окна его. Чужую книгу целиком не читаем: у длинного
 окна там десятки тысяч минуток. Короткое окно не глушит длинное. Своя позиция,
 стоп и выход не трогаются — снимается только свежая цель входа против чужого плюса.
 """
@@ -9,7 +11,7 @@
 from __future__ import annotations
 
 from cnyrub.engine import MULTIPLIER, _FillBook
-from cnyrub.live.config import PRESETS
+from cnyrub.live.config import MOMENTUM, PRESETS
 from cnyrub.live.indicators import bar_get
 
 HOLD_DAYS = 2
@@ -54,8 +56,8 @@ def cancel_fresh_entry(book: _FillBook) -> None:
 
 
 def publish_peer(store, strategy: str, channel: int, book: _FillBook | None, bars: list[object]) -> None:
-    """Записать позицию, которую видят остальные стратегии. Плоская книга снимает запрет."""
-    if book is None or strategy not in PRESETS:
+    """Записать позицию в peers/. Плоская книга снимает запрет. Моментум пишет файл, запрет его не читает."""
+    if book is None or (strategy not in PRESETS and strategy != MOMENTUM):
         return
     close = float(bar_get(bars[-1], "c")) if bars else 0.0
     held = int(book.held)

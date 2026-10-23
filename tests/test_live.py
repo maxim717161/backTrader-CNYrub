@@ -19,6 +19,7 @@ from cnyrub.live.broker import (
     TinkoffClient,
     FillReport,
     Instrument,
+    BOOK_DEPTH,
     book_lots,
     choose_front,
     half_book,
@@ -651,7 +652,10 @@ def test_api_error_text_prefers_the_exchange_message():
         "instrument not available for trading"
     )
     assert api_error_text(400, "") == "HTTP 400"
-    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 10
+    assert BOOK_DEPTH == 1
+    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 3
+    assert book_lots({"asks": [{"quantity": "nope"}]}, "asks") == 0
+    assert book_lots({"asks": ["bad"]}, "asks") == 0
     assert book_lots({"asks": []}, "bids") == 0
     assert half_book(10) == 5
     assert half_book(1) == 0
@@ -1749,7 +1753,6 @@ def test_momentum_sign_matches_the_chosen_account_where_the_window_fits():
     """Живой знак совпадает с выбранным счётом, пока окну хватает пяти дней до конца ряда."""
     import numpy as np
 
-    pytest.importorskip("research.cr_momentum")
     from research.cr_momentum import Series
     from research.cr_momentum_params import chosen_account_position
     from cnyrub.live.momentum import HISTORY_DAYS, HOLD, LOOKBACK, sign_for_today
@@ -1826,7 +1829,7 @@ def _momentum_days(count: int, end: date) -> list[dict[str, float | str]]:
     return days
 
 
-def test_momentum_orders_on_its_own_account_and_does_not_publish_a_peer():
+def test_momentum_orders_on_its_own_account_and_writes_its_peer():
     broker = FakeBroker()
     broker.margin_value = 100.0
     store = MemoryStore()
@@ -1867,15 +1870,26 @@ def test_momentum_orders_on_its_own_account_and_does_not_publish_a_peer():
     assert first["held"] == 10
     assert first["order"]["signed"] == 10
     assert broker.orders == [{"signed": 10, "order_id": first["order"]["id"], "account": account, "uid": "uid-1"}]
-    assert peer_key("momentum") not in store.data
-    assert not any(key.startswith("peers/") for key in store.data)
+    peer = store.load(peer_key("momentum"))
+    assert peer["strategy"] == "momentum"
+    assert peer["channel"] == 0
+    assert peer["held"] == 10
+    assert peer["target"] == 30
+    assert peer["held_days"] == 0
+    fresh = _FillBook("CRZ6", None)
+    fresh.target = 2
+    assert veto_source(store, "short", 525, fresh) == ""
     broker._candles.append(_candle(datetime(2026, 9, 30, 10, 5, tzinfo=MSK), 10.0))
     second = run_minute(request, broker, store, now=datetime(2026, 9, 30, 10, 6, tzinfo=MSK))
     assert second["phase"] == "order"
     assert second["target"] == 30
     assert second["held"] == 20
     assert second["order"]["signed"] == 10
-    assert peer_key("momentum") not in store.data
+    peer = store.load(peer_key("momentum"))
+    assert peer["held"] == 20
+    assert peer["target"] == 30
+    assert peer["channel"] == 0
+    assert veto_source(store, "m2160", 2160, fresh) == ""
 
 
 def test_momentum_is_outside_the_seven_window_exchange():
@@ -1890,8 +1904,27 @@ def test_momentum_is_outside_the_seven_window_exchange():
     book.held = -3
     book.target = -3
     book.avg = 10.0
-    publish_peer(store, "momentum", 0, book, [{"t": "2026-09-30T10:00:00+03:00", "c": 10.0}])
-    assert store.load(peer_key("momentum")) is None
+    book.entry_i = 0
+    publish_peer(
+        store,
+        "momentum",
+        0,
+        book,
+        [
+            {"t": "2026-09-28T23:50:00+03:00", "c": 10.2},
+            {"t": "2026-09-29T23:50:00+03:00", "c": 10.1},
+            {"t": "2026-09-30T12:00:00+03:00", "c": 9.7},
+        ],
+    )
+    written = store.load(peer_key("momentum"))
+    assert written["strategy"] == "momentum"
+    assert written["channel"] == 0
+    assert written["held"] == -3
+    assert written["target"] == -3
+    assert written["held_days"] == 2
+    assert written["pnl"] == pytest.approx((9.7 - 10.0) * -3 * 1000)
+    publish_peer(store, "missing", 10, book, [{"t": "2026-09-30T10:00:00+03:00", "c": 10.0}])
+    assert store.load(peer_key("missing")) is None
     fresh = _FillBook("CRZ6", None)
     fresh.target = 2
     store.save(
@@ -1909,7 +1942,7 @@ def test_momentum_is_outside_the_seven_window_exchange():
         assert veto_source(store, name, channel, fresh) == ""
 
 
-def test_momentum_history_does_not_order_or_write_a_peer():
+def test_momentum_history_does_not_order_and_writes_a_flat_peer():
     broker = FakeBroker()
     store = MemoryStore()
     yesterday = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
@@ -1929,7 +1962,12 @@ def test_momentum_history_does_not_order_or_write_a_peer():
     assert second["phase"] == "history"
     assert second["order"] is None
     assert broker.orders == []
-    assert not any(key.startswith("peers/") for key in store.data)
+    peer = store.load(peer_key("momentum"))
+    assert peer["strategy"] == "momentum"
+    assert peer["channel"] == 0
+    assert peer["held"] == 0
+    assert peer["target"] == 0
+    assert peer["pnl"] == 0
     saved = store.load(state_key("momentum", "acc-momentum"))
     assert [day["d"] for day in saved["days"]] == ["2026-09-28"]
     assert saved["ready"] is False
