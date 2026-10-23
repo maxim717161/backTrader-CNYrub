@@ -196,28 +196,26 @@ def parse_fill(payload: dict[str, object], fallback_id: str) -> FillReport:
     )
 
 
-# Глубина, которую отдаёт API Т-Инвестиций. Половина считается по всему этому срезу.
-BOOK_DEPTH = 50
+# Один уровень. Половина считается только по лучшей цене, дальние уровни не складываются.
+BOOK_DEPTH = 1
 
 
 def book_lots(payload: dict[str, object], side: str) -> int:
-    """Сумма контрактов на одной стороне стакана. bids — покупка, asks — продажа."""
+    """Контракты на лучшей цене одной стороны. bids — покупка, asks — продажа."""
     rows = payload.get(side) or []
-    if not isinstance(rows, list):
+    if not isinstance(rows, list) or not rows:
         return 0
-    total = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        try:
-            total += int(row.get("quantity") or 0)
-        except (TypeError, ValueError):
-            continue
-    return max(total, 0)
+    top = rows[0]
+    if not isinstance(top, dict):
+        return 0
+    try:
+        return max(int(top.get("quantity") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def half_book(lots: int) -> int:
-    """Не больше половины видимых контрактов. Один контракт половину не даёт."""
+    """Не больше половины контрактов на лучшей цене. Один контракт половину не даёт."""
     return max(lots, 0) // 2
 
 
@@ -304,7 +302,7 @@ class TinkoffClient:
         return quotation(payload.get("totalAmountPortfolio"))
 
     def order_book(self, uid: str) -> dict[str, object]:
-        """Видимый стакан фьючерса. Глубина — максимум, который отдаёт API."""
+        """Лучшая цена фьючерса. Глубина один уровень."""
         payload = self._call(
             "MarketDataService",
             "GetOrderBook",

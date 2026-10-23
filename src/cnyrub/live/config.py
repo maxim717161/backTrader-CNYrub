@@ -349,7 +349,7 @@ def _unwrap_timer(loaded: dict[str, object]) -> dict[str, object]:
 
 
 def _fill_per_minute(value: object) -> int | None:
-    """Пусто и «авто» — половина стакана. 0 — пауза. Положительное — потолок минуты."""
+    """Пусто и «авто» — половина лучшей цены. 0 — пауза. Положительное — потолок минуты."""
     if value is None:
         return None
     if isinstance(value, bool):
