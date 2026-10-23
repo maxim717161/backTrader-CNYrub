@@ -9,9 +9,11 @@
 смотрит против, счёт только закрывается. Длинное окно не глушится коротким,
 пока в правиле включено «только старшее».
 
-Команда пишет trend.txt, trend_equity.csv и trend_equity.png: сумма восьми
-счетов без взаимодействия, с правилом «старшее, 2 дня, только плюс» и с
-правилом, которое этот прогон оставил.
+Команда по умолчанию пишет trend.txt, trend_equity.csv и trend_equity.png:
+сумма восьми счетов без взаимодействия, с общим правилом «четверо старших,
+1 день в плюсе» и с раздельными ролями. Мини-окна остаются на «старшее, 2 дня,
+только плюс», короткое окно — на четырёх старших. Средние и моментум
+подбираются отдельно. Сетка общего правила остаётся через --family grid.
 """
 
 from __future__ import annotations
@@ -35,7 +37,6 @@ from backtest import PARTS, WINDOWS, _money, _part_nets, _profit_factor, load_mi
 from consensus import (
     ADOPTED_RULE,
     NAMES,
-    ConsensusRule,
     OpenState,
     StrategyStats,
     _Drawdown,
@@ -82,6 +83,7 @@ class TrendSpec:
     block_momentum: bool = True
     min_channel: int = 0
     price_days: int = 0
+    voters: frozenset[str] | None = None
 
 
 def _spec(spec_id: str, title: str, **overrides: object) -> TrendSpec:
@@ -137,9 +139,66 @@ SPECS: tuple[TrendSpec, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class RoleRule:
+    """Запрет, который действует только на одну группу счетов."""
+
+    mode: str = "none"
+    quorum: int = 2
+    hold_days: int = 1
+    growing: str = "no"
+    slower_only: bool = True
+    profit: bool = True
+    exclusive: bool = True
+    momentum_votes: bool = True
+    min_channel: int = 0
+    price_days: int = 0
+    voters: frozenset[str] | None = None
+
+
+MINI = ("thirty", "fortyfive", "sixty")
+MEDIUM = ("m1760", "m2160")
+# Мини-окна: одно старшее окно два дня в плюсе. Короткое: четыре старших один день в плюсе.
+MINI_RULE = RoleRule("legacy")
+SHORT_RULE = RoleRule("quorum", quorum=4, hold_days=1, momentum_votes=True)
+LONG_RULE = RoleRule("none")
+
+
+@dataclass(frozen=True)
+class SplitSpec:
+    """Разные запреты для мини-окон, короткого, средних и моментума. Длинное не глушится."""
+
+    id: str
+    title: str
+    legend: str
+    roles: tuple[tuple[str, RoleRule], ...]
+    medium_id: str = "none"
+    momentum_id: str = "none"
+
+    def role(self, name: str) -> RoleRule:
+        for key, rule in self.roles:
+            if key == name:
+                return rule
+        raise KeyError(name)
+
+
+def split_spec(medium: RoleRule, momentum: RoleRule, spec_id: str, title: str, legend: str, medium_id: str, momentum_id: str) -> SplitSpec:
+    roles = tuple(
+        (name, rule)
+        for name, rule in (
+            *((name, MINI_RULE) for name in MINI),
+            ("short", SHORT_RULE),
+            ("long", LONG_RULE),
+            *((name, medium) for name in MEDIUM),
+            (MOMENTUM, momentum),
+        )
+    )
+    return SplitSpec(spec_id, title, legend, roles, medium_id, momentum_id)
+
+
 @dataclass
 class EightResult:
-    spec: TrendSpec
+    spec: TrendSpec | SplitSpec
     strategies: list[StrategyStats]
     combined_drawdown: float
     dates: list[date]
@@ -198,6 +257,8 @@ class _MomentumTape:
 def _peer_votes(state: OpenState, spec: TrendSpec, name: str, channel: int, price_sign: int) -> bool:
     """Эта чужая позиция входит в кворум для стратегии name."""
     if state.name == name:
+        return False
+    if spec.voters is not None and state.name not in spec.voters:
         return False
     if state.name == MOMENTUM:
         if not spec.momentum_votes:
@@ -278,6 +339,47 @@ def combine_veto(legacy: int, obvious: int) -> int:
     if block_short:
         return -1
     return 0
+
+
+def _as_quorum(role: RoleRule) -> TrendSpec:
+    return TrendSpec(
+        "role",
+        "role",
+        enabled=True,
+        quorum=role.quorum,
+        hold_days=role.hold_days,
+        growing=role.growing,
+        slower_only=role.slower_only,
+        profit=role.profit,
+        exclusive=role.exclusive,
+        momentum_votes=role.momentum_votes,
+        block_momentum=True,
+        min_channel=role.min_channel,
+        price_days=role.price_days,
+        voters=role.voters,
+    )
+
+
+def entry_veto(
+    name: str,
+    channel: int,
+    states: list[OpenState],
+    window_states: list[OpenState],
+    spec: TrendSpec | SplitSpec,
+    price_sign: int,
+) -> int:
+    """Запрет свежего входа этой стратегии. Для общего правила и для раздельных ролей."""
+    if isinstance(spec, TrendSpec):
+        legacy = veto_side(window_states, ADOPTED_RULE, name, channel) if spec.legacy and name != MOMENTUM else 0
+        return combine_veto(legacy, obvious_veto(states, spec, name, channel, price_sign))
+    role = spec.role(name)
+    if role.mode == "none":
+        return 0
+    if role.mode == "legacy":
+        return veto_side(window_states, ADOPTED_RULE, name, channel)
+    if role.mode != "quorum":
+        raise ValueError(f"неизвестный режим роли: {role.mode}")
+    return obvious_veto(states, _as_quorum(role), name, channel, price_sign)
 
 
 def apply_momentum_target(book: _FillBook, desired: int, veto: int) -> bool:
@@ -420,7 +522,6 @@ def run_eight(
     curve: list[float] = []
     if views is None:
         views = build_views(frames)
-    legacy_rule: ConsensusRule = ADOPTED_RULE
 
     for secid, frame in frames.items():
         prepared = views[secid]
@@ -465,12 +566,11 @@ def run_eight(
                 if state is not None:
                     states.append(state)
             window_states = [state for state in states if state.name != MOMENTUM]
-            price_sign = tape.price_sign(spec.price_days)
+            shared_sign = tape.price_sign(spec.price_days) if isinstance(spec, TrendSpec) else 0
             for name in NAMES:
                 book = books[name]
-                legacy = veto_side(window_states, legacy_rule, name, channels[name]) if spec.legacy else 0
-                obvious = obvious_veto(states, spec, name, channels[name], price_sign)
-                veto = combine_veto(legacy, obvious)
+                sign = tape.price_sign(spec.role(name).price_days) if isinstance(spec, SplitSpec) else shared_sign
+                veto = entry_veto(name, channels[name], states, window_states, spec, sign)
                 if veto:
                     veto_minutes[name] += 1
                 fresh_side = 1 if book.target > 0 else -1
@@ -490,9 +590,8 @@ def run_eight(
                     MOMENTUM_MARGIN,
                     MOMENTUM_LEVERAGE,
                 )
-                legacy = 0
-                obvious = obvious_veto(states, spec, MOMENTUM, 0, price_sign)
-                veto = combine_veto(legacy, obvious)
+                price_sign = tape.price_sign(spec.role(MOMENTUM).price_days) if isinstance(spec, SplitSpec) else shared_sign
+                veto = entry_veto(MOMENTUM, 0, states, window_states, spec, price_sign)
                 if veto:
                     veto_minutes[MOMENTUM] += 1
                 if apply_momentum_target(books[MOMENTUM], desired, veto):
@@ -725,6 +824,337 @@ def write_curve(results: list[EightResult], output: Path) -> Path:
     return output
 
 
+NONE_RULE = RoleRule("none")
+MEDIUM_OPTIONS: tuple[tuple[str, str, RoleRule], ...] = (
+    ("none", "сами", NONE_RULE),
+    ("leg", "старшее, 2 дня", RoleRule("legacy")),
+    ("q2-d0", "двое старших, плюс сразу", RoleRule("quorum", quorum=2, hold_days=0)),
+    ("q2-d1", "двое старших, 1 день", RoleRule("quorum", quorum=2, hold_days=1, momentum_votes=False)),
+    ("q2-d1-mom", "двое старших и моментум, 1 день", RoleRule("quorum", quorum=2, hold_days=1)),
+    ("q2-d2", "двое старших, 2 дня", RoleRule("quorum", quorum=2, hold_days=2, momentum_votes=False)),
+    ("q2-d2-mom", "двое старших и моментум, 2 дня", RoleRule("quorum", quorum=2, hold_days=2)),
+    ("long-d2", "только длинное, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False, voters=frozenset({"long"}))),
+    ("long-d5", "только длинное, 5 дней", RoleRule("quorum", quorum=1, hold_days=5, momentum_votes=False, voters=frozenset({"long"}))),
+    ("long-mom", "длинное и моментум, 1 день", RoleRule("quorum", quorum=2, hold_days=1, voters=frozenset({"long", MOMENTUM}))),
+    ("mom-d2", "только моментум, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, voters=frozenset({MOMENTUM}))),
+    ("px20", "двое старших и ход 20 дней", RoleRule("quorum", quorum=2, hold_days=1, price_days=20)),
+)
+MOMENTUM_OPTIONS: tuple[tuple[str, str, RoleRule], ...] = (
+    ("none", "сам", NONE_RULE),
+    ("long-d1", "длинное, 1 день", RoleRule("quorum", quorum=1, hold_days=1, momentum_votes=False, voters=frozenset({"long"}))),
+    ("long-d2", "длинное, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False, voters=frozenset({"long"}))),
+    ("long-d5", "длинное, 5 дней", RoleRule("quorum", quorum=1, hold_days=5, momentum_votes=False, voters=frozenset({"long"}))),
+    ("swing-d1", "двое от 1760, 1 день", RoleRule("quorum", quorum=2, hold_days=1, min_channel=1760, momentum_votes=False)),
+    ("swing-d2", "двое от 1760, 2 дня", RoleRule("quorum", quorum=2, hold_days=2, min_channel=1760, momentum_votes=False)),
+    ("med-d1", "оба средних, 1 день", RoleRule("quorum", quorum=2, hold_days=1, slower_only=False, momentum_votes=False, voters=frozenset({"m1760", "m2160"}))),
+    ("med-d2", "оба средних, 2 дня", RoleRule("quorum", quorum=2, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"m1760", "m2160"}))),
+    ("from525-d2", "двое от 525, 2 дня", RoleRule("quorum", quorum=2, hold_days=2, min_channel=525, momentum_votes=False)),
+    ("short-d2", "короткое, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"short"}))),
+    ("px20-long", "длинное и ход 20 дней", RoleRule("quorum", quorum=1, hold_days=1, price_days=20, momentum_votes=False, voters=frozenset({"long"}))),
+    ("any-d2", "любое окно, 2 дня", RoleRule("legacy")),
+)
+
+
+def _named_option(table: tuple[tuple[str, str, RoleRule], ...], key: str) -> tuple[str, str, RoleRule]:
+    for item in table:
+        if item[0] == key:
+            return item
+    raise KeyError(key)
+
+
+def make_split(medium_id: str, momentum_id: str) -> SplitSpec:
+    """Мини-окна и короткое фиксированы. Меняются только средние и моментум."""
+    _, medium_label, medium = _named_option(MEDIUM_OPTIONS, medium_id)
+    _, momentum_label, momentum = _named_option(MOMENTUM_OPTIONS, momentum_id)
+    if medium_id == "none" and momentum_id == "none":
+        spec_id = "roles-fixed"
+        legend = "мини — 2 дня, короткое — четверо"
+    else:
+        spec_id = f"roles-{medium_id}-{momentum_id}"
+        legend = f"средние: {medium_label}; моментум: {momentum_label}"
+    title = f"мини 2 дня, короткое четверо; средние: {medium_label}; моментум: {momentum_label}"
+    return split_spec(medium, momentum, spec_id, title, legend, medium_id, momentum_id)
+
+
+def _role_safe(item: EightResult, base: EightResult, anchor: EightResult) -> bool:
+    """Длинное, оба средних и моментум не хуже опоры, где у них ещё нет своего запрета."""
+    names = _by_name(item)
+    anchor_names = _by_name(anchor)
+    if names["long"].net < _by_name(base)["long"].net - 0.5:
+        return False
+    for name in (*MEDIUM, MOMENTUM):
+        if names[name].net < anchor_names[name].net - 0.5:
+            return False
+    return True
+
+
+def _role_rank(item: EightResult, base: EightResult) -> tuple[int, float, float]:
+    return (-_weaker_parts(item, base), item.net, item.combined_drawdown)
+
+
+def choose_roles(results: list[EightResult]) -> EightResult:
+    """Раздельное правило: сумма выше, а средние и моментум не платят за чужую прибавку."""
+    base = next(item for item in results if item.spec.id == "base")
+    anchor = next(item for item in results if item.spec.id == "roles-fixed")
+    pool = [item for item in results if isinstance(item.spec, SplitSpec) and item.spec.id != "roles-fixed"]
+    eligible = [item for item in pool if _role_safe(item, base, anchor)]
+    if not eligible:
+        return anchor
+    best = max(eligible, key=lambda item: _role_rank(item, base))
+    if best.net <= anchor.net + 0.5:
+        return anchor
+    return best
+
+
+def _top_ids(runs: list[EightResult], base: EightResult, anchor: EightResult, field: str) -> list[str]:
+    safe = [item for item in runs if _role_safe(item, base, anchor)]
+    ordered = sorted(safe, key=lambda item: _role_rank(item, base), reverse=True)
+    found: list[str] = []
+    for item in ordered:
+        if not isinstance(item.spec, SplitSpec):
+            continue
+        ident = item.spec.medium_id if field == "medium_id" else item.spec.momentum_id
+        if ident not in found:
+            found.append(ident)
+        if len(found) == 3:
+            break
+    return found or ["none"]
+
+
+def _legend(spec: TrendSpec | SplitSpec) -> str:
+    if isinstance(spec, SplitSpec):
+        return spec.legend
+    return spec.title
+
+
+def report_roles(results: list[EightResult]) -> str:
+    """Сетка раздельных ролей и три линии графика."""
+    base = next(item for item in results if item.spec.id == "base")
+    legacy = next(item for item in results if item.spec.id == "legacy")
+    uniform = next(item for item in results if item.spec.id == "q4-d1")
+    anchor = next(item for item in results if item.spec.id == "roles-fixed")
+    chosen = choose_roles(results)
+    base_names = _by_name(base)
+    width = max(len(item.spec.title) for item in results)
+    lines = [
+        "Восемь счетов, каждый со 100 000 руб. Сумма старта "
+        f"{_money(START_SUM)} руб. Счета не складываются в один.",
+        "Мини-окна 30, 45 и 60: «старшее, 2 дня, только плюс». Одно более длинное окно,",
+        "которое уже два торговых дня в плюсе, не пускает их во вход против себя.",
+        "Короткое окно 525: «четверо старших, 1 день в плюсе». Это 1 760, 2 160, 12 420 и моментум.",
+        "Средние окна 1 760 и 2 160 подбираются отдельно. Моментум подбирается отдельно.",
+        "Длинное окно никто не глушит. Своя позиция против запрета закрывается и не переворачивается.",
+        "Правило годится, если длинное, оба средних и моментум не хуже прогона, где у средних",
+        "и моментума своего запрета ещё нет, и сумма восьми счетов от этого растёт.",
+        "",
+        f"{'ПРАВИЛО':<{width}} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'ФАКТОР':>7} {'ПРОСАДКА':>14}",
+    ]
+    for item in results:
+        mark = "  ←" if item.spec.id == chosen.spec.id else ""
+        lines.append(
+            f"{item.spec.title:<{width}} {len(item.trades):>7} {item.blocked_setups:>7} "
+            f"{_money(item.net):>14} {_signed(item.net - base.net):>14} "
+            f"{_factor(item):>7} {_money(item.combined_drawdown):>14}{mark}"
+        )
+    lines.extend(["", _roles_decision(base, legacy, uniform, anchor, chosen, results), ""])
+    lines.append("Части истории, сумма восьми счетов: " + "  ".join(f"{secids[0]}–{secids[-1]}" for secids in PARTS))
+    lines.append(f"{'ПРАВИЛО':<{width}} " + " ".join(f"{'Ч' + str(index):>12}" for index in range(1, 6)))
+    shown: list[EightResult] = []
+    seen: set[str] = set()
+    for item in (base, legacy, uniform, anchor, chosen):
+        if item.spec.id in seen:
+            continue
+        seen.add(item.spec.id)
+        shown.append(item)
+    for item in shown:
+        parts = _part_nets(item.trades)
+        lines.append(f"{item.spec.title:<{width}} " + " ".join(f"{_money(part):>12}" for part in parts))
+    for item in shown:
+        lines.extend(["", item.spec.title])
+        lines.append(
+            f"{'СТРАТЕГИЯ':<12} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'ПРОСАДКА':>14} {'СЧЁТ':>14}"
+        )
+        for stats in item.strategies:
+            lines.append(
+                f"{stats.name:<12} {len(stats.trades):>7} {stats.blocked_setups:>7} "
+                f"{_money(stats.net):>14} {_signed(stats.net - base_names[stats.name].net):>14} "
+                f"{_money(stats.drawdown):>14} {_money(stats.end_equity):>14}"
+            )
+    lines.append("")
+    lines.append("На графике три суммы: без взаимодействия, общее правило четырёх старших и раздельные роли.")
+    return "\n".join(lines)
+
+
+def _above_but_unsafe(results: list[EightResult], anchor: EightResult, base: EightResult, side: str) -> EightResult | None:
+    """Лучшая сумма на этой стороне, которая всё же делает хуже защищённый счёт."""
+    pool: list[EightResult] = []
+    for item in results:
+        spec = item.spec
+        if not isinstance(spec, SplitSpec) or spec.id == anchor.spec.id:
+            continue
+        medium_side = spec.momentum_id == "none" and spec.medium_id != "none"
+        momentum_side = spec.medium_id == "none" and spec.momentum_id != "none"
+        if side == "medium" and not medium_side:
+            continue
+        if side == "momentum" and not momentum_side:
+            continue
+        if item.net <= anchor.net + 0.5 or _role_safe(item, base, anchor):
+            continue
+        pool.append(item)
+    if not pool:
+        return None
+    return max(pool, key=lambda item: item.net)
+
+
+def _hurt_text(item: EightResult, anchor: EightResult) -> str:
+    names = _by_name(item)
+    anchor_names = _by_name(anchor)
+    hurt = [
+        name
+        for name in ("long", *MEDIUM, MOMENTUM)
+        if names[name].net < anchor_names[name].net - 0.5
+    ]
+    return ", ".join(f"{name} {_signed(names[name].net - anchor_names[name].net)}" for name in hurt)
+
+
+def _roles_decision(
+    base: EightResult,
+    legacy: EightResult,
+    uniform: EightResult,
+    anchor: EightResult,
+    chosen: EightResult,
+    results: list[EightResult],
+) -> str:
+    names = _by_name(chosen)
+    anchor_names = _by_name(anchor)
+    bits = [
+        f"Раздельные роли — «{chosen.spec.title}»: итог {_money(chosen.net)} руб., "
+        f"{_signed(chosen.net - base.net)} к базе без взаимодействия, "
+        f"{_signed(chosen.net - uniform.net)} к общему правилу четырёх старших, "
+        f"{_signed(chosen.net - legacy.net)} к общему «старшее, 2 дня».",
+        f"Против опоры, где средние и моментум ещё сами по себе: {_signed(chosen.net - anchor.net)}.",
+        "Счета к этой опоре: "
+        + ", ".join(
+            f"{name} {_signed(names[name].net - anchor_names[name].net)}"
+            for name in ("m1760", "m2160", MOMENTUM, "short", "thirty", "fortyfive", "sixty", "long")
+        )
+        + ".",
+        f"Частей слабее базы: {_weaker_parts(chosen, base)} из 5. "
+        f"Просадка суммы {_money(chosen.combined_drawdown)} руб.",
+    ]
+    if chosen.spec.id == anchor.spec.id:
+        bits.append("Отдельный запрет, который не ухудшает длинное, оба средних и моментум, сумму не поднял.")
+        for side, label in (("medium", "Средние"), ("momentum", "Моментум")):
+            rejected = _above_but_unsafe(results, anchor, base, side)
+            if rejected is None:
+                continue
+            bits.append(
+                f"{label}: выше опоры, но не взято, «{rejected.spec.title}», "
+                f"{_signed(rejected.net - anchor.net)}. Хуже {_hurt_text(rejected, anchor)}."
+            )
+    return " ".join(bits)
+
+
+def plot_roles(results: list[EightResult], output: Path) -> Path:
+    """Три линии: база, общее правило четырёх старших, раздельные роли."""
+    base = next(item for item in results if item.spec.id == "base")
+    uniform = next(item for item in results if item.spec.id == "q4-d1")
+    chosen = choose_roles(results)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig, (ax_equity, ax_gap) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(12, 7.2),
+        height_ratios=(3, 1.4),
+        layout="constrained",
+    )
+    dates = [pd.Timestamp(day) for day in base.dates]
+    series = (
+        (base, "#6b6258", 1.6),
+        (uniform, "#1f4e79", 1.6),
+        (chosen, "#9a3412", 1.8),
+    )
+    base_curve = np.asarray(base.curve, dtype=float)
+    seen: set[str] = set()
+    for item, color, width in series:
+        if item.spec.id in seen:
+            continue
+        seen.add(item.spec.id)
+        ax_equity.plot(dates, item.curve, color=color, linewidth=width, label=_legend(item.spec))
+        if item.spec.id != "base":
+            ax_gap.plot(dates, np.asarray(item.curve) - base_curve, color=color, linewidth=width, label=_legend(item.spec))
+    ax_gap.axhline(0.0, color="#6b6258", linewidth=0.8)
+    ax_equity.set_title("Сумма восьми счетов")
+    ax_equity.set_ylabel("руб.")
+    ax_gap.set_ylabel("к базе, руб.")
+    ax_gap.set_xlabel("день истекающего контракта")
+    ax_equity.legend(frameon=False, loc="upper left")
+    ax_equity.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f} млн"))
+    ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f} млн"))
+    ax_equity.xaxis.set_major_locator(mdates.YearLocator())
+    ax_equity.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.savefig(output, dpi=140)
+    plt.close(fig)
+    return output
+
+
+def write_roles_curve(results: list[EightResult], output: Path) -> Path:
+    base = next(item for item in results if item.spec.id == "base")
+    uniform = next(item for item in results if item.spec.id == "q4-d1")
+    chosen = choose_roles(results)
+    frame = pd.DataFrame(
+        {
+            "date": [day.isoformat() for day in base.dates],
+            "base": base.curve,
+            "uniform_q4": uniform.curve,
+            "roles": chosen.curve,
+        }
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output, index=False)
+    return output
+
+
+def run_role_study(
+    frames: dict[str, pd.DataFrame],
+    starts: dict[str, date],
+    views: dict[str, dict[str, pd.DataFrame]],
+) -> list[EightResult]:
+    """Сначала каждый запрет отдельно, потом крест трёх лучших средних и трёх лучших моментума."""
+    results: list[EightResult] = []
+
+    def run(spec: TrendSpec | SplitSpec) -> EightResult:
+        print(f"правило {spec.id}", flush=True)
+        item = run_eight(frames, spec, starts, views=views)
+        results.append(item)
+        return item
+
+    for spec_id in ("base", "legacy", "q4-d1"):
+        run(next(spec for spec in SPECS if spec.id == spec_id))
+    anchor = run(make_split("none", "none"))
+    base = results[0]
+    medium_runs = [anchor]
+    for medium_id, _, _ in MEDIUM_OPTIONS:
+        if medium_id == "none":
+            continue
+        medium_runs.append(run(make_split(medium_id, "none")))
+    momentum_runs = [anchor]
+    for momentum_id, _, _ in MOMENTUM_OPTIONS:
+        if momentum_id == "none":
+            continue
+        momentum_runs.append(run(make_split("none", momentum_id)))
+    top_medium = _top_ids(medium_runs, base, anchor, "medium_id")
+    top_momentum = _top_ids(momentum_runs, base, anchor, "momentum_id")
+    print(f"крест средние {top_medium} моментум {top_momentum}", flush=True)
+    for medium_id in top_medium:
+        for momentum_id in top_momentum:
+            if medium_id == "none" or momentum_id == "none":
+                continue
+            run(make_split(medium_id, momentum_id))
+    return results
+
+
 def specs_by_id(selected: str | None) -> tuple[TrendSpec, ...]:
     if not selected:
         return SPECS
@@ -747,22 +1177,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path("trend.txt"))
     parser.add_argument("--chart", type=Path, default=Path("trend_equity.png"))
     parser.add_argument("--csv", type=Path, default=Path("trend_equity.csv"))
-    parser.add_argument("--rules", help="Идентификаторы через запятую. base и legacy добавляются сами")
+    parser.add_argument("--family", choices=("roles", "grid"), default="roles")
+    parser.add_argument("--rules", help="Для сетки: идентификаторы через запятую. base и legacy добавляются сами")
     args = parser.parse_args(argv)
     frames = load_minutes(args.bars)
     starts = load_trade_starts(args.bars)
     print("окна", flush=True)
     views = build_views(frames)
-    chosen_specs = specs_by_id(args.rules)
-    results: list[EightResult] = []
-    for spec in chosen_specs:
-        print(f"правило {spec.id}", flush=True)
-        results.append(run_eight(frames, spec, starts, views=views))
-    text = report(results)
-    print(text)
-    args.output.write_text(text + "\n", encoding="utf-8")
-    plot_equity(results, args.chart)
-    write_curve(results, args.csv)
+    if args.family == "roles":
+        results = run_role_study(frames, starts, views)
+        text = report_roles(results)
+        args.output.write_text(text + "\n", encoding="utf-8")
+        print(text, flush=True)
+        plot_roles(results, args.chart)
+        write_roles_curve(results, args.csv)
+    else:
+        results = []
+        for spec in specs_by_id(args.rules):
+            print(f"правило {spec.id}", flush=True)
+            results.append(run_eight(frames, spec, starts, views=views))
+        text = report(results)
+        args.output.write_text(text + "\n", encoding="utf-8")
+        print(text, flush=True)
+        plot_equity(results, args.chart)
+        write_curve(results, args.csv)
     print(args.chart)
     return 0
 

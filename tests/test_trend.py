@@ -14,12 +14,18 @@ from trend import (
     TrendSpec,
     _MomentumTape,
     apply_momentum_target,
+    _roles_decision,
+    choose_roles,
     choose_spec,
     combine_veto,
+    entry_veto,
+    make_split,
     obvious_sources,
     obvious_veto,
     plot_equity,
+    plot_roles,
     run_eight,
+    write_roles_curve,
 )
 
 
@@ -147,7 +153,77 @@ def test_plot_writes_three_lines(tmp_path: Path):
     assert path.stat().st_size > 1000
 
 
-def test_eight_accounts_walk_a_short_contract():
+def test_role_chart_labels_the_split(tmp_path: Path):
+    from trend import EightResult
+
+    def result(spec: object, level: float) -> EightResult:
+        stats = StrategyStats("long", [], 0, 0, 0, level, 0, 100_000)
+        return EightResult(spec, [stats], 0, [date(2024, 1, 2), date(2024, 1, 3)], [level, level + 10])  # type: ignore[arg-type]
+
+    base = next(spec for spec in SPECS if spec.id == "base")
+    uniform = next(spec for spec in SPECS if spec.id == "q4-d1")
+    anchor = make_split("none", "none")
+    results = [result(base, 800_000), result(uniform, 810_000), result(anchor, 820_000)]
+    chart = tmp_path / "roles.png"
+    table = tmp_path / "roles.csv"
+    plot_roles(results, chart)
+    write_roles_curve(results, table)
+    assert chart.stat().st_size > 1000
+    assert "uniform_q4" in table.read_text(encoding="utf-8")
+
+
+def test_a_medium_rule_that_taxes_1760_stays_out_of_the_choice():
+    from trend import EightResult
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", "momentum")
+
+    def book(spec: object, nets: dict[str, float]) -> EightResult:
+        strategies = [
+            StrategyStats(name, [{"pnlcomm": nets[name], "secid": "CRM2"}], 0, 0, 0, 100_000 + nets[name], -1, 100_000)
+            for name in names
+        ]
+        return EightResult(spec, strategies, -10, [], [])  # type: ignore[arg-type]
+
+    flat = {name: 1_000.0 for name in names}
+    taxed = dict(flat)
+    taxed["m1760"] = 900.0
+    taxed["m2160"] = 1_200.0
+    base = next(spec for spec in SPECS if spec.id == "base")
+    legacy = next(spec for spec in SPECS if spec.id == "legacy")
+    uniform = next(spec for spec in SPECS if spec.id == "q4-d1")
+    anchor = make_split("none", "none")
+    results = [
+        book(base, flat),
+        book(legacy, flat),
+        book(uniform, flat),
+        book(anchor, flat),
+        book(make_split("mom-d2", "none"), taxed),
+    ]
+    assert choose_roles(results).spec.id == "roles-fixed"
+    text = _roles_decision(*results[:4], results[3], results)
+    assert "только моментум, 2 дня" in text
+    assert "m1760" in text
+
+
+def test_roles_keep_four_seniors_on_the_short_window_and_two_days_on_the_minis():
+    spec = make_split("none", "long-d2")
+    one_long = [_state("long", 12_420, -1, held_days=2)]
+    assert entry_veto("thirty", 30, one_long, one_long, spec, 0) == 1
+    assert entry_veto("fortyfive", 45, [_state("long", 12_420, -1, held_days=1)], [_state("long", 12_420, -1, held_days=1)], spec, 0) == 0
+    assert entry_veto("short", 525, one_long, one_long, spec, 0) == 0
+    four = [
+        _state("m1760", 1760, -1, held_days=1),
+        _state("m2160", 2160, -1, held_days=1),
+        _state("long", 12_420, -1, held_days=1),
+        _state("momentum", 0, -1, held_days=1),
+    ]
+    windows = [state for state in four if state.name != "momentum"]
+    assert entry_veto("short", 525, four, windows, spec, 0) == 1
+    assert entry_veto("m1760", 1760, four, windows, spec, 0) == 0
+    assert entry_veto("long", 12_420, four, windows, spec, 0) == 0
+    assert entry_veto("momentum", 0, four, windows, spec, 0) == 0
+    assert entry_veto("momentum", 0, one_long, one_long, spec, 0) == 1
+    assert entry_veto("momentum", 0, [_state("thirty", 30, -1, held_days=3)], [_state("thirty", 30, -1, held_days=3)], spec, 0) == 0
     index = pd.date_range("2024-01-08 10:00", periods=40, freq="min", tz="Europe/Moscow")
     frame = pd.DataFrame(
         {
