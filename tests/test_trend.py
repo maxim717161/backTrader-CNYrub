@@ -21,6 +21,8 @@ from trend import (
     entry_veto,
     kept_split,
     make_split,
+    sixty_spec,
+    RoleRule,
     plot_kept,
     obvious_sources,
     obvious_veto,
@@ -205,6 +207,65 @@ def test_a_medium_rule_that_taxes_1760_stays_out_of_the_choice():
     text = _roles_decision(*results[:4], results[3], results)
     assert "только моментум, 2 дня" in text
     assert "m1760" in text
+
+
+def test_sixty_choice_refuses_a_gain_that_taxes_the_other_minis():
+    from trend import EightResult, choose_sixty
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", "momentum")
+
+    def book(spec: object, nets: dict[str, float]) -> EightResult:
+        strategies = [
+            StrategyStats(name, [{"pnlcomm": nets[name], "secid": "CRM2"}], 0, 0, 0, 100_000 + nets[name], -1, 100_000)
+            for name in names
+        ]
+        return EightResult(spec, strategies, -10, [], [])  # type: ignore[arg-type]
+
+    flat = {name: 1_000.0 for name in names}
+    taxed = dict(flat)
+    taxed["sixty"] = 1_500.0
+    taxed["fortyfive"] = 700.0
+    safe = dict(flat)
+    safe["sixty"] = 1_200.0
+    base = next(spec for spec in SPECS if spec.id == "base")
+    anchor = sixty_spec("leg", "старшее, 2 дня", RoleRule("legacy"))
+    rich = sixty_spec("d1", "старшее, 1 день", RoleRule("quorum", quorum=1, hold_days=1, momentum_votes=False))
+    costly = sixty_spec("none", "само", RoleRule("none"))
+    results = [book(base, flat), book(anchor, flat), book(rich, safe), book(costly, taxed)]
+    assert choose_sixty(results).spec.id == "sixty-d1"
+
+
+def test_kept_book_blocks_sixty_as_soon_as_a_longer_window_is_in_profit():
+    spec = kept_split()
+    fresh = [_state("long", 12_420, -1, held_days=0)]
+    ripe = [_state("long", 12_420, -1, held_days=2)]
+    assert entry_veto("sixty", 60, fresh, fresh, spec, 0) == 1
+    assert entry_veto("thirty", 30, fresh, fresh, spec, 0) == 0
+    assert entry_veto("fortyfive", 45, ripe, ripe, spec, 0) == 1
+    losing = [_state("m1760", 1760, -1, held_days=0, pnl=-100.0)]
+    assert entry_veto("sixty", 60, losing, losing, spec, 0) == 0
+
+
+def test_sixty_rule_stays_on_sixty_and_leaves_the_other_roles():
+    alone = sixty_spec("none", "само", RoleRule("none"))
+    momentum = [_state("momentum", 0, -1, held_days=2)]
+    one_long = [_state("long", 12_420, -1, held_days=2)]
+    assert entry_veto("sixty", 60, one_long, one_long, alone, 0) == 0
+    assert entry_veto("thirty", 30, one_long, one_long, alone, 0) == 1
+    assert entry_veto("m2160", 2160, momentum, [], alone, 0) == 1
+    senior = [_state("sixty", 60, -1, held_days=2)]
+    assert entry_veto("fortyfive", 45, senior, senior, alone, 0) == 1
+    current = sixty_spec("leg", "старшее, 2 дня", RoleRule("legacy"))
+    assert entry_veto("sixty", 60, one_long, one_long, current, 0) == 1
+    only_long = sixty_spec(
+        "long-d2",
+        "только длинное",
+        RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False, voters=frozenset({"long"})),
+    )
+    short_only = [_state("short", 525, -1, held_days=2)]
+    assert entry_veto("sixty", 60, one_long, one_long, only_long, 0) == 1
+    assert entry_veto("sixty", 60, short_only, short_only, only_long, 0) == 0
+    assert entry_veto("thirty", 30, short_only, short_only, only_long, 0) == 1
 
 
 def test_only_2160_yields_when_momentum_is_two_days_in_profit():
