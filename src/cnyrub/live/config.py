@@ -214,17 +214,39 @@ class RunRequest:
     params: StrategyParams
 
 
+MOMENTUM = "momentum"
+
+
 def preset(strategy: str) -> StrategyParams:
     if strategy not in PRESETS:
-        raise ValueError("strategy должен быть short, long, thirty, fortyfive, sixty, m1760 или m2160")
+        raise ValueError("strategy должен быть short, long, thirty, fortyfive, sixty, m1760, m2160 или momentum")
     return PRESETS[strategy]
+
+
+def momentum_params() -> StrategyParams:
+    """Заглушка полей окна. Дневной моментум их не читает и в PRESETS не входит, поэтому запрет его не видит."""
+    return StrategyParams(
+        channel=0,
+        exit_channel=0,
+        stop_mult=None,
+        clock_cap=None,
+        size_mode="flat",
+        loss_bars=None,
+        risk_fraction=None,
+        stop_rub=None,
+        breakout_span=None,
+        scale_step=None,
+        scale_back=None,
+        scale_floor=0.5,
+        leverage=3.0,
+    )
 
 
 def parse_event(event: object) -> RunRequest:
     """Принять JSON параметров, конверт таймера или конверт HTTPS-вызова."""
     data = _payload(event)
     strategy = str(data.get("strategy") or "")
-    params = preset(strategy)
+    params = momentum_params() if strategy == MOMENTUM else preset(strategy)
     account_id = str(data.get("account_id") or "").strip()
     if not account_id:
         raise ValueError("нужен account_id")

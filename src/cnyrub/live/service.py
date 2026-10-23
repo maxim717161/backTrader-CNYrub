@@ -8,6 +8,7 @@
 индикаторов и десять сессий сверху, более старые минутки стираются.
 Свежий вход против старшего окна, которое уже два торговых дня в плюсе,
 снимается до заявки. Своя позиция, стоп и выход остаются.
+Моментум — восьмая стратегия на своём субсчёте: дневной знак, без запрета семи окон.
 
 Сколько контрактов менять за минуту решает fill_per_minute. Пустое значение —
 авто: не больше половины видимого стакана с той стороны, которую съест заявка.
@@ -32,8 +33,9 @@ from cnyrub.engine import (
     step_minute,
 )
 from cnyrub.live.broker import Candle, Instrument, book_lots, choose_front, half_book
-from cnyrub.live.config import RunRequest
+from cnyrub.live.config import MOMENTUM, RunRequest
 from cnyrub.live.indicators import bar_get, bar_levels
+from cnyrub.live.momentum import HISTORY_DAYS, absorb, fold_candle, sign_for_today, target_lots
 from cnyrub.live.state import StateStore, state_key
 from cnyrub.live.veto import cancel_fresh_entry, publish_peer, veto_source
 
@@ -204,7 +206,344 @@ def close_pnl(book: _FillBook, before: dict[str, object], signed: int) -> float 
     return gross - commission
 
 
+def run_momentum(request: RunRequest, broker, store: StateStore, now: datetime | None = None) -> dict[str, object]:
+    """Дневной моментум. Чужой запрет не читает и свой файл peers/ не пишет."""
+    moment = _moscow(now)
+    key = state_key(request.strategy, request.account_id)
+    state = store.load(key) or _empty_state(request)
+    result: dict[str, object] = {
+        "strategy": request.strategy,
+        "account_id": request.account_id,
+        "phase": "idle",
+        "halted": state.get("halted"),
+        "order": None,
+    }
+    if state.get("halted") and not request.reconcile:
+        result["phase"] = "halted"
+        return result
+
+    front, trade_from = _resolve_front(state, broker, moment.date())
+    result["secid"] = front.secid
+    adopted = _adopt_instrument(state, front, trade_from)
+    if adopted == "halt":
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            "контракт сменился, пока позиция ещё открыта",
+            None,
+            request.params,
+            request.strategy,
+            0,
+        )
+    if adopted == "reset":
+        state["days"] = []
+        state["today"] = None
+        state["sized_day"] = None
+
+    book = load_book(state.get("book") if isinstance(state.get("book"), dict) else None, front.secid, None)
+    if not state.get("ready"):
+        _pull_momentum_day(state, broker, front, moment.date())
+        days = list(state.get("days") or [])
+        if len(days) >= HISTORY_DAYS:
+            state["ready"] = True
+        elif int(state.get("history_walked") or 0) >= HISTORY_WALKS:
+            state["book"] = export_book(book)
+            return _halt(
+                state,
+                store,
+                key,
+                result,
+                "не хватает дней, чтобы собрать моментум",
+                book,
+                request.params,
+                request.strategy,
+                0,
+            )
+        state["book"] = export_book(book)
+        store.save(key, state)
+        result["phase"] = "history"
+        result["bars"] = len(days)
+        result["goal"] = HISTORY_DAYS
+        result["ready"] = bool(state.get("ready"))
+        return result
+
+    broker_lots = int(broker.futures_position(request.account_id, front.uid))
+    if request.reconcile:
+        _adopt_position(book, broker, request, front, broker_lots, [])
+        book.stop_dist = None
+        book.stop_px = None
+        state["halted"] = None
+        state["zero_fills"] = 0
+        state["book"] = export_book(book)
+        store.save(key, state)
+        result["phase"] = "reconciled"
+        result["held"] = book.held
+        result["halted"] = None
+        return result
+    if broker_lots != book.held:
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            f"позиция на счёте {broker_lots}, в книге {book.held}",
+            book,
+            request.params,
+            request.strategy,
+            0,
+        )
+
+    fresh = _momentum_fresh(state, broker, front.uid, moment)
+    if fresh is None:
+        store.save(key, state)
+        result["phase"] = "catchup"
+        result["held"] = book.held
+        return result
+    if not fresh:
+        result["phase"] = "idle"
+        result["held"] = book.held
+        result["target"] = book.target
+        return result
+
+    days = [day for day in list(state.get("days") or []) if isinstance(day, dict)]
+    today_bar = state.get("today") if isinstance(state.get("today"), dict) else None
+    days, today_bar = absorb(days, today_bar, fresh)
+    state["days"] = days
+    state["today"] = today_bar
+    last = fresh[-1]
+    local = last.time.astimezone(MSK)
+    if today_bar is not None and state.get("sized_day") != today_bar.get("d") and days:
+        margin = _margin(state, broker, front.uid, moment.date(), refresh=True)
+        if margin <= 0:
+            return _halt(
+                state,
+                store,
+                key,
+                result,
+                "биржа не вернула гарантийное обеспечение",
+                book,
+                request.params,
+                request.strategy,
+                0,
+            )
+        try:
+            book.equity = float(broker.equity(request.account_id))
+        except Exception:
+            book.equity = book.equity
+        book.stop_dist = None
+        book.stop_px = None
+        book.target = target_lots(sign_for_today(days), float(book.equity or 0.0), float(days[-1]["c"]), margin)
+        if book.target == 0 and book.held:
+            book.reason = "flat"
+        state["sized_day"] = today_bar.get("d")
+
+    before = export_book(book)
+    side = move_side(book, day=local.date(), last_day=front.lsttrade, opened=last.open, high=last.high, low=last.low)
+    try:
+        pace = pace_for(request, broker, front.uid, side)
+    except Exception:
+        result["phase"] = "book"
+        result["held"] = book.held
+        result["target"] = book.target
+        return result
+
+    def advance(limit: int) -> None:
+        step_minute(
+            book,
+            len(days),
+            opened=last.open,
+            high=last.high,
+            low=last.low,
+            close=last.close,
+            volume=last.volume,
+            day=local.date(),
+            next_day=following_day(local, front.lsttrade),
+            last_day=front.lsttrade,
+            prior_high=float("nan"),
+            prior_low=float("nan"),
+            prior_vol=float("nan"),
+            prior_range=float("nan"),
+            exit_high=float("nan"),
+            exit_low=float("nan"),
+            clock_vol=float("nan"),
+            entry_ready=0.0,
+            clearance=0.0,
+            cooldown=0,
+            clock_volume=False,
+            clock_cap=None,
+            size_mode="flat",
+            stop_mult=None,
+            loss_bars=None,
+            risk_fraction=None,
+            margin=0.0,
+            stop_rub=None,
+            breakout_span=None,
+            trade_from=trade_from,
+            trail=False,
+            fill_per_minute=limit,
+        )
+
+    advance(pace)
+    stamp = last.time.astimezone(MSK).isoformat()
+    signed = int(book.last_signed)
+    if signed == 0:
+        state["last_bar"] = stamp
+        state["book"] = export_book(book)
+        store.save(key, state)
+        result["phase"] = "paused" if request.fill_per_minute == 0 else ("signal" if book.target != book.held else "hold")
+        result["held"] = book.held
+        result["target"] = book.target
+        result["bars"] = len(days)
+        return result
+
+    order_id = make_order_id(request.strategy, last.time)
+    try:
+        report = broker.market_order(request.account_id, front.uid, signed, order_id)
+    except Exception:
+        restore_book(book, before)
+        state["last_bar"] = stamp
+        return _halt(state, store, key, result, "заявка не подтверждена", book, request.params, request.strategy, 0)
+    wanted = abs(signed)
+    if report.executed > wanted:
+        restore_book(book, before)
+        state["last_bar"] = stamp
+        return _halt(
+            state,
+            store,
+            key,
+            result,
+            f"исполнено больше заявленного: {report.executed} из {wanted}",
+            book,
+            request.params,
+            request.strategy,
+            0,
+        )
+    if report.executed <= 0:
+        restore_book(book, before)
+        misses = int(state.get("zero_fills") or 0) + 1
+        state["zero_fills"] = misses
+        if misses >= ZERO_FILL_LIMIT:
+            state["last_bar"] = stamp
+            return _halt(
+                state,
+                store,
+                key,
+                result,
+                f"заявка не исполнена {misses} раз подряд",
+                book,
+                request.params,
+                request.strategy,
+                0,
+            )
+        state["book"] = export_book(book)
+        store.save(key, state)
+        result["phase"] = "unfilled"
+        result["unfilled"] = misses
+        result["held"] = book.held
+        result["target"] = book.target
+        return result
+    state["zero_fills"] = 0
+    if report.executed < wanted:
+        restore_book(book, before)
+        advance(report.executed)
+        signed = int(book.last_signed)
+    price = fill_price(report.price, last.close)
+    reprice_fill(book, before, last.close, price)
+    state["last_bar"] = stamp
+    state["book"] = export_book(book)
+    store.save(key, state)
+    result["phase"] = "order"
+    result["held"] = book.held
+    result["target"] = book.target
+    result["bars"] = len(days)
+    result["order"] = {
+        "id": order_id,
+        "signed": signed,
+        "requested": wanted,
+        "executed": report.executed,
+        "price": price,
+        "time": local.strftime("%Y-%m-%d %H:%M"),
+        "reason": order_reason(book, before, signed),
+    }
+    pnl = close_pnl(book, before, signed)
+    if pnl is not None:
+        result["order"]["pnl"] = pnl
+    return result
+
+
+def _pull_momentum_day(state: dict[str, object], broker, front: Instrument, today: date) -> None:
+    """Один прошедший день в дневную свечу. Сегодняшняя сессия остаётся незакрытой."""
+    walked = int(state.get("history_walked") or 0)
+    if walked >= HISTORY_WALKS:
+        return
+    raw = state.get("history_before")
+    before = date.fromisoformat(raw) if isinstance(raw, str) else today + timedelta(days=1)
+    day = before - timedelta(days=1)
+    start = datetime.combine(day, time.min, tzinfo=MSK)
+    end = datetime.combine(before, time.min, tzinfo=MSK)
+    candles = [
+        candle
+        for candle in broker.candles(front.uid, start, end)
+        if start <= candle.time.astimezone(MSK) < end and _weekday(candle.time)
+    ]
+    candles.sort(key=lambda candle: candle.time)
+    state["history_before"] = day.isoformat()
+    state["history_walked"] = walked + 1
+    if not candles:
+        return
+    folded: dict[str, object] | None = None
+    for candle in candles:
+        local = candle.time.astimezone(MSK)
+        folded = fold_candle(folded, local, candle.open, candle.high, candle.low, candle.close, candle.volume)
+    if folded is None:
+        return
+    if day < today:
+        days = [item for item in list(state.get("days") or []) if isinstance(item, dict)]
+        days.append(folded)
+        days.sort(key=lambda item: str(item["d"]))
+        state["days"] = days
+    else:
+        state["today"] = folded
+    state["last_bar"] = candles[-1].time.astimezone(MSK).isoformat()
+
+
+def _momentum_fresh(state: dict[str, object], broker, uid: str, now: datetime) -> list[Candle] | None:
+    """Новые минутки после last_bar. Минутную историю в бакет не кладём."""
+    cursor = _sync_cursor(state, [], now) - timedelta(minutes=2)
+    downloaded: list[Candle] = []
+    for _ in range(CATCHUP_DAYS):
+        if cursor >= now - timedelta(minutes=1):
+            break
+        end = cursor + timedelta(days=1)
+        if end > now:
+            end = now
+        if end <= cursor:
+            break
+        batch = broker.candles(uid, cursor, end)
+        downloaded.extend(
+            candle
+            for candle in batch
+            if cursor <= candle.time.astimezone(MSK) < end and _weekday(candle.time)
+        )
+        cursor = end
+    if _sync_is_stale(state, cursor, now) or cursor < now - timedelta(minutes=2):
+        state["sync_from"] = cursor.isoformat()
+    if cursor < now - timedelta(minutes=2):
+        return None
+    last_raw = state.get("last_bar")
+    if not isinstance(last_raw, str):
+        return []
+    last_dt = datetime.fromisoformat(last_raw)
+    pending = [candle for candle in downloaded if candle.time.astimezone(MSK) > last_dt]
+    pending.sort(key=lambda candle: candle.time)
+    return pending
+
+
 def run_minute(request: RunRequest, broker, store: StateStore, now: datetime | None = None) -> dict[str, object]:
+    if request.strategy == MOMENTUM:
+        return run_momentum(request, broker, store, now)
     moment = _moscow(now)
     key = state_key(request.strategy, request.account_id)
     state = store.load(key) or _empty_state(request)
