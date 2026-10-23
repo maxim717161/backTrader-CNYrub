@@ -16,6 +16,7 @@ import pytest
 from backtest import WINDOWS, channel_view
 from cnyrub.engine import COMMISSION, _FillBook, export_book, reprice_fill, step_minute
 from cnyrub.live.broker import (
+    BOOK_DEPTH,
     TinkoffClient,
     FillReport,
     Instrument,
@@ -623,7 +624,9 @@ def test_api_error_text_prefers_the_exchange_message():
         "instrument not available for trading"
     )
     assert api_error_text(400, "") == "HTTP 400"
-    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 10
+    assert BOOK_DEPTH == 1
+    assert book_lots({"asks": [{"quantity": "3"}, {"quantity": "7"}]}, "asks") == 3
+    assert book_lots({"asks": [{"quantity": "нет"}, {"quantity": "7"}]}, "asks") == 0
     assert book_lots({"asks": []}, "bids") == 0
     assert half_book(10) == 5
     assert half_book(1) == 0
@@ -1714,6 +1717,7 @@ def test_momentum_sign_matches_the_chosen_account_where_the_window_fits():
     """Живой знак совпадает с выбранным счётом, пока окну хватает пяти дней до конца ряда."""
     import numpy as np
 
+    pytest.importorskip("research.cr_momentum")
     from research.cr_momentum import Series
     from research.cr_momentum_params import chosen_account_position
     from cnyrub.live.momentum import HISTORY_DAYS, HOLD, LOOKBACK, sign_for_today
