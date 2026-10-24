@@ -18,8 +18,10 @@ from trend import (
     choose_roles,
     choose_spec,
     combine_veto,
+    choose_fortyfive,
     choose_momentum,
     entry_veto,
+    fortyfive_spec,
     kept_split,
     make_split,
     m1760_spec,
@@ -396,6 +398,76 @@ def test_roles_keep_four_seniors_on_the_short_window_and_two_days_on_the_minis()
     assert sum(stats.cash for stats in result.strategies) == pytest.approx(START_SUM)
     assert result.curve
     assert result.dates[0] == date(2024, 1, 8)
+
+
+def test_fortyfive_rule_stays_on_fortyfive_and_leaves_1760_free():
+    spec = fortyfive_spec(
+        "d0",
+        "старшее, плюс сразу",
+        RoleRule("quorum", quorum=1, hold_days=0, momentum_votes=False),
+    )
+    fresh = [_state("long", 12_420, -1, held_days=0)]
+    ripe = [_state("long", 12_420, -1, held_days=2)]
+    only_sixty = [_state("sixty", 60, -1, held_days=0)]
+    assert spec.role("m1760").mode == "none"
+    assert spec.role("momentum").mode == "none"
+    assert spec.role("thirty").mode == "legacy"
+    assert spec.role("sixty").hold_days == 0
+    assert entry_veto("fortyfive", 45, fresh, fresh, spec, 0) == 1
+    assert entry_veto("thirty", 30, fresh, fresh, spec, 0) == 0
+    assert entry_veto("thirty", 30, ripe, ripe, spec, 0) == 1
+    assert entry_veto("sixty", 60, fresh, fresh, spec, 0) == 1
+    assert entry_veto("m1760", 1760, ripe, ripe, spec, 0) == 0
+    assert entry_veto("momentum", 0, ripe, ripe, spec, 0) == 0
+    leg = fortyfive_spec("leg", "старшее, 2 дня", RoleRule("legacy"))
+    assert entry_veto("fortyfive", 45, fresh, fresh, leg, 0) == 0
+    assert entry_veto("fortyfive", 45, ripe, ripe, leg, 0) == 1
+    nearest = fortyfive_spec(
+        "sixty-d0",
+        "только 60, плюс сразу",
+        RoleRule("quorum", quorum=1, hold_days=0, slower_only=False, momentum_votes=False, voters=frozenset({"sixty"})),
+    )
+    assert entry_veto("fortyfive", 45, fresh, fresh, nearest, 0) == 0
+    assert entry_veto("fortyfive", 45, only_sixty, only_sixty, nearest, 0) == 1
+
+
+def test_fortyfive_choice_refuses_a_gain_that_taxes_thirty():
+    from trend import EightResult
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", "momentum")
+
+    def book(spec: object, nets: dict[str, float]) -> EightResult:
+        strategies = [
+            StrategyStats(name, [{"pnlcomm": nets[name], "secid": "CRM2"}], 0, 0, 0, 100_000 + nets[name], -1, 100_000)
+            for name in names
+        ]
+        return EightResult(spec, strategies, -10, [], [])  # type: ignore[arg-type]
+
+    flat = {name: 1_000.0 for name in names}
+    taxed = dict(flat)
+    taxed["fortyfive"] = 2_000.0
+    taxed["thirty"] = 500.0
+    safe = dict(flat)
+    safe["fortyfive"] = 1_400.0
+    shorter = dict(flat)
+    shorter["fortyfive"] = 3_000.0
+    base = next(spec for spec in SPECS if spec.id == "base")
+    anchor = fortyfive_spec("leg", "старшее, 2 дня", RoleRule("legacy"))
+    rich = fortyfive_spec("d0", "плюс сразу", RoleRule("quorum", quorum=1, hold_days=0, momentum_votes=False))
+    costly = fortyfive_spec("none", "само", RoleRule("none"))
+    mini = fortyfive_spec(
+        "thirty-d2",
+        "только 30",
+        RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, voters=frozenset({"thirty"})),
+    )
+    results = [
+        book(base, flat),
+        book(anchor, flat),
+        book(rich, safe),
+        book(costly, taxed),
+        book(mini, shorter),
+    ]
+    assert choose_fortyfive(results).spec.id == "f45-d0"
 
 
 def test_momentum_rule_leaves_1760_free_and_blocks_only_momentum():
