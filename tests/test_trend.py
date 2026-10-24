@@ -498,6 +498,23 @@ def test_fortyfive_choice_refuses_a_gain_that_taxes_thirty():
     assert choose_fortyfive(results).spec.id == "f45-d0"
 
 
+def test_backtest_default_uses_the_current_roles():
+    from backtest import adopted_specs
+
+    base, book = adopted_specs()
+    assert base.id == "base"
+    assert book.role("thirty").mode == "legacy"
+    assert book.role("fortyfive").voters == frozenset({"m1760"})
+    assert book.role("fortyfive").hold_days == 2
+    assert book.role("sixty").hold_days == 0
+    assert book.role("short").quorum == 4
+    assert book.role("m1760").mode == "none"
+    assert book.role("m2160").voters == frozenset({"momentum"})
+    assert book.role("m2160").hold_days == 2
+    assert book.role("momentum").mode == "none"
+    assert book.role("long").mode == "none"
+
+
 def test_kept_fortyfive_yields_only_to_1760_after_two_days():
     spec = kept_split()
     wide = [_state("m1760", 1760, -1, held_days=2)]

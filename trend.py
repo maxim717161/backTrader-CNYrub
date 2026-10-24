@@ -2945,6 +2945,40 @@ def write_sum_curve(results: list[EightResult], output: Path) -> Path:
     return output
 
 
+def report_adopted(results: list[EightResult]) -> str:
+    """Что печатает python backtest.py: база и текущие роли."""
+    base = _pick(results, "base")
+    kept = _pick(results, "roles-m2160-mom2")
+    base_names = _by_name(base)
+    names = _by_name(kept)
+    lines = [
+        "Восемь счетов, по 100 000 руб. Счета не складываются в один.",
+        "Окно 30: «старшее, 2 дня, только плюс». Окно 45 слушает только 1 760 два дня в плюсе.",
+        "Окно 60: «старшее, плюс сразу». Короткое: четверо старших, 1 день в плюсе.",
+        "Окно 2 160 уступает моментуму после двух дней в плюсе.",
+        "Окно 1 760, длинное окно и моментум без своего запрета.",
+        "",
+        f"Без взаимодействия: {_money(base.net)} руб., просадка {_money(base.combined_drawdown)}.",
+        f"Текущие роли: {_money(kept.net)} руб., {_signed(kept.net - base.net)} к базе, "
+        f"просадка {_money(kept.combined_drawdown)}.",
+        "",
+        f"{'СЧЁТ':<12} {'СДЕЛОК':>7} {'ЗАПРЕТ':>7} {'ИТОГ':>14} {'К БАЗЕ':>14} {'ПРОСАДКА':>14}",
+    ]
+    for name in ("thirty", "fortyfive", "sixty", "short", "m1760", "m2160", MOMENTUM, "long"):
+        stats = names[name]
+        lines.append(
+            f"{name:<12} {len(stats.trades):>7} {stats.blocked_setups:>7} "
+            f"{_money(stats.net):>14} {_signed(stats.net - base_names[name].net):>14} "
+            f"{_money(stats.drawdown):>14}"
+        )
+    lines.append("")
+    lines.append(
+        "Общее «старшее, 2 дня, только плюс» остаётся в consensus.py. "
+        "Живой счёт его пока и применяет."
+    )
+    return "\n".join(lines)
+
+
 def report_sum(results: list[EightResult]) -> str:
     """Короткая подпись к графику суммы восьми счетов."""
     base = _pick(results, "base")

@@ -45,6 +45,15 @@
 Нулевой медианный диапазон вход не открывает. Счёт 100 000 руб., плечо 5.
 Окно 2 160 минут устроено так же, но потолок громкости — восемь медиан
 и плечо 4.
+
+Команда без флагов считает восемь счетов: семь окон и моментум, каждый
+со 100 000 руб. Рядом печатаются прогон без взаимодействия и текущие роли.
+Окно 30 слушает старшее два дня в плюсе. Окно 45 слушает только 1 760 два
+дня в плюсе. Окно 60 слушает старшее сразу, моментум не голосует. Короткое
+окно слушает четверых старших один день в плюсе. Окно 2 160 слушает моментум
+два дня в плюсе. Окно 1 760, длинное окно и моментум без своего запрета.
+Общее правило двух дней остаётся в consensus.py. `python backtest.py --solo`
+считает семь окон по отдельности.
 """
 
 from __future__ import annotations
@@ -1455,17 +1464,25 @@ def _exit_decision(
     return coarse + " Рабочие выходы после более широкой проверки: " + locked + "."
 
 
-def _run_adopted(frames: dict[str, pd.DataFrame], starts: dict[str, date]) -> int:
-    """Семь счетов со стартом 100 000 руб. и запретом «старшее, 2 дня, только плюс»."""
-    from consensus import ADOPTED_RULE, RULES, build_views, report as consensus_report, run_consensus
+def adopted_specs():
+    """Прогон по умолчанию: без взаимодействия и текущие роли восьми счетов."""
+    from trend import SPECS, kept_split
 
-    base = next(rule for rule in RULES if rule.id == "base")
+    base = next(spec for spec in SPECS if spec.id == "base")
+    return (base, kept_split())
+
+
+def _run_adopted(frames: dict[str, pd.DataFrame], starts: dict[str, date]) -> int:
+    """Восемь счетов со стартом 100 000 руб. и ролями из исследования."""
+    from consensus import build_views
+    from trend import report_adopted, run_eight
+
     views = build_views(frames)
     results = []
-    for rule in (base, ADOPTED_RULE):
-        print(f"правило {rule.id}", flush=True)
-        results.append(run_consensus(frames, rule, starts, views=views))
-    print(consensus_report(results))
+    for spec in adopted_specs():
+        print(f"правило {spec.id}", flush=True)
+        results.append(run_eight(frames, spec, starts, views=views))
+    print(report_adopted(results))
     return 0
 
 
