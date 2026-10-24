@@ -2974,7 +2974,7 @@ def report_adopted(results: list[EightResult]) -> str:
     lines.append("")
     lines.append(
         "Общее «старшее, 2 дня, только плюс» остаётся в consensus.py. "
-        "Живой счёт его пока и применяет."
+        "Живой счёт применяет эти роли."
     )
     return "\n".join(lines)
 
