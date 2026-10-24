@@ -9,10 +9,9 @@
 смотрит против, счёт только закрывается. Длинное окно не глушится коротким,
 пока в правиле включено «только старшее».
 
-Команда по умолчанию подбирает правило окна 30 и пишет trend.txt,
-trend_equity.csv и trend_equity.png. Остальные роли фиксированы: окно 45
-слушает только 1 760 два дня в плюсе, окно 60 на «плюс сразу», 1 760 и
-моментум без своего запрета. Сетка окна 45 — --family fortyfive, моментума —
+Команда по умолчанию рисует сумму восьми счетов: без взаимодействия,
+общее «старшее, 2 дня» и текущие роли. Сетка окна 30 — --family thirty,
+окна 45 — --family fortyfive, моментума —
 --family momentum, окно 1 760 — --family m1760, окно 60 — --family sixty,
 короткое сравнение принятых ролей — --family kept, полная сетка ролей —
 --family roles, сетка общего правила — --family grid.
@@ -2878,6 +2877,121 @@ def run_thirty_study(
     return results
 
 
+def plot_sum(results: list[EightResult], output: Path) -> Path:
+    """Сумма восьми счетов: без взаимодействия, общее правило двух дней и текущие роли."""
+    base = _pick(results, "base")
+    legacy = _pick(results, "legacy")
+    kept = _pick(results, "roles-m2160-mom2")
+    labels = {
+        "base": "без взаимодействия",
+        "legacy": "старшее, 2 дня, только плюс",
+        "roles-m2160-mom2": "текущие роли",
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig, (ax_equity, ax_gap) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(12, 7.2),
+        height_ratios=(3, 1.4),
+        layout="constrained",
+    )
+    dates = [pd.Timestamp(day) for day in base.dates]
+    series = (
+        (base, "#6b6258", 1.6),
+        (legacy, "#1f4e79", 1.6),
+        (kept, "#9a3412", 1.8),
+    )
+    base_curve = np.asarray(base.curve, dtype=float)
+    for item, color, width in series:
+        ax_equity.plot(dates, item.curve, color=color, linewidth=width, label=labels[item.spec.id])
+        if item.spec.id != "base":
+            ax_gap.plot(
+                dates,
+                np.asarray(item.curve) - base_curve,
+                color=color,
+                linewidth=width,
+                label=labels[item.spec.id],
+            )
+    ax_gap.axhline(0.0, color="#6b6258", linewidth=0.8)
+    ax_equity.set_title("Сумма восьми счетов")
+    ax_equity.set_ylabel("руб.")
+    ax_gap.set_ylabel("к базе без взаимодействия, руб.")
+    ax_gap.set_xlabel("день истекающего контракта")
+    ax_equity.legend(frameon=False, loc="upper left")
+    ax_equity.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f} млн"))
+    ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f} млн"))
+    ax_equity.xaxis.set_major_locator(mdates.YearLocator())
+    ax_equity.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.savefig(output, dpi=140)
+    plt.close(fig)
+    return output
+
+
+def write_sum_curve(results: list[EightResult], output: Path) -> Path:
+    base = _pick(results, "base")
+    legacy = _pick(results, "legacy")
+    kept = _pick(results, "roles-m2160-mom2")
+    frame = pd.DataFrame(
+        {
+            "date": [day.isoformat() for day in base.dates],
+            "base": base.curve,
+            "legacy": legacy.curve,
+            "roles": kept.curve,
+        }
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output, index=False)
+    return output
+
+
+def report_sum(results: list[EightResult]) -> str:
+    """Короткая подпись к графику суммы восьми счетов."""
+    base = _pick(results, "base")
+    legacy = _pick(results, "legacy")
+    kept = _pick(results, "roles-m2160-mom2")
+    names = _by_name(kept)
+    lines = [
+        "Сумма восьми счетов. Старт 800 000 руб., по 100 000 на счёт.",
+        "Серая линия — без взаимодействия. Синяя — общее «старшее, 2 дня, только плюс».",
+        "Рыжая — текущие роли: окно 30 на двух днях, окно 45 слушает только 1 760 два дня,",
+        "окно 60 на «плюс сразу», короткое — четверо старших один день,",
+        "окно 2 160 уступает моментуму после двух дней в плюсе.",
+        "Окно 1 760, длинное окно и моментум без своего запрета.",
+        "Нижняя панель — разница с прогоном без взаимодействия.",
+        "",
+        f"Без взаимодействия: {_money(base.net)} руб., просадка {_money(base.combined_drawdown)}.",
+        f"Старшее, 2 дня: {_money(legacy.net)} руб., {_signed(legacy.net - base.net)} к базе, "
+        f"просадка {_money(legacy.combined_drawdown)}.",
+        f"Текущие роли: {_money(kept.net)} руб., {_signed(kept.net - base.net)} к базе, "
+        f"{_signed(kept.net - legacy.net)} к правилу двух дней, просадка {_money(kept.combined_drawdown)}.",
+        "",
+        "Счета текущих ролей, итог поверх 100 000:",
+    ]
+    for name in ("thirty", "fortyfive", "sixty", "short", "m1760", "m2160", MOMENTUM, "long"):
+        stats = names[name]
+        lines.append(f"  {name:<12} {_money(stats.net):>12}  сделок {len(stats.trades):>4}  просадка {_money(stats.drawdown)}")
+    return "\n".join(lines)
+
+
+def run_sum(
+    frames: dict[str, pd.DataFrame],
+    starts: dict[str, date],
+    views: dict[str, dict[str, pd.DataFrame]],
+) -> list[EightResult]:
+    """База, общее правило двух дней и текущая книга."""
+    specs: list[TrendSpec | SplitSpec] = [
+        next(spec for spec in SPECS if spec.id == "base"),
+        next(spec for spec in SPECS if spec.id == "legacy"),
+        kept_split(),
+    ]
+    results: list[EightResult] = []
+    for spec in specs:
+        print(f"правило {spec.id}", flush=True)
+        results.append(run_eight(frames, spec, starts, views=views))
+    return results
+
+
 def specs_by_id(selected: str | None) -> tuple[TrendSpec, ...]:
     if not selected:
         return SPECS
@@ -2902,8 +3016,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv", type=Path, default=Path("trend_equity.csv"))
     parser.add_argument(
         "--family",
-        choices=("thirty", "fortyfive", "momentum", "m1760", "sixty", "kept", "roles", "grid"),
-        default="thirty",
+        choices=("sum", "thirty", "fortyfive", "momentum", "m1760", "sixty", "kept", "roles", "grid"),
+        default="sum",
     )
     parser.add_argument("--rules", help="Для сетки: идентификаторы через запятую. base и legacy добавляются сами")
     args = parser.parse_args(argv)
@@ -2911,7 +3025,14 @@ def main(argv: list[str] | None = None) -> int:
     starts = load_trade_starts(args.bars)
     print("окна", flush=True)
     views = build_views(frames)
-    if args.family == "thirty":
+    if args.family == "sum":
+        results = run_sum(frames, starts, views)
+        text = report_sum(results)
+        args.output.write_text(text + "\n", encoding="utf-8")
+        print(text, flush=True)
+        plot_sum(results, args.chart)
+        write_sum_curve(results, args.csv)
+    elif args.family == "thirty":
         results = run_thirty_study(frames, starts, views)
         text = report_thirty(results)
         args.output.write_text(text + "\n", encoding="utf-8")

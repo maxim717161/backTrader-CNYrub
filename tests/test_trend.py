@@ -341,6 +341,26 @@ def test_only_2160_yields_when_momentum_is_two_days_in_profit():
     assert entry_veto("short", 525, one_long, one_long, spec, 0) == 0
 
 
+def test_sum_chart_compares_the_current_book_with_no_interaction(tmp_path: Path):
+    from trend import EightResult, plot_sum, write_sum_curve
+
+    def result(spec: object, level: float) -> EightResult:
+        stats = StrategyStats("long", [], 0, 0, 0, level, 0, 100_000)
+        return EightResult(spec, [stats], 0, [date(2024, 1, 2), date(2024, 1, 3)], [level, level + 10])  # type: ignore[arg-type]
+
+    base = next(spec for spec in SPECS if spec.id == "base")
+    legacy = next(spec for spec in SPECS if spec.id == "legacy")
+    results = [result(base, 800_000), result(legacy, 810_000), result(kept_split(), 830_000)]
+    chart = tmp_path / "sum.png"
+    table = tmp_path / "sum.csv"
+    plot_sum(results, chart)
+    write_sum_curve(results, table)
+    text = table.read_text(encoding="utf-8")
+    assert chart.stat().st_size > 1000
+    assert "roles" in text
+    assert "legacy" in text
+
+
 def test_kept_chart_shows_the_2160_gap(tmp_path: Path):
     from trend import EightResult, write_kept_curve
 
