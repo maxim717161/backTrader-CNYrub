@@ -20,9 +20,11 @@ from trend import (
     combine_veto,
     choose_fortyfive,
     choose_momentum,
+    choose_thirty,
     entry_veto,
     fortyfive_spec,
     kept_split,
+    thirty_spec,
     make_split,
     m1760_spec,
     momentum_spec,
@@ -292,7 +294,12 @@ def test_kept_book_blocks_sixty_as_soon_as_a_longer_window_is_in_profit():
     ripe = [_state("long", 12_420, -1, held_days=2)]
     assert entry_veto("sixty", 60, fresh, fresh, spec, 0) == 1
     assert entry_veto("thirty", 30, fresh, fresh, spec, 0) == 0
-    assert entry_veto("fortyfive", 45, ripe, ripe, spec, 0) == 1
+    assert entry_veto("fortyfive", 45, ripe, ripe, spec, 0) == 0
+    wide = [_state("m1760", 1760, -1, held_days=2)]
+    fresh_wide = [_state("m1760", 1760, -1, held_days=1)]
+    assert entry_veto("fortyfive", 45, wide, wide, spec, 0) == 1
+    assert entry_veto("fortyfive", 45, fresh_wide, fresh_wide, spec, 0) == 0
+    assert entry_veto("thirty", 30, wide, wide, spec, 0) == 1
     losing = [_state("m1760", 1760, -1, held_days=0, pnl=-100.0)]
     assert entry_veto("sixty", 60, losing, losing, spec, 0) == 0
 
@@ -305,7 +312,8 @@ def test_sixty_rule_stays_on_sixty_and_leaves_the_other_roles():
     assert entry_veto("thirty", 30, one_long, one_long, alone, 0) == 1
     assert entry_veto("m2160", 2160, momentum, [], alone, 0) == 1
     senior = [_state("sixty", 60, -1, held_days=2)]
-    assert entry_veto("fortyfive", 45, senior, senior, alone, 0) == 1
+    assert entry_veto("fortyfive", 45, senior, senior, alone, 0) == 0
+    assert entry_veto("fortyfive", 45, [_state("m1760", 1760, -1, held_days=2)], [_state("m1760", 1760, -1, held_days=2)], alone, 0) == 1
     current = sixty_spec("leg", "старшее, 2 дня", RoleRule("legacy"))
     assert entry_veto("sixty", 60, one_long, one_long, current, 0) == 1
     only_long = sixty_spec(
@@ -468,6 +476,49 @@ def test_fortyfive_choice_refuses_a_gain_that_taxes_thirty():
         book(mini, shorter),
     ]
     assert choose_fortyfive(results).spec.id == "f45-d0"
+
+
+def test_kept_fortyfive_yields_only_to_1760_after_two_days():
+    spec = kept_split()
+    wide = [_state("m1760", 1760, -1, held_days=2)]
+    fresh = [_state("m1760", 1760, -1, held_days=1)]
+    other = [_state("sixty", 60, -1, held_days=2)]
+    assert spec.role("fortyfive").voters == frozenset({"m1760"})
+    assert spec.role("thirty").mode == "legacy"
+    assert entry_veto("fortyfive", 45, wide, wide, spec, 0) == 1
+    assert entry_veto("fortyfive", 45, fresh, fresh, spec, 0) == 0
+    assert entry_veto("fortyfive", 45, other, other, spec, 0) == 0
+    assert entry_veto("m1760", 1760, wide, wide, spec, 0) == 0
+
+
+def test_thirty_choice_refuses_a_gain_that_taxes_fortyfive():
+    from trend import EightResult
+
+    names = ("short", "long", "thirty", "fortyfive", "sixty", "m1760", "m2160", "momentum")
+
+    def book(spec: object, nets: dict[str, float]) -> EightResult:
+        strategies = [
+            StrategyStats(name, [{"pnlcomm": nets[name], "secid": "CRM2"}], 0, 0, 0, 100_000 + nets[name], -1, 100_000)
+            for name in names
+        ]
+        return EightResult(spec, strategies, -10, [], [])  # type: ignore[arg-type]
+
+    flat = {name: 1_000.0 for name in names}
+    taxed = dict(flat)
+    taxed["thirty"] = 2_000.0
+    taxed["fortyfive"] = 400.0
+    safe = dict(flat)
+    safe["thirty"] = 1_500.0
+    base = next(spec for spec in SPECS if spec.id == "base")
+    anchor = thirty_spec("leg", "старшее, 2 дня", RoleRule("legacy"))
+    rich = thirty_spec("d0", "плюс сразу", RoleRule("quorum", quorum=1, hold_days=0, momentum_votes=False))
+    costly = thirty_spec("none", "само", RoleRule("none"))
+    changed = thirty_spec("m1760-d2", "только 1760", RoleRule("quorum", quorum=1, hold_days=2, voters=frozenset({"m1760"})))
+    assert changed.role("fortyfive").voters == frozenset({"m1760"})
+    assert entry_veto("thirty", 30, [_state("m1760", 1760, -1, held_days=2)], [_state("m1760", 1760, -1, held_days=2)], changed, 0) == 1
+    assert entry_veto("thirty", 30, [_state("long", 12_420, -1, held_days=2)], [_state("long", 12_420, -1, held_days=2)], changed, 0) == 0
+    results = [book(base, flat), book(anchor, flat), book(rich, safe), book(costly, taxed)]
+    assert choose_thirty(results).spec.id == "t30-d0"
 
 
 def test_momentum_rule_leaves_1760_free_and_blocks_only_momentum():

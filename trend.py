@@ -9,9 +9,10 @@
 смотрит против, счёт только закрывается. Длинное окно не глушится коротким,
 пока в правиле включено «только старшее».
 
-Команда по умолчанию подбирает правило окна 45 и пишет trend.txt,
-trend_equity.csv и trend_equity.png. Остальные роли фиксированы: окно 1 760
-и моментум без своего запрета, окно 60 на «плюс сразу». Сетка моментума —
+Команда по умолчанию подбирает правило окна 30 и пишет trend.txt,
+trend_equity.csv и trend_equity.png. Остальные роли фиксированы: окно 45
+слушает только 1 760 два дня в плюсе, окно 60 на «плюс сразу», 1 760 и
+моментум без своего запрета. Сетка окна 45 — --family fortyfive, моментума —
 --family momentum, окно 1 760 — --family m1760, окно 60 — --family sixty,
 короткое сравнение принятых ролей — --family kept, полная сетка ролей —
 --family roles, сетка общего правила — --family grid.
@@ -193,14 +194,16 @@ def split_spec(
     momentum_id: str,
     m2160: RoleRule | None = None,
     sixty: RoleRule | None = None,
+    fortyfive: RoleRule | None = None,
 ) -> SplitSpec:
     rule_2160 = medium if m2160 is None else m2160
     rule_sixty = MINI_RULE if sixty is None else sixty
+    rule_45 = MINI_RULE if fortyfive is None else fortyfive
     roles = tuple(
         (name, rule)
         for name, rule in (
             ("thirty", MINI_RULE),
-            ("fortyfive", MINI_RULE),
+            ("fortyfive", rule_45),
             ("sixty", rule_sixty),
             ("short", SHORT_RULE),
             ("long", LONG_RULE),
@@ -214,6 +217,16 @@ def split_spec(
 
 # Окно 60: одно более длинное окно уже в плюсе. Два дня ждать не нужно. Моментум не голосует.
 SIXTY_RULE = RoleRule("quorum", quorum=1, hold_days=0, momentum_votes=False)
+# Окно 45 не входит против окна 1760, которое уже два дня в плюсе.
+FORTYFIVE_M1760_RULE = RoleRule(
+    "quorum",
+    quorum=1,
+    hold_days=2,
+    slower_only=False,
+    profit=True,
+    momentum_votes=False,
+    voters=frozenset({"m1760"}),
+)
 # Окно 2160 не покупает против моментума и не продаёт против него, если тот уже два дня в плюсе.
 M2160_MOMENTUM_RULE = RoleRule(
     "quorum",
@@ -226,17 +239,18 @@ M2160_MOMENTUM_RULE = RoleRule(
 
 
 def kept_split() -> SplitSpec:
-    """1760 без своего запрета. 2160 уступает моментуму, который два дня в плюсе."""
+    """45 слушает только 1760 два дня в плюсе. 1760 и моментум без своего запрета."""
     return split_spec(
         NONE_RULE,
         NONE_RULE,
         "roles-m2160-mom2",
-        "мини 2 дня, короткое четверо; 2160 — моментум 2 дня в плюсе",
-        "2160 — моментум 2 дня в плюсе",
+        "45 — только 1760, 2 дня; 60 — плюс сразу; 2160 — моментум 2 дня",
+        "45 — только 1760, 2 дня",
         "none",
         "none",
         m2160=M2160_MOMENTUM_RULE,
         sixty=SIXTY_RULE,
+        fortyfive=FORTYFIVE_M1760_RULE,
     )
 
 
@@ -251,6 +265,7 @@ class EightResult:
     m1760_blocks: dict[str, int] = field(default_factory=dict)
     momentum_blocks: dict[str, int] = field(default_factory=dict)
     fortyfive_blocks: dict[str, int] = field(default_factory=dict)
+    thirty_blocks: dict[str, int] = field(default_factory=dict)
 
     @property
     def trades(self) -> list[dict[str, object]]:
@@ -595,6 +610,7 @@ def run_eight(
     m1760_blocks: dict[str, int] = {}
     momentum_blocks: dict[str, int] = {}
     fortyfive_blocks: dict[str, int] = {}
+    thirty_blocks: dict[str, int] = {}
     drawdowns = {name: _Drawdown(cash[name]) for name in EIGHT}
     combined = _Drawdown(sum(cash.values()))
     curve_dates: list[date] = []
@@ -740,6 +756,7 @@ def run_eight(
                             "sixty": sixty_blocks,
                             "m1760": m1760_blocks,
                             "fortyfive": fortyfive_blocks,
+                            "thirty": thirty_blocks,
                         }.get(name)
                         if block_log is not None:
                             sources = _entry_sources(
@@ -821,6 +838,7 @@ def run_eight(
         m1760_blocks,
         momentum_blocks,
         fortyfive_blocks,
+        thirty_blocks,
     )
 
 
@@ -1107,6 +1125,41 @@ def fortyfive_spec(option_id: str, label: str, rule: RoleRule) -> SplitSpec:
     base = kept_split()
     roles = tuple((name, rule if name == "fortyfive" else old) for name, old in base.roles)
     return SplitSpec(f"f45-{option_id}", f"окно 45: {label}", f"45 — {label}", roles)
+
+
+# Окно 30. Сейчас «старшее, 2 дня, только плюс». Старше него все остальные окна.
+# Окно 45 в этой книге уже слушает только 1760.
+THIRTY_OPTIONS: tuple[tuple[str, str, RoleRule], ...] = (
+    ("none", "само, без запрета", NONE_RULE),
+    ("leg", "старшее, 2 дня, только плюс", RoleRule("legacy")),
+    ("d0", "старшее, плюс сразу", RoleRule("quorum", quorum=1, hold_days=0, momentum_votes=False)),
+    ("d1", "старшее, 1 день", RoleRule("quorum", quorum=1, hold_days=1, momentum_votes=False)),
+    ("d3", "старшее, 3 дня", RoleRule("quorum", quorum=1, hold_days=3, momentum_votes=False)),
+    ("d5", "старшее, 5 дней", RoleRule("quorum", quorum=1, hold_days=5, momentum_votes=False)),
+    ("soft", "старшее, 2 дня, плюс растёт", RoleRule("quorum", quorum=1, hold_days=2, growing="soft", momentum_votes=False)),
+    ("f45-d0", "только 45, плюс сразу", RoleRule("quorum", quorum=1, hold_days=0, slower_only=False, momentum_votes=False, voters=frozenset({"fortyfive"}))),
+    ("f45-d2", "только 45, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"fortyfive"}))),
+    ("sixty-d0", "только 60, плюс сразу", RoleRule("quorum", quorum=1, hold_days=0, slower_only=False, momentum_votes=False, voters=frozenset({"sixty"}))),
+    ("sixty-d2", "только 60, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"sixty"}))),
+    ("long-d2", "только длинное, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, momentum_votes=False, voters=frozenset({"long"}))),
+    ("long-d5", "только длинное, 5 дней", RoleRule("quorum", quorum=1, hold_days=5, momentum_votes=False, voters=frozenset({"long"}))),
+    ("m1760-d2", "только 1760, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"m1760"}))),
+    ("wide-d2", "только 2160, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"m2160"}))),
+    ("short-d2", "только короткое, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"short"}))),
+    ("swing-d2", "от 1760, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, min_channel=1760, momentum_votes=False)),
+    ("q2-d0", "двое старших, плюс сразу", RoleRule("quorum", quorum=2, hold_days=0, momentum_votes=False)),
+    ("q2-d2", "двое старших, 2 дня", RoleRule("quorum", quorum=2, hold_days=2, momentum_votes=False)),
+    ("mom-d2", "только моментум, 2 дня", RoleRule("quorum", quorum=1, hold_days=2, slower_only=False, voters=frozenset({MOMENTUM}))),
+    ("med-d2", "оба средних, 2 дня", RoleRule("quorum", quorum=2, hold_days=2, slower_only=False, momentum_votes=False, voters=frozenset({"m1760", "m2160"}))),
+    ("px20", "старшее, 2 дня и ход 20 дней", RoleRule("quorum", quorum=1, hold_days=2, price_days=20, momentum_votes=False)),
+)
+
+
+def thirty_spec(option_id: str, label: str, rule: RoleRule) -> SplitSpec:
+    """Те же роли, что сейчас, и другое правило только у окна 30. Окно 45 слушает 1760."""
+    base = kept_split()
+    roles = tuple((name, rule if name == "thirty" else old) for name, old in base.roles)
+    return SplitSpec(f"t30-{option_id}", f"окно 30: {label}", f"30 — {label}", roles)
 
 
 # Окно 1760. Старше него только 2160 и 12420. Моментум голосует лишь там, где это сказано.
@@ -2593,6 +2646,234 @@ def run_fortyfive_study(
     return results
 
 
+def _thirty_safe(item: EightResult, anchor: EightResult) -> bool:
+    """45, 60, короткое, длинное, оба средних и моментум не хуже текущего правила окна 30."""
+    names = _by_name(item)
+    anchor_names = _by_name(anchor)
+    guarded = ("fortyfive", "sixty", "short", "long", "m1760", "m2160", MOMENTUM)
+    return all(names[name].net >= anchor_names[name].net - 0.5 for name in guarded)
+
+
+def choose_thirty(results: list[EightResult]) -> EightResult:
+    """Правило окна 30, которое поднимает его счёт и не забирает деньги у остальных."""
+    anchor = _pick(results, "t30-leg")
+    pool = [item for item in results if item.spec.id.startswith("t30-") and item.spec.id != "t30-leg"]
+    eligible = [item for item in pool if _thirty_safe(item, anchor)]
+    if not eligible:
+        return anchor
+    best = max(eligible, key=lambda item: (_by_name(item)["thirty"].net, item.net, item.combined_drawdown))
+    if _by_name(best)["thirty"].net <= _by_name(anchor)["thirty"].net + 0.5:
+        return anchor
+    return best
+
+
+def _best_thirty(results: list[EightResult]) -> EightResult:
+    pool = [item for item in results if item.spec.id.startswith("t30-")]
+    return max(pool, key=lambda item: (_by_name(item)["thirty"].net, item.net))
+
+
+def report_thirty(results: list[EightResult]) -> str:
+    """Сетка правил только для окна 30. Окно 45 уже слушает только 1760."""
+    base = _pick(results, "base")
+    anchor = _pick(results, "t30-leg")
+    chosen = choose_thirty(results)
+    raw = _best_thirty(results)
+    base_names = _by_name(base)
+    anchor_names = _by_name(anchor)
+    rows = [item for item in results if item.spec.id == "base" or item.spec.id.startswith("t30-")]
+    rows.sort(key=lambda item: _by_name(item)["thirty"].net, reverse=True)
+    width = max(len(item.spec.title) for item in rows)
+    lines = [
+        "Окно 30 при уже выбранных ролях остальных счетов.",
+        "Сейчас у него «старшее, 2 дня, только плюс».",
+        "Окно 45 слушает только 1 760, уже два дня в плюсе. Окно 60: «старшее, плюс сразу».",
+        "Короткое 525: четверо старших, 1 день в плюсе. Окно 2 160 уступает моментуму после двух дней в плюсе.",
+        "Окно 1 760, длинное и моментум сами. Старше 30 все остальные окна.",
+        "Правило годится, если счёт 30 выше, а 45, 60, короткое, длинное, оба средних и моментум не хуже.",
+        "",
+        f"{'ПРАВИЛО':<{width}} {'СДЕЛКИ':>7} {'ЗАПРЕТ':>7} {'ИТОГ 30':>12} {'К СЕЙЧАС':>12} "
+        f"{'45':>10} {'60':>10} {'СУММА':>14} {'К СЕЙЧАС':>12} {'ПРОСАДКА':>12}",
+    ]
+    for item in rows:
+        names = _by_name(item)
+        window = names["thirty"]
+        mark = ""
+        if item.spec.id == chosen.spec.id:
+            mark += "  ←"
+        if item.spec.id == anchor.spec.id:
+            mark += "  сейчас"
+        if item.spec.id == raw.spec.id and raw.spec.id != chosen.spec.id:
+            mark += "  максимум 30"
+        lines.append(
+            f"{item.spec.title:<{width}} {len(window.trades):>7} {window.blocked_setups:>7} "
+            f"{_money(window.net):>12} {_signed(window.net - anchor_names['thirty'].net):>12} "
+            f"{_signed(names['fortyfive'].net - anchor_names['fortyfive'].net):>10} "
+            f"{_signed(names['sixty'].net - anchor_names['sixty'].net):>10} "
+            f"{_money(item.net):>14} {_signed(item.net - anchor.net):>12} "
+            f"{_money(window.drawdown):>12}{mark}"
+        )
+    chosen_names = _by_name(chosen)
+    raw_names = _by_name(raw)
+    watched = ("thirty", "fortyfive", "sixty", "short", "m1760", "m2160", MOMENTUM, "long")
+    lines.extend(
+        [
+            "",
+            f"Сейчас у окна 30 «старшее, 2 дня, только плюс»: итог {_money(anchor_names['thirty'].net)} руб., "
+            f"{_signed(anchor_names['thirty'].net - base_names['thirty'].net)} к базе без взаимодействия, "
+            f"сделок {len(anchor_names['thirty'].trades)}, запретов {anchor_names['thirty'].blocked_setups}.",
+            f"Взято «{chosen.spec.title}»: итог окна 30 {_money(chosen_names['thirty'].net)} руб., "
+            f"{_signed(chosen_names['thirty'].net - anchor_names['thirty'].net)} к текущему правилу, "
+            f"сумма восьми {_money(chosen.net)} руб., {_signed(chosen.net - anchor.net)} к этому прогону, "
+            f"{_signed(chosen.net - base.net)} к базе. "
+            f"Просадка суммы {_money(chosen.combined_drawdown)} руб.",
+            "Счета к текущему правилу окна 30: "
+            + ", ".join(f"{name} {_signed(chosen_names[name].net - anchor_names[name].net)}" for name in watched)
+            + ".",
+            f"Окно 45 на этой книге: {_money(anchor_names['fortyfive'].net)} руб.",
+        ]
+    )
+    if chosen.spec.id != anchor.spec.id:
+        lines.append(
+            "В книгу это правило не включено, пока оно отдельно не принято. "
+            f"Своя просадка окна 30 {_money(chosen_names['thirty'].drawdown)} руб. "
+            f"против {_money(anchor_names['thirty'].drawdown)} при правиле двух дней."
+        )
+    if raw.spec.id != chosen.spec.id:
+        lines.append(
+            f"Самый высокий итог окна 30 даёт «{raw.spec.title}»: {_money(raw_names['thirty'].net)} руб., "
+            f"{_signed(raw_names['thirty'].net - anchor_names['thirty'].net)} к текущему. "
+            f"Сумма {_signed(raw.net - anchor.net)}. "
+            + ", ".join(
+                f"{name} {_signed(raw_names[name].net - anchor_names[name].net)}"
+                for name in ("fortyfive", "sixty", "short", "m1760", "m2160", MOMENTUM, "long")
+                if abs(raw_names[name].net - anchor_names[name].net) >= 0.5
+            )
+            + ". Оно не взято: кто-то из остальных счетов слабее."
+        )
+    elif chosen.spec.id == anchor.spec.id:
+        lines.append("Отдельное правило, которое поднимает окно 30 и не забирает деньги у остальных, не нашлось.")
+    interesting = [anchor, chosen, raw]
+    seen: set[str] = set()
+    for item in interesting:
+        if item.spec.id in seen:
+            continue
+        seen.add(item.spec.id)
+        lines.extend(["", f"Кто глушит окно 30 при «{item.spec.title}»:"])
+        lines.extend(_block_lines(item.thirty_blocks))
+    lines.extend(["", "Части истории, только счёт окна 30:"])
+    lines.append(f"{'ПРАВИЛО':<{width}} " + " ".join(f"{'Ч' + str(index):>12}" for index in range(1, 6)))
+    unique: list[EightResult] = []
+    for item in (base, anchor, chosen, raw):
+        if item.spec.id not in {kept.spec.id for kept in unique}:
+            unique.append(item)
+    for item in unique:
+        parts = _part_nets(_by_name(item)["thirty"].trades)
+        lines.append(f"{item.spec.title:<{width}} " + " ".join(f"{_money(part):>12}" for part in parts))
+    lines.extend(["", "Части истории, сумма восьми счетов:"])
+    lines.append(f"{'ПРАВИЛО':<{width}} " + " ".join(f"{'Ч' + str(index):>12}" for index in range(1, 6)))
+    for item in unique:
+        parts = _part_nets(item.trades)
+        lines.append(f"{item.spec.title:<{width}} " + " ".join(f"{_money(part):>12}" for part in parts))
+    chart = _thirty_chart_item(results)
+    lines.append("")
+    lines.append(
+        "На графике сумма восьми счетов: без взаимодействия, текущее правило окна 30 "
+        f"и «{chart.spec.legend}»."
+    )
+    lines.append("Нижняя панель — разница этой линии с правилом двух дней у окна 30.")
+    return "\n".join(lines)
+
+
+def _thirty_chart_item(results: list[EightResult]) -> EightResult:
+    anchor = _pick(results, "t30-leg")
+    chosen = choose_thirty(results)
+    if chosen.spec.id != anchor.spec.id:
+        return chosen
+    return _best_thirty(results)
+
+
+def plot_thirty(results: list[EightResult], output: Path) -> Path:
+    """Три суммы. Нижняя панель — что меняет правило окна 30."""
+    base = _pick(results, "base")
+    anchor = _pick(results, "t30-leg")
+    shown = _thirty_chart_item(results)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig, (ax_equity, ax_gap) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(12, 7.2),
+        height_ratios=(3, 1.4),
+        layout="constrained",
+    )
+    dates = [pd.Timestamp(day) for day in base.dates]
+    series = (
+        (base, "#6b6258", 1.6),
+        (anchor, "#1f4e79", 1.6),
+        (shown, "#9a3412", 1.8),
+    )
+    anchor_curve = np.asarray(anchor.curve, dtype=float)
+    seen: set[str] = set()
+    for item, color, width in series:
+        if item.spec.id in seen:
+            continue
+        seen.add(item.spec.id)
+        ax_equity.plot(dates, item.curve, color=color, linewidth=width, label=_legend(item.spec))
+        if item.spec.id == shown.spec.id and item.spec.id != anchor.spec.id:
+            ax_gap.plot(
+                dates,
+                np.asarray(item.curve) - anchor_curve,
+                color=color,
+                linewidth=width,
+                label=_legend(item.spec),
+            )
+    ax_gap.axhline(0.0, color="#6b6258", linewidth=0.8)
+    ax_equity.set_title("Сумма восьми счетов")
+    ax_equity.set_ylabel("руб.")
+    ax_gap.set_ylabel("к правилу двух дней у 30, руб.")
+    ax_gap.set_xlabel("день истекающего контракта")
+    ax_equity.legend(frameon=False, loc="upper left")
+    ax_equity.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f} млн"))
+    ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value / 1_000_000:.2f} млн"))
+    ax_equity.xaxis.set_major_locator(mdates.YearLocator())
+    ax_equity.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.savefig(output, dpi=140)
+    plt.close(fig)
+    return output
+
+
+def write_thirty_curve(results: list[EightResult], output: Path) -> Path:
+    base = _pick(results, "base")
+    anchor = _pick(results, "t30-leg")
+    shown = _thirty_chart_item(results)
+    frame = pd.DataFrame(
+        {
+            "date": [day.isoformat() for day in base.dates],
+            "base": base.curve,
+            "thirty_now": anchor.curve,
+            "thirty_shown": shown.curve,
+        }
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output, index=False)
+    return output
+
+
+def run_thirty_study(
+    frames: dict[str, pd.DataFrame],
+    starts: dict[str, date],
+    views: dict[str, dict[str, pd.DataFrame]],
+) -> list[EightResult]:
+    """База без взаимодействия и каждое правило окна 30. Окно 45 уже слушает только 1760."""
+    results: list[EightResult] = []
+    specs: list[TrendSpec | SplitSpec] = [next(spec for spec in SPECS if spec.id == "base")]
+    specs.extend(thirty_spec(option_id, label, rule) for option_id, label, rule in THIRTY_OPTIONS)
+    for spec in specs:
+        print(f"правило {spec.id}", flush=True)
+        results.append(run_eight(frames, spec, starts, views=views))
+    return results
+
+
 def specs_by_id(selected: str | None) -> tuple[TrendSpec, ...]:
     if not selected:
         return SPECS
@@ -2617,8 +2898,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv", type=Path, default=Path("trend_equity.csv"))
     parser.add_argument(
         "--family",
-        choices=("fortyfive", "momentum", "m1760", "sixty", "kept", "roles", "grid"),
-        default="fortyfive",
+        choices=("thirty", "fortyfive", "momentum", "m1760", "sixty", "kept", "roles", "grid"),
+        default="thirty",
     )
     parser.add_argument("--rules", help="Для сетки: идентификаторы через запятую. base и legacy добавляются сами")
     args = parser.parse_args(argv)
@@ -2626,7 +2907,14 @@ def main(argv: list[str] | None = None) -> int:
     starts = load_trade_starts(args.bars)
     print("окна", flush=True)
     views = build_views(frames)
-    if args.family == "fortyfive":
+    if args.family == "thirty":
+        results = run_thirty_study(frames, starts, views)
+        text = report_thirty(results)
+        args.output.write_text(text + "\n", encoding="utf-8")
+        print(text, flush=True)
+        plot_thirty(results, args.chart)
+        write_thirty_curve(results, args.csv)
+    elif args.family == "fortyfive":
         results = run_fortyfive_study(frames, starts, views)
         text = report_fortyfive(results)
         args.output.write_text(text + "\n", encoding="utf-8")
