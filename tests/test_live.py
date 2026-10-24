@@ -1568,6 +1568,12 @@ def _peer(name: str, *, channel: int, held: int, days: int, pnl: float) -> dict[
     }
 
 
+def _save_short_seniors(store: MemoryStore, *, held: int, days: int, pnl: float) -> None:
+    """Четверо старших короткого окна: 1 760, 2 160, длинное и моментум."""
+    for name, channel in (("m1760", 1760), ("m2160", 2160), ("long", 12_420), ("momentum", 0)):
+        store.save(peer_key(name), _peer(name, channel=channel, held=held, days=days, pnl=pnl))
+
+
 def test_held_days_count_dates_after_the_entry_and_add_one_when_it_fell_out():
     bars = [
         {"t": "2026-09-28T10:00:00+03:00", "c": 10},
@@ -1588,33 +1594,117 @@ def test_only_a_longer_green_position_blocks_the_opposite_entry():
     book.target = 10
     store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
     store.save(peer_key("thirty"), _peer("thirty", channel=30, held=-8, days=2, pnl=1500))
-    assert veto_source(store, "short", 525, book) == "long"
-    book.target = -10
     assert veto_source(store, "short", 525, book) == ""
+    assert veto_source(store, "thirty", 30, book) == "long"
+    assert veto_source(store, "fortyfive", 45, book) == ""
+    book.target = -10
+    assert veto_source(store, "thirty", 30, book) == ""
     book.held = -1
     book.target = 10
-    assert veto_source(store, "short", 525, book) == ""
+    assert veto_source(store, "thirty", 30, book) == ""
     book.held = 0
     store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=1, pnl=1500))
-    assert veto_source(store, "short", 525, book) == ""
+    assert veto_source(store, "thirty", 30, book) == ""
+    assert veto_source(store, "sixty", 60, book) == "long"
     store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=0))
-    assert veto_source(store, "short", 525, book) == ""
+    assert veto_source(store, "thirty", 30, book) == ""
+    assert veto_source(store, "sixty", 60, book) == ""
     store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
     store.save(peer_key("fortyfive"), {"strategy": "other", "channel": 45, "held": -8, "target": -8, "held_days": 2, "pnl": 1})
-    assert veto_source(store, "short", 525, book) == "long"
+    assert veto_source(store, "thirty", 30, book) == "long"
 
     class Broken:
         def load(self, key: str):
             raise RuntimeError(key)
 
-    assert veto_source(Broken(), "short", 525, book) == ""
+    assert veto_source(Broken(), "thirty", 30, book) == ""
     store.save(peer_key("m1760"), _peer("m1760", channel=1760, held=-8, days=2, pnl=1500))
     store.save(peer_key("m2160"), _peer("m2160", channel=2160, held=-8, days=2, pnl=1500))
     book.target = 10
     assert veto_source(store, "sixty", 60, book) == "long, m1760, m2160"
-    assert veto_source(store, "m1760", 1760, book) == "long, m2160"
-    assert veto_source(store, "m2160", 2160, book) == "long"
+    assert veto_source(store, "fortyfive", 45, book) == "m1760"
+    assert veto_source(store, "m1760", 1760, book) == ""
+    assert veto_source(store, "m2160", 2160, book) == ""
     assert veto_source(store, "long", 12420, book) == ""
+    assert veto_source(store, "momentum", 0, book) == ""
+
+
+def test_live_roles_match_the_research_book():
+    from consensus import OpenState
+    from trend import _entry_sources, entry_veto, kept_split
+
+    spec = kept_split()
+    roster = (
+        ("short", 525),
+        ("long", 12_420),
+        ("thirty", 30),
+        ("fortyfive", 45),
+        ("sixty", 60),
+        ("m1760", 1760),
+        ("m2160", 2160),
+        ("momentum", 0),
+    )
+    pictures = (
+        (),
+        (("long", -1, 2, 1500.0),),
+        (("long", -1, 1, 1500.0),),
+        (("long", -1, 0, 1500.0),),
+        (("long", -1, 2, 0.0),),
+        (("m1760", -1, 2, 100.0),),
+        (("m1760", -1, 1, 100.0),),
+        (("momentum", -1, 2, 100.0),),
+        (("momentum", -1, 1, 100.0),),
+        (("momentum", -1, 0, 100.0),),
+        (
+            ("m1760", -1, 1, 100.0),
+            ("m2160", -1, 1, 100.0),
+            ("long", -1, 1, 100.0),
+            ("momentum", -1, 1, 100.0),
+        ),
+        (
+            ("m1760", -1, 1, 100.0),
+            ("m2160", -1, 1, 100.0),
+            ("long", -1, 1, 100.0),
+            ("momentum", 1, 1, 100.0),
+        ),
+        (
+            ("m1760", -1, 1, 100.0),
+            ("m2160", -1, 1, 100.0),
+            ("long", -1, 1, 100.0),
+            ("momentum", -1, 0, 100.0),
+        ),
+        (("long", -1, 2, 100.0), ("m1760", 1, 2, 100.0)),
+        (("sixty", -1, 0, 50.0),),
+        (("short", -1, 2, 50.0),),
+        (("fortyfive", -1, 2, 50.0),),
+        (("thirty", -1, 5, 50.0),),
+        (("m2160", -1, 2, 80.0), ("long", 1, 2, 80.0), ("m1760", -1, 0, 80.0)),
+    )
+    channels = dict(roster)
+    for picture in pictures:
+        store = MemoryStore()
+        present = {name: (side, days, pnl) for name, side, days, pnl in picture}
+        states = []
+        windows = []
+        for name, _channel in roster:
+            if name not in present:
+                continue
+            side, days, pnl = present[name]
+            store.save(peer_key(name), _peer(name, channel=channels[name], held=side * 4, days=days, pnl=pnl))
+            state = OpenState(name, channels[name], side, days, pnl, None, None, 0.0)
+            states.append(state)
+            if name != "momentum":
+                windows.append(state)
+        book = _FillBook("CRZ6", 100_000.0)
+        for name, channel in roster:
+            for side in (1, -1):
+                book.held = 0
+                book.target = side * 2
+                live = [part for part in veto_source(store, name, channel, book).split(", ") if part]
+                research = entry_veto(name, channel, states, windows, spec, 0)
+                sources = _entry_sources(name, channel, states, windows, spec, 0, side)
+                assert live == sources
+                assert bool(live) is (research in {side, 2})
 
 
 def test_a_senior_short_in_profit_blocks_a_fresh_long_and_keeps_a_short():
@@ -1622,12 +1712,12 @@ def test_a_senior_short_in_profit_blocks_a_fresh_long_and_keeps_a_short():
     broker = FakeBroker()
     store = MemoryStore()
     _ready(store, _quiet_bars(start, 5))
-    store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    _save_short_seniors(store, held=-8, days=2, pnl=1500)
     request = _request()
     broker._candles.append(_candle(start + timedelta(minutes=5), 10.4, high=10.45, low=10.3))
     blocked = run_minute(request, broker, store, now=start + timedelta(minutes=6))
     assert blocked["phase"] == "veto"
-    assert blocked["veto"] == "long"
+    assert blocked["veto"] == "long, m1760, m2160, momentum"
     assert blocked["order"] is None
     assert blocked["target"] == 0
     assert broker.orders == []
@@ -1640,7 +1730,7 @@ def test_a_senior_short_in_profit_blocks_a_fresh_long_and_keeps_a_short():
     same = FakeBroker()
     same_store = MemoryStore()
     _ready(same_store, _quiet_bars(start, 5))
-    same_store.save(peer_key("long"), _peer("long", channel=12420, held=-8, days=2, pnl=1500))
+    _save_short_seniors(same_store, held=-8, days=2, pnl=1500)
     same._candles.append(_candle(start + timedelta(minutes=5), 9.8, high=9.9, low=9.7))
     opened = run_minute(request, same, same_store, now=start + timedelta(minutes=6))
     assert opened["phase"] == "signal"
@@ -1938,8 +2028,16 @@ def test_momentum_is_outside_the_seven_window_exchange():
             "pnl": 50_000.0,
         },
     )
-    for name, channel in (("short", 525), ("m1760", 1760), ("m2160", 2160), ("long", 12_420)):
-        assert veto_source(store, name, channel, fresh) == ""
+    assert veto_source(store, "short", 525, fresh) == ""
+    assert veto_source(store, "m1760", 1760, fresh) == ""
+    assert veto_source(store, "long", 12_420, fresh) == ""
+    assert veto_source(store, "momentum", 0, fresh) == ""
+    assert veto_source(store, "m2160", 2160, fresh) == "momentum"
+    store.save(
+        peer_key("momentum"),
+        {"strategy": "momentum", "channel": 0, "held": -8, "target": -8, "held_days": 1, "pnl": 50_000.0},
+    )
+    assert veto_source(store, "m2160", 2160, fresh) == ""
 
 
 def test_momentum_history_does_not_order_and_writes_a_flat_peer():
