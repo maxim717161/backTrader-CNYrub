@@ -2785,10 +2785,14 @@ def report_thirty(results: list[EightResult]) -> str:
 
 
 def _thirty_chart_item(results: list[EightResult]) -> EightResult:
+    """Если правило не сменилось, третья линия — окно 30 без запрета, чтобы была видна цена текущего."""
     anchor = _pick(results, "t30-leg")
     chosen = choose_thirty(results)
     if chosen.spec.id != anchor.spec.id:
         return chosen
+    for item in results:
+        if item.spec.id == "t30-none":
+            return item
     return _best_thirty(results)
 
 
